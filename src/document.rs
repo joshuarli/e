@@ -1,0 +1,310 @@
+use crate::buffer::GapBuffer;
+use crate::operation::{Operation, UndoStack};
+use crate::selection::Pos;
+
+/// Wraps a GapBuffer with undo/redo and dirty tracking.
+pub struct Document {
+    pub buf: GapBuffer,
+    pub undo_stack: UndoStack,
+    pub dirty: bool,
+    pub filename: Option<String>,
+}
+
+impl Document {
+    pub fn new(text: Vec<u8>, filename: Option<String>) -> Self {
+        let buf = if text.is_empty() {
+            GapBuffer::new()
+        } else {
+            GapBuffer::from_text(&text)
+        };
+        Self {
+            buf,
+            undo_stack: UndoStack::new(),
+            dirty: false,
+            filename,
+        }
+    }
+
+    /// Insert bytes at (line, col), recording an undo operation.
+    pub fn insert(&mut self, line: usize, col: usize, bytes: &[u8]) -> Pos {
+        let offset = self.buf.pos_to_offset(line, col);
+        let cursor_before = Pos::new(line, col);
+        self.buf.insert(offset, bytes);
+        let (new_line, new_col) = self.buf.offset_to_pos(offset + bytes.len());
+        let cursor_after = Pos::new(new_line, new_col);
+
+        self.undo_stack.record(
+            Operation::Insert {
+                pos: offset,
+                data: bytes.to_vec(),
+            },
+            cursor_before,
+            cursor_after,
+        );
+        self.dirty = true;
+        cursor_after
+    }
+
+    /// Delete `count` bytes starting at byte offset, recording an undo operation.
+    pub fn delete_range(&mut self, start_pos: Pos, end_pos: Pos) -> Pos {
+        let start_offset = self.buf.pos_to_offset(start_pos.line, start_pos.col);
+        let end_offset = self.buf.pos_to_offset(end_pos.line, end_pos.col);
+        if start_offset >= end_offset {
+            return start_pos;
+        }
+        let deleted = self.buf.slice(start_offset, end_offset);
+        self.buf.delete(start_offset, end_offset - start_offset);
+
+        self.undo_stack.record(
+            Operation::Delete {
+                pos: start_offset,
+                data: deleted,
+            },
+            end_pos,
+            start_pos,
+        );
+        self.dirty = true;
+        start_pos
+    }
+
+    /// Seal the current undo group (force a boundary).
+    pub fn seal_undo(&mut self) {
+        self.undo_stack.seal();
+    }
+
+    /// Undo the last operation group. Returns new cursor position.
+    pub fn undo(&mut self) -> Option<Pos> {
+        let (ops, cursor) = self.undo_stack.undo()?;
+        for op in &ops {
+            match op {
+                Operation::Insert { pos, data } => {
+                    // To undo an insert, delete
+                    self.buf.delete(*pos, data.len());
+                }
+                Operation::Delete { pos, data } => {
+                    // To undo a delete, insert
+                    self.buf.insert(*pos, data);
+                }
+            }
+        }
+        self.dirty = true;
+        Some(cursor)
+    }
+
+    /// Redo the last undone group. Returns new cursor position.
+    pub fn redo(&mut self) -> Option<Pos> {
+        let (ops, cursor) = self.undo_stack.redo()?;
+        for op in &ops {
+            match op {
+                Operation::Insert { pos, data } => {
+                    self.buf.insert(*pos, data);
+                }
+                Operation::Delete { pos, data } => {
+                    self.buf.delete(*pos, data.len());
+                }
+            }
+        }
+        self.dirty = true;
+        Some(cursor)
+    }
+
+    /// Get text in a range (for clipboard, etc.).
+    pub fn text_in_range(&mut self, start: Pos, end: Pos) -> Vec<u8> {
+        let start_offset = self.buf.pos_to_offset(start.line, start.col);
+        let end_offset = self.buf.pos_to_offset(end.line, end.col);
+        self.buf.slice(start_offset, end_offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_empty() {
+        let mut doc = Document::new(Vec::new(), None);
+        assert!(!doc.dirty);
+        assert!(doc.filename.is_none());
+        assert_eq!(doc.buf.line_count(), 1);
+    }
+
+    #[test]
+    fn test_new_with_text() {
+        let mut doc = Document::new(b"hello\nworld".to_vec(), Some("test.txt".to_string()));
+        assert!(!doc.dirty);
+        assert_eq!(doc.filename.as_deref(), Some("test.txt"));
+        assert_eq!(doc.buf.line_count(), 2);
+    }
+
+    #[test]
+    fn test_insert_sets_dirty() {
+        let mut doc = Document::new(b"hello".to_vec(), None);
+        assert!(!doc.dirty);
+        doc.insert(0, 5, b" world");
+        assert!(doc.dirty);
+    }
+
+    #[test]
+    fn test_insert_returns_cursor() {
+        let mut doc = Document::new(b"hello".to_vec(), None);
+        let pos = doc.insert(0, 5, b" world");
+        assert_eq!(pos, Pos::new(0, 11));
+    }
+
+    #[test]
+    fn test_insert_newline_moves_cursor_to_next_line() {
+        let mut doc = Document::new(b"helloworld".to_vec(), None);
+        let pos = doc.insert(0, 5, b"\n");
+        assert_eq!(pos, Pos::new(1, 0));
+        assert_eq!(doc.buf.line_count(), 2);
+        assert_eq!(doc.buf.line_text(0), b"hello");
+        assert_eq!(doc.buf.line_text(1), b"world");
+    }
+
+    #[test]
+    fn test_delete_range_sets_dirty() {
+        let mut doc = Document::new(b"hello world".to_vec(), None);
+        doc.delete_range(Pos::new(0, 5), Pos::new(0, 11));
+        assert!(doc.dirty);
+    }
+
+    #[test]
+    fn test_delete_range_returns_start() {
+        let mut doc = Document::new(b"hello world".to_vec(), None);
+        let pos = doc.delete_range(Pos::new(0, 5), Pos::new(0, 11));
+        assert_eq!(pos, Pos::new(0, 5));
+        assert_eq!(doc.buf.contents(), b"hello");
+    }
+
+    #[test]
+    fn test_delete_range_across_lines() {
+        let mut doc = Document::new(b"hello\nworld".to_vec(), None);
+        let pos = doc.delete_range(Pos::new(0, 3), Pos::new(1, 2));
+        assert_eq!(pos, Pos::new(0, 3));
+        assert_eq!(doc.buf.contents(), b"helrld");
+    }
+
+    #[test]
+    fn test_delete_range_noop_when_equal() {
+        let mut doc = Document::new(b"hello".to_vec(), None);
+        let pos = doc.delete_range(Pos::new(0, 3), Pos::new(0, 3));
+        assert_eq!(pos, Pos::new(0, 3));
+        assert!(!doc.dirty);
+    }
+
+    #[test]
+    fn test_undo_insert() {
+        let mut doc = Document::new(b"hello".to_vec(), None);
+        doc.insert(0, 5, b" world");
+        assert_eq!(doc.buf.contents(), b"hello world");
+
+        let pos = doc.undo().unwrap();
+        assert_eq!(pos, Pos::new(0, 5));
+        assert_eq!(doc.buf.contents(), b"hello");
+    }
+
+    #[test]
+    fn test_undo_delete() {
+        let mut doc = Document::new(b"hello world".to_vec(), None);
+        doc.delete_range(Pos::new(0, 5), Pos::new(0, 11));
+        assert_eq!(doc.buf.contents(), b"hello");
+
+        let pos = doc.undo().unwrap();
+        assert_eq!(pos, Pos::new(0, 11));
+        assert_eq!(doc.buf.contents(), b"hello world");
+    }
+
+    #[test]
+    fn test_redo() {
+        let mut doc = Document::new(b"hello".to_vec(), None);
+        doc.insert(0, 5, b" world");
+        doc.undo();
+        assert_eq!(doc.buf.contents(), b"hello");
+
+        let pos = doc.redo().unwrap();
+        assert_eq!(pos, Pos::new(0, 11));
+        assert_eq!(doc.buf.contents(), b"hello world");
+    }
+
+    #[test]
+    fn test_undo_nothing_returns_none() {
+        let mut doc = Document::new(b"hello".to_vec(), None);
+        assert!(doc.undo().is_none());
+    }
+
+    #[test]
+    fn test_redo_nothing_returns_none() {
+        let mut doc = Document::new(b"hello".to_vec(), None);
+        assert!(doc.redo().is_none());
+    }
+
+    #[test]
+    fn test_redo_cleared_after_new_edit() {
+        let mut doc = Document::new(b"hello".to_vec(), None);
+        doc.insert(0, 5, b"1");
+        doc.undo();
+        // Now insert something new — redo should be gone
+        doc.insert(0, 5, b"2");
+        assert!(doc.redo().is_none());
+    }
+
+    #[test]
+    fn test_multiple_undo_redo() {
+        let mut doc = Document::new(b"a".to_vec(), None);
+        doc.seal_undo();
+        doc.insert(0, 1, b"b");
+        doc.seal_undo();
+        doc.insert(0, 2, b"c");
+        doc.seal_undo();
+        assert_eq!(doc.buf.contents(), b"abc");
+
+        doc.undo();
+        assert_eq!(doc.buf.contents(), b"ab");
+        doc.undo();
+        assert_eq!(doc.buf.contents(), b"a");
+
+        doc.redo();
+        assert_eq!(doc.buf.contents(), b"ab");
+        doc.redo();
+        assert_eq!(doc.buf.contents(), b"abc");
+    }
+
+    #[test]
+    fn test_seal_undo_creates_separate_groups() {
+        let mut doc = Document::new(b"".to_vec(), None);
+        doc.insert(0, 0, b"a");
+        doc.seal_undo();
+        doc.insert(0, 1, b"b");
+        doc.seal_undo();
+        assert_eq!(doc.buf.contents(), b"ab");
+
+        // Undo should only undo "b"
+        doc.undo();
+        assert_eq!(doc.buf.contents(), b"a");
+
+        // Undo "a"
+        doc.undo();
+        assert_eq!(doc.buf.contents(), b"");
+    }
+
+    #[test]
+    fn test_text_in_range() {
+        let mut doc = Document::new(b"hello\nworld\nfoo".to_vec(), None);
+        let text = doc.text_in_range(Pos::new(0, 2), Pos::new(1, 3));
+        assert_eq!(text, b"llo\nwor");
+    }
+
+    #[test]
+    fn test_text_in_range_single_line() {
+        let mut doc = Document::new(b"hello world".to_vec(), None);
+        let text = doc.text_in_range(Pos::new(0, 6), Pos::new(0, 11));
+        assert_eq!(text, b"world");
+    }
+
+    #[test]
+    fn test_text_in_range_empty() {
+        let mut doc = Document::new(b"hello".to_vec(), None);
+        let text = doc.text_in_range(Pos::new(0, 3), Pos::new(0, 3));
+        assert_eq!(text, b"");
+    }
+}
