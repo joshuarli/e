@@ -1,43 +1,139 @@
-This is a minimalistic and performant text editor.
+This file must be updated before each commit.
 
-Please update this file before every commit.
+# `e` — Minimalist Terminal Text Editor
 
-## design constraints
+A performant, minimalist text editor in Rust. Single-file editing only — no tabs, no file browser. macOS and Linux.
 
-- rust 2024 edition
-- no tabs, no file browsers. just purely edit a file
-- only support macos and linux
+## Design Constraints
 
-## inspiration
+- Rust 2024 edition
+- 3 dependencies only: `termion`, `regex`, `signal-hook` — do not add crates without good reason
+- Single-file editing — no tabs, no file browser, no split panes
+- macOS and Linux only (no Windows)
+- Indent: 2 spaces for all files except `.c`, `.h`, `.go`, `Makefile` which use tabs
+- Tabs display as 2 spaces
 
-https://github.com/ilai-deutel/kibi
-- a good resource. we don't need to be this lines-of-code constrained, and i'd want to use an actual low level tui library
+## Architecture
 
-https://github.com/micro-editor/micro
-- a lot of the features and feature design i want are from this editor
+Ownership chain: `main.rs` → `Editor` → `Document` → `GapBuffer`
 
-## v0 feature checklist
-[] performant repainting (be smart about only repainting what's needed)
-[] handle window resize
-[] mouse support (click, drag to select, double click to select by word, triple click to select by line)
-[] hold shift and use arrow keys to select text
-[] copypaste from system clipboard (linux and macos with platform detection)
-[] emacs style keybindings and basic commands
-  [] save (^s)
-  [] kill line (^k)
-  [] goto top of file (^t), end of file (^g)
-  [] undo (^z), redo (^y)
-[] regex find (^f) then Tab to tab through results
-[] open editor command (cmd+p) buffer where commands can be typed and executed
-  - all editor functions like saving files, find and replace, are really just all commands
-[] goto line number (^l) -> opens a command buffer to enter the linenumber
-[] command: `replaceall findregex string` that applies to the selection if there is one, otherwise the entire file
+```
+src/
+  main.rs            arg parsing, file safety checks (binary, >5MB), enter raw mode
+  editor.rs          Editor struct: all state, channel-based event loop, action dispatch
+  buffer.rs          GapBuffer (Vec<u8> with gap) + lazy line-start index cache
+  document.rs        wraps GapBuffer + UndoStack + dirty flag + filename
+  selection.rs       Pos (line, col), Selection (anchor+cursor), word/line boundary helpers
+  operation.rs       Operation enum (Insert/Delete), OperationGroup, UndoStack with grouping
+  view.rs            Viewport: scroll offsets, scroll margins, cursor-to-screen mapping
+  render.rs          ANSI rendering: gutter, line content, selection/find highlighting, status bar
+  keybind.rs         EditorAction enum, KeybindingTable with defaults, INI config loader
+  command.rs         CommandRegistry: HashMap<String, CommandFn>, built-in commands
+  command_buffer.rs  Modal mini-editor for command palette, find, goto, save-as prompt
+  clipboard.rs       Platform-detected clipboard: pbcopy/wl-copy/xclip/xsel/internal fallback
+  file_io.rs         Read/write files, CRLF→LF normalization, binary detection, trailing whitespace strip
+  signal.rs          Placeholder (SIGWINCH handled directly in editor.rs via signal-hook)
+  highlight.rs       Stub: Highlighter trait + Span/Style types for future syntax highlighting
+```
 
-more advanced features (save for later, just keep in mind when designing the foundation)
-[] performant and basic (not too noisy with colors) syntax highlighting
-[] command: `comment on|off` comments out / uncomments the selected code
-[] when saving a file, if parent directories are not created then prompt to confirm a `mkdir -p`
-[] if permissions denied when saving file
-[] automatic formatting with file detection
-  - indent style space, 2 spaces for all files except Makefile, .c, .go where the indent needs to be tab
-  - tab characters need to display as 2 spaces
+## Key Data Structures
+
+- **GapBuffer** (`buffer.rs`): `Vec<u8>` with `gap_start`/`gap_end`. Lazy `line_starts` cache (byte offsets of each line start, rebuilt on access after edits). All text stored as UTF-8 bytes.
+- **Document** (`document.rs`): Owns `GapBuffer` + `UndoStack` + `dirty: bool` + `filename: Option<String>`. All mutations (`insert`, `delete_range`) record undo operations.
+- **Pos** (`selection.rs`): `{ line: usize, col: usize }` — 0-indexed, col is character index not byte offset. Implements `Ord`.
+- **Selection** (`selection.rs`): `{ anchor: Pos, cursor: Pos }`. `anchor == cursor` means no selection. `ordered()` returns `(start, end)`.
+- **UndoStack** (`operation.rs`): Groups operations automatically by: kind change (insert vs delete), word boundary (space/newline), time gap (>1s), cursor jump, or explicit `seal()`.
+- **Editor** (`editor.rs`): Owns everything. Event loop uses `mpsc` channels — background thread for stdin, another for SIGWINCH. Main thread does `recv_timeout(500ms)` for status message expiry.
+
+## Event Loop
+
+Channel-based (`std::sync::mpsc`). No async runtime.
+
+1. Background thread: reads `stdin.events()` via termion → sends `EditorEvent::Term(Event)`
+2. Background thread: listens for `SIGWINCH` via `signal-hook` → sends `EditorEvent::Resize(w, h)`
+3. Main thread: `recv_timeout(500ms)` — dispatches events, expires status messages, redraws
+
+## Rendering
+
+All output buffered to a `Write` impl, flushed once per frame. Status bar (reverse video) on second-to-last row. Command buffer on last row when active. Selection rendered as reverse video, find matches as yellow background. Line numbers in dim text with `│` separator when ruler is on.
+
+## Keybindings
+
+Configurable via `~/.config/e/keybindings.ini`. Format: `ctrl+key = action`.
+
+| Key | Action |
+|---|---|
+| `^s` | Save |
+| `^q` | Quit (confirms if dirty) |
+| `^z` | Undo |
+| `^y` | Redo |
+| `^a` | Select all |
+| `^c` | Copy |
+| `^x` | Cut |
+| `^v` | Paste |
+| `^f` | Find (regex, smart-case) |
+| `^p` | Command palette |
+| `^l` | Goto line |
+| `^k` | Kill line |
+| `^t` | Goto top |
+| `^g` | Goto end |
+| `^r` | Toggle ruler |
+| `^h` | Ctrl+Backspace (delete word) |
+| `Shift+Arrows` | Extend selection |
+| `Esc` | Clear selection / find highlights |
+
+Mouse: click to place cursor, drag to select, double-click selects word, triple-click selects line, scroll wheel scrolls.
+
+## Commands
+
+Entered via `^p` command palette. Available commands:
+
+| Command | Description |
+|---|---|
+| `save [filename]` | Save current file, or save-as if filename given |
+| `quit` / `q` | Quit |
+| `goto <line>` | Jump to line number |
+| `ruler` | Toggle line number ruler |
+| `replaceall <regex> <replacement>` | Replace all matches (in selection if active, else whole file) |
+| `comment` | Stub — not yet implemented |
+
+## Development Guidelines
+
+- Run `cargo clippy && cargo test` before every commit — zero warnings, all tests pass
+- All modules have inline `#[cfg(test)] mod tests` — 222 tests total
+- Prefer `&self` over `&mut self` for read-only operations (the line cache uses interior mutability via `Option<Vec<usize>>`)
+- Minimize heap allocations in hot paths (render loop, cursor movement)
+- No `unwrap()` on user-facing I/O — propagate errors or show in status bar
+- Keep the dependency count at 3 — solve problems with std
+- Tests should be self-contained with no external file dependencies (use `std::env::temp_dir()` for integration tests)
+- When adding new keybindings, update `KeybindingTable::with_defaults()` in `keybind.rs` and `parse_action()` match arm
+
+## v0 Feature Status
+
+- [x] Gap buffer with lazy line index
+- [x] Undo/redo with automatic grouping heuristics
+- [x] Selection (shift+arrows, mouse drag, double/triple click)
+- [x] System clipboard (platform-detected: pbcopy, wl-copy, xclip, xsel)
+- [x] Regex find with smart-case and live highlighting
+- [x] Replace all (selection-aware)
+- [x] Command palette (`^p`)
+- [x] Goto line (`^l`)
+- [x] Configurable keybindings (INI file)
+- [x] SIGWINCH window resize handling
+- [x] File safety checks (binary detection, >5MB confirmation)
+- [x] CRLF→LF normalization on read
+- [x] Trailing whitespace strip + ensure newline on save
+- [x] Quit confirmation when dirty
+- [x] Save-as prompt for unnamed buffers
+- [x] Mouse support (click, drag, double/triple click, scroll wheel)
+- [x] Horizontal scrolling for long lines
+- [x] Timed status messages
+- [x] Toggle ruler (`^r`)
+
+## Future Work
+
+- [ ] Syntax highlighting (foundation: `highlight.rs` stub with `Highlighter` trait)
+- [ ] `comment on|off` command (toggle comments on selected code)
+- [ ] `mkdir -p` prompt when saving to non-existent parent directories
+- [ ] Permission denied handling on save
+- [ ] Differential rendering with per-line hashes (field exists in `Renderer`, not yet wired up)
