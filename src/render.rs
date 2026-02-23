@@ -156,7 +156,7 @@ impl Renderer {
                 if ruler_on {
                     let num_str = format!("{}", logical_line + 1);
                     let pad = gw - 1;
-                    write!(w, "\x1b[2m{:>width$} \x1b[0m", num_str, width = pad)?;
+                    write!(w, "\x1b[0;2m{:>width$} \x1b[0m", num_str, width = pad)?;
                 }
 
                 let raw_text = buf.line_text(logical_line);
@@ -313,11 +313,11 @@ impl Renderer {
                         write!(w, "\x1b[0m")?;
                     }
                 }
-                // Erase remainder of line after content (avoids clear-before-draw flicker)
-                write!(w, "\x1b[K")?;
+                // Reset attributes + erase remainder of line after content
+                write!(w, "\x1b[0m\x1b[K")?;
             } else if ruler_on {
                 let pad = gw - 1;
-                write!(w, "\x1b[2m{:>width$} \x1b[0m\x1b[K", "", width = pad)?;
+                write!(w, "\x1b[0;2m{:>width$} \x1b[0m\x1b[K", "", width = pad)?;
             } else {
                 write!(w, "\x1b[K")?;
             }
@@ -333,7 +333,7 @@ impl Renderer {
         // Status bar
         let status_row = text_rows + completion_rows + 1;
         write!(w, "\x1b[{};1H", status_row)?;
-        write!(w, "\x1b[7m")?;
+        write!(w, "\x1b[0;7m")?;
         let width = view.width as usize;
         let left_len = status_left.len().min(width);
         let right_len = status_right.len();
