@@ -964,6 +964,31 @@ impl Editor {
         }
     }
 
+    fn indent_snap_left(&mut self, line: usize, col: usize) -> usize {
+        let line_text = self.doc.buf.line_text(line);
+        let leading_ws: usize = line_text
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+        if col <= leading_ws && col >= 1 && line_text[..col].iter().all(|&b| b == b' ') {
+            return (col - 1) / 2 * 2;
+        }
+        col - 1
+    }
+
+    fn indent_snap_right(&mut self, line: usize, col: usize) -> usize {
+        let line_text = self.doc.buf.line_text(line);
+        let leading_ws: usize = line_text
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+        if col < leading_ws && line_text[..leading_ws].iter().all(|&b| b == b' ') {
+            let target = (col / 2 + 1) * 2;
+            return target.min(leading_ws);
+        }
+        col + 1
+    }
+
     fn move_left(&mut self) {
         if !self.sel.is_empty() {
             let (start, _) = self.sel.ordered();
@@ -972,7 +997,8 @@ impl Editor {
         }
         let c = self.cursor();
         if c.col > 0 {
-            self.set_cursor(Pos::new(c.line, c.col - 1));
+            let new_col = self.indent_snap_left(c.line, c.col);
+            self.set_cursor(Pos::new(c.line, new_col));
         } else if c.line > 0 {
             let prev_len = self.doc.buf.line_char_len(c.line - 1);
             self.set_cursor(Pos::new(c.line - 1, prev_len));
@@ -988,7 +1014,8 @@ impl Editor {
         let c = self.cursor();
         let line_len = self.doc.buf.line_char_len(c.line);
         if c.col < line_len {
-            self.set_cursor(Pos::new(c.line, c.col + 1));
+            let new_col = self.indent_snap_right(c.line, c.col);
+            self.set_cursor(Pos::new(c.line, new_col));
         } else if c.line + 1 < self.doc.buf.line_count() {
             self.set_cursor(Pos::new(c.line + 1, 0));
         }
@@ -1049,7 +1076,7 @@ impl Editor {
     fn move_left_extend(&mut self) {
         let c = self.cursor();
         if c.col > 0 {
-            self.sel.cursor = Pos::new(c.line, c.col - 1);
+            self.sel.cursor = Pos::new(c.line, self.indent_snap_left(c.line, c.col));
         } else if c.line > 0 {
             let prev_len = self.doc.buf.line_char_len(c.line - 1);
             self.sel.cursor = Pos::new(c.line - 1, prev_len);
@@ -1060,7 +1087,7 @@ impl Editor {
         let c = self.cursor();
         let line_len = self.doc.buf.line_char_len(c.line);
         if c.col < line_len {
-            self.sel.cursor = Pos::new(c.line, c.col + 1);
+            self.sel.cursor = Pos::new(c.line, self.indent_snap_right(c.line, c.col));
         } else if c.line + 1 < self.doc.buf.line_count() {
             self.sel.cursor = Pos::new(c.line + 1, 0);
         }

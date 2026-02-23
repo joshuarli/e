@@ -83,7 +83,8 @@ Configurable via `~/.config/e/keybindings.ini`. Format: `ctrl+key = action`.
 | `Tab` | Indent selected lines (or insert tab/spaces) |
 | `Shift+Tab` | Dedent line(s) |
 | `Delete` | Forward delete (non-configurable) |
-| `Shift+Arrows` | Extend selection |
+| `Left/Right` | Move cursor; snaps to 2-space indent stops in leading whitespace |
+| `Shift+Arrows` | Extend selection (left/right also snap to indent stops) |
 | `Esc` | Clear selection / find highlights |
 
 Mouse: click to place cursor, drag to select, double-click selects word (space-delineated), triple-click selects line, scroll wheel scrolls.
@@ -110,7 +111,7 @@ Entered via `^p` command palette. Available commands:
 ## Development Guidelines
 
 - Run `cargo clippy && cargo test` before every commit — zero warnings, all tests pass
-- All modules have inline `#[cfg(test)] mod tests` — 232 tests total
+- All modules have inline `#[cfg(test)] mod tests` — 255 tests total
 - Prefer `&self` over `&mut self` for read-only operations (the line cache uses interior mutability via `Option<Vec<usize>>`)
 - Minimize heap allocations in hot paths (render loop, cursor movement)
 - No `unwrap()` on user-facing I/O — propagate errors or show in status bar
