@@ -907,6 +907,9 @@ impl Editor {
     }
 
     fn scroll_up(&mut self) {
+        if self.view.scroll_line == 0 {
+            return;
+        }
         self.view.scroll_line = self.view.scroll_line.saturating_sub(SCROLL_LINES);
         let max_visible = self.view.scroll_line + self.view.text_rows().saturating_sub(1);
         if self.cursor().line > max_visible {
@@ -918,6 +921,9 @@ impl Editor {
     fn scroll_down(&mut self) {
         let line_count = self.doc.buf.line_count();
         let max_scroll = line_count.saturating_sub(1);
+        if self.view.scroll_line >= max_scroll {
+            return;
+        }
         self.view.scroll_line = (self.view.scroll_line + SCROLL_LINES).min(max_scroll);
         if self.cursor().line < self.view.scroll_line {
             let line_len = self.doc.buf.line_char_len(self.view.scroll_line);

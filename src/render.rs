@@ -93,7 +93,13 @@ impl Renderer {
             .unwrap_or((Pos::zero(), Pos::zero()));
         let has_sel = selection.is_some_and(|s| !s.is_empty());
 
-        write!(out, "\x1b[?25l")?;
+        // Buffer all output, then write to terminal in one shot to avoid flicker
+        let mut frame = Vec::with_capacity(8192);
+        let w = &mut frame;
+
+        // Synchronized output: tell terminal to hold rendering until frame is complete
+        write!(w, "\x1b[?2026h")?;
+        write!(w, "\x1b[?25l")?;
 
         // Compute per-line highlight states for visible lines
         let last_visible = (view.scroll_line + text_rows).min(line_count);
@@ -111,13 +117,13 @@ impl Renderer {
 
         for row in 0..text_rows {
             let logical_line = view.scroll_line + row;
-            write!(out, "\x1b[{};1H\x1b[2K", row + 1)?;
+            write!(w, "\x1b[{};1H", row + 1)?;
 
             if logical_line < line_count {
                 if ruler_on {
                     let num_str = format!("{}", logical_line + 1);
                     let pad = gw - 1;
-                    write!(out, "\x1b[2m{:>width$} \x1b[0m", num_str, width = pad)?;
+                    write!(w, "\x1b[2m{:>width$} \x1b[0m", num_str, width = pad)?;
                 }
 
                 let raw_text = buf.line_text(logical_line);
@@ -210,20 +216,20 @@ impl Renderer {
 
                         if in_sel {
                             if is_tab_pipe {
-                                write!(out, "\x1b[7;90m{}\x1b[0m", ch)?;
+                                write!(w, "\x1b[7;90m{}\x1b[0m", ch)?;
                             } else {
-                                write!(out, "\x1b[7m{}\x1b[0m", ch)?;
+                                write!(w, "\x1b[7m{}\x1b[0m", ch)?;
                             }
                         } else if let Some((_, _, is_current)) = find_hit {
                             if *is_current {
-                                write!(out, "\x1b[42;30m{}\x1b[0m", ch)?;
+                                write!(w, "\x1b[42;30m{}\x1b[0m", ch)?;
                             } else {
-                                write!(out, "\x1b[43;30m{}\x1b[0m", ch)?;
+                                write!(w, "\x1b[43;30m{}\x1b[0m", ch)?;
                             }
                         } else if is_bracket_match {
-                            write!(out, "\x1b[45;30m{}\x1b[0m", ch)?;
+                            write!(w, "\x1b[45;30m{}\x1b[0m", ch)?;
                         } else if is_tab_pipe {
-                            write!(out, "\x1b[90m{}\x1b[0m", ch)?;
+                            write!(w, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
                             // Syntax color as fallback
                             let ht = char_hl
@@ -232,9 +238,9 @@ impl Renderer {
                                 .unwrap_or(HlType::Normal);
                             let code = ht.ansi_code();
                             if code.is_empty() {
-                                write!(out, "{}", ch)?;
+                                write!(w, "{}", ch)?;
                             } else {
-                                write!(out, "{}{}\x1b[0m", code, ch)?;
+                                write!(w, "{}{}\x1b[0m", code, ch)?;
                             }
                         }
                     }
@@ -250,10 +256,10 @@ impl Renderer {
                         let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
                         if is_tab_pipe {
                             if current_hl != HlType::Normal {
-                                write!(out, "\x1b[0m")?;
+                                write!(w, "\x1b[0m")?;
                                 current_hl = HlType::Normal;
                             }
-                            write!(out, "\x1b[90m{}\x1b[0m", ch)?;
+                            write!(w, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
                             let ht = char_hl
                                 .as_ref()
@@ -261,64 +267,69 @@ impl Renderer {
                                 .unwrap_or(HlType::Normal);
                             if ht != current_hl {
                                 if ht == HlType::Normal {
-                                    write!(out, "\x1b[0m")?;
+                                    write!(w, "\x1b[0m")?;
                                 } else {
-                                    write!(out, "{}", ht.ansi_code())?;
+                                    write!(w, "{}", ht.ansi_code())?;
                                 }
                                 current_hl = ht;
                             }
-                            write!(out, "{}", ch)?;
+                            write!(w, "{}", ch)?;
                         }
                     }
                     if current_hl != HlType::Normal {
-                        write!(out, "\x1b[0m")?;
+                        write!(w, "\x1b[0m")?;
                     }
                 }
+                // Erase remainder of line after content (avoids clear-before-draw flicker)
+                write!(w, "\x1b[K")?;
             } else if ruler_on {
                 let pad = gw - 1;
-                write!(out, "\x1b[2m{:>width$} \x1b[0m", "", width = pad)?;
+                write!(w, "\x1b[2m{:>width$} \x1b[0m\x1b[K", "", width = pad)?;
+            } else {
+                write!(w, "\x1b[K")?;
             }
         }
 
         // Completions area
         for (i, comp) in completions.iter().enumerate() {
             let row = text_rows + i + 1;
-            write!(out, "\x1b[{};1H\x1b[2K", row)?;
-            write!(out, "\x1b[2m  {}\x1b[0m", comp)?;
+            write!(w, "\x1b[{};1H", row)?;
+            write!(w, "\x1b[2m  {}\x1b[0m\x1b[K", comp)?;
         }
 
         // Status bar
         let status_row = text_rows + completion_rows + 1;
-        write!(out, "\x1b[{};1H\x1b[2K", status_row)?;
-        write!(out, "\x1b[7m")?;
+        write!(w, "\x1b[{};1H", status_row)?;
+        write!(w, "\x1b[7m")?;
         let width = view.width as usize;
         let left_len = status_left.len().min(width);
         let right_len = status_right.len();
         let padding = width.saturating_sub(left_len + right_len);
         write!(
-            out,
+            w,
             "{}{}{}",
             &status_left[..left_len],
             " ".repeat(padding),
             status_right,
         )?;
-        write!(out, "\x1b[0m")?;
+        write!(w, "\x1b[0m")?;
 
         // Command line
         let cmd_row = text_rows + completion_rows + 2;
-        write!(out, "\x1b[{};1H\x1b[2K", cmd_row)?;
+        write!(w, "\x1b[{};1H", cmd_row)?;
         if let Some(cmd) = command_line {
-            write!(out, "{}", cmd)?;
+            write!(w, "{}", cmd)?;
         }
+        write!(w, "\x1b[K")?;
 
         // Position cursor
         if find_active {
             // Hide cursor while browsing find results
-            write!(out, "\x1b[?25l")?;
+            write!(w, "\x1b[?25l")?;
         } else if let Some(col) = cmd_cursor {
             // Blinking cursor in command buffer
-            write!(out, "\x1b[{};{}H", cmd_row, col + 1)?;
-            write!(out, "\x1b[?25h")?;
+            write!(w, "\x1b[{};{}H", cmd_row, col + 1)?;
+            write!(w, "\x1b[?25h")?;
         } else {
             let screen_col = if ruler_on {
                 cursor_col.saturating_sub(view.scroll_col) + gw
@@ -326,10 +337,14 @@ impl Renderer {
                 cursor_col.saturating_sub(view.scroll_col)
             };
             let screen_row = cursor_line.saturating_sub(view.scroll_line);
-            write!(out, "\x1b[{};{}H", screen_row + 1, screen_col + 1)?;
-            write!(out, "\x1b[?25h")?;
+            write!(w, "\x1b[{};{}H", screen_row + 1, screen_col + 1)?;
+            write!(w, "\x1b[?25h")?;
         }
 
+        // End synchronized output
+        write!(w, "\x1b[?2026l")?;
+
+        out.write_all(&frame)?;
         out.flush()?;
         self.needs_full_redraw = false;
         Ok(())
