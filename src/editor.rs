@@ -311,14 +311,6 @@ impl Editor {
 
     fn status_left(&self) -> String {
         let name = self.doc.filename.as_deref().unwrap_or("[scratch]");
-        if self.doc.dirty {
-            format!(" {}*", name)
-        } else {
-            format!(" {}", name)
-        }
-    }
-
-    fn status_right(&mut self) -> String {
         let lang_name = self
             .doc
             .filename
@@ -326,12 +318,15 @@ impl Editor {
             .and_then(language::detect)
             .map(|l| l.name)
             .unwrap_or("Text");
-        format!(
-            "{} \u{2502} Ln {}, Col {} ",
-            lang_name,
-            self.cursor().line + 1,
-            self.cursor().col + 1,
-        )
+        if self.doc.dirty {
+            format!(" {}* [{}]", name, lang_name)
+        } else {
+            format!(" {} [{}]", name, lang_name)
+        }
+    }
+
+    fn status_right(&self) -> String {
+        format!(" e v{} ", env!("CARGO_PKG_VERSION"))
     }
 
     fn center_view_on_line(&mut self, line: usize) {
@@ -1343,7 +1338,7 @@ impl Editor {
         let indent_bytes: &[u8] = if use_tab { b"\t" } else { b"  " };
         let indent_char_len = if use_tab { 1 } else { 2 };
 
-        self.doc.seal_undo();
+        self.doc.begin_undo_group();
         let cursor_line = self.cursor().line;
         let mut cursor_added = 0usize;
         for line_idx in (start_line..=end_line).rev() {
@@ -1357,7 +1352,7 @@ impl Editor {
                 cursor_added = indent_char_len;
             }
         }
-        self.doc.seal_undo();
+        self.doc.end_undo_group();
 
         let c = self.cursor();
         self.set_cursor(Pos::new(c.line, c.col + cursor_added));
@@ -1515,7 +1510,7 @@ impl Editor {
             }
         });
 
-        self.doc.seal_undo();
+        self.doc.begin_undo_group();
         if all_commented {
             // Uncomment: remove first occurrence of "comment " from each line
             for line_idx in (start_line..=end_line).rev() {
@@ -1557,7 +1552,7 @@ impl Editor {
                     .insert(line_idx, min_indent_chars, prefix.as_bytes());
             }
         }
-        self.doc.seal_undo();
+        self.doc.end_undo_group();
     }
 
     // -- dedent -------------------------------------------------------------
@@ -1575,7 +1570,7 @@ impl Editor {
             (s.line, end)
         };
 
-        self.doc.seal_undo();
+        self.doc.begin_undo_group();
         let cursor_line = self.cursor().line;
         let mut cursor_removed = 0usize;
         for line_idx in (start_line..=end_line).rev() {
@@ -1595,7 +1590,7 @@ impl Editor {
                 cursor_removed = removed;
             }
         }
-        self.doc.seal_undo();
+        self.doc.end_undo_group();
 
         let c = self.cursor();
         let new_col = c.col.saturating_sub(cursor_removed);

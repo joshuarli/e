@@ -17,6 +17,7 @@ pub enum HlType {
     Comment,
     Number,
     Bracket,
+    Operator,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -40,6 +41,7 @@ pub struct SyntaxRules {
     pub string_delims: &'static [StringDelim],
     pub keywords: &'static [&'static str],
     pub types: &'static [&'static str],
+    pub operators: &'static [&'static str],
     pub highlight_numbers: bool,
     pub is_markdown: bool,
     pub is_json: bool,
@@ -53,12 +55,13 @@ impl HlType {
     pub fn ansi_code(self) -> &'static str {
         match self {
             HlType::Normal => "",
-            HlType::Comment => "\x1b[90m", // grey
-            HlType::Keyword => "\x1b[33m", // yellow
-            HlType::Type => "\x1b[36m",    // cyan
-            HlType::String => "\x1b[32m",  // green
-            HlType::Number => "\x1b[31m",  // red
-            HlType::Bracket => "\x1b[35m", // magenta
+            HlType::Comment => "\x1b[90m",  // grey
+            HlType::Keyword => "\x1b[33m",  // yellow
+            HlType::Type => "\x1b[36m",     // cyan
+            HlType::String => "\x1b[32m",   // green
+            HlType::Number => "\x1b[31m",   // red
+            HlType::Bracket => "\x1b[35m",  // magenta
+            HlType::Operator => "\x1b[33m", // yellow (same as keyword)
         }
     }
 }
@@ -295,6 +298,15 @@ fn highlight_line_code(line: &[u8], state: HlState, rules: &SyntaxRules) -> (Vec
             }
         }
 
+        // Operators (multi-char like &&, ||, !=, etc.)
+        if !rules.operators.is_empty()
+            && let Some(advance) = try_operator(line, i, rules.operators, &mut hl)
+        {
+            i += advance;
+            prev_sep = true;
+            continue;
+        }
+
         if matches!(line[i], b'(' | b')' | b'[' | b']' | b'{' | b'}') {
             hl[i] = HlType::Bracket;
         }
@@ -319,6 +331,19 @@ fn is_digit_start(line: &[u8], i: usize) -> bool {
 
 fn is_number_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'.'
+}
+
+fn try_operator(line: &[u8], pos: usize, ops: &[&str], hl: &mut [HlType]) -> Option<usize> {
+    for &op in ops {
+        let ob = op.as_bytes();
+        if starts_with_at(line, ob, pos) {
+            for b in &mut hl[pos..pos + ob.len()] {
+                *b = HlType::Operator;
+            }
+            return Some(ob.len());
+        }
+    }
+    None
 }
 
 fn try_keyword(
@@ -1151,6 +1176,7 @@ static RUST_RULES: SyntaxRules = SyntaxRules {
         "u16", "u32", "u64", "u128", "usize", "String", "Vec", "Option", "Result", "Box", "Self",
         "true", "false", "None", "Some", "Ok", "Err",
     ],
+    operators: &["&&", "||", "!=", "==", "<=", ">=", "=>", "->"],
     highlight_numbers: true,
     is_markdown: false,
     is_json: false,
@@ -1178,6 +1204,7 @@ static PYTHON_RULES: SyntaxRules = SyntaxRules {
         "True", "False", "None", "int", "float", "str", "bool", "list", "dict", "tuple", "set",
         "bytes", "self",
     ],
+    operators: &["!=", "==", "<=", ">="],
     highlight_numbers: true,
     is_markdown: false,
     is_json: false,
@@ -1247,6 +1274,7 @@ static GO_RULES: SyntaxRules = SyntaxRules {
         "nil",
         "iota",
     ],
+    operators: &["&&", "||", "!=", "==", "<=", ">=", ":="],
     highlight_numbers: true,
     is_markdown: false,
     is_json: false,
@@ -1333,6 +1361,7 @@ static TS_RULES: SyntaxRules = SyntaxRules {
         "Set",
         "Promise",
     ],
+    operators: &["&&", "||", "!==", "===", "!=", "==", "<=", ">=", "=>"],
     highlight_numbers: true,
     is_markdown: false,
     is_json: false,
@@ -1406,6 +1435,7 @@ static JS_RULES: SyntaxRules = SyntaxRules {
         "String",
         "Boolean",
     ],
+    operators: &["&&", "||", "!==", "===", "!=", "==", "<=", ">=", "=>"],
     highlight_numbers: true,
     is_markdown: false,
     is_json: false,
@@ -1427,6 +1457,7 @@ static BASH_RULES: SyntaxRules = SyntaxRules {
         "eval", "exec", "exit", "shift", "trap", "break", "continue",
     ],
     types: &["true", "false"],
+    operators: &["&&", "||"],
     highlight_numbers: true,
     is_markdown: false,
     is_json: false,
@@ -1452,6 +1483,7 @@ static C_RULES: SyntaxRules = SyntaxRules {
         "size_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t",
         "uint64_t", "bool", "true", "false",
     ],
+    operators: &["&&", "||", "!=", "==", "<=", ">=", "->"],
     highlight_numbers: true,
     is_markdown: false,
     is_json: false,
@@ -1471,6 +1503,7 @@ static TOML_RULES: SyntaxRules = SyntaxRules {
     string_delims: TOML_STRINGS,
     keywords: &[],
     types: &["true", "false"],
+    operators: &[],
     highlight_numbers: true,
     is_markdown: false,
     is_json: false,
@@ -1485,6 +1518,7 @@ static JSON_RULES: SyntaxRules = SyntaxRules {
     string_delims: JSON_STRINGS,
     keywords: &[],
     types: &["true", "false", "null"],
+    operators: &[],
     highlight_numbers: true,
     is_markdown: false,
     is_json: true,
@@ -1502,6 +1536,7 @@ static YAML_RULES: SyntaxRules = SyntaxRules {
     string_delims: YAML_STRINGS,
     keywords: &[],
     types: &["true", "false", "null", "yes", "no"],
+    operators: &[],
     highlight_numbers: true,
     is_markdown: false,
     is_json: false,
@@ -1522,6 +1557,7 @@ static MAKEFILE_RULES: SyntaxRules = SyntaxRules {
         "override", "export", "unexport", "vpath",
     ],
     types: &[],
+    operators: &[],
     highlight_numbers: false,
     is_markdown: false,
     is_json: false,
@@ -1539,6 +1575,7 @@ static HTML_RULES: SyntaxRules = SyntaxRules {
     string_delims: HTML_STRINGS,
     keywords: &[],
     types: &[],
+    operators: &[],
     highlight_numbers: false,
     is_markdown: false,
     is_json: false,
@@ -1556,6 +1593,7 @@ static CSS_RULES: SyntaxRules = SyntaxRules {
     string_delims: CSS_STRINGS,
     keywords: &[],
     types: &[],
+    operators: &[],
     highlight_numbers: true,
     is_markdown: false,
     is_json: false,
@@ -1592,6 +1630,7 @@ static DOCKERFILE_RULES: SyntaxRules = SyntaxRules {
         "AS",
     ],
     types: &[],
+    operators: &[],
     highlight_numbers: false,
     is_markdown: false,
     is_json: false,
@@ -1604,6 +1643,7 @@ static MARKDOWN_RULES: SyntaxRules = SyntaxRules {
     string_delims: &[],
     keywords: &[],
     types: &[],
+    operators: &[],
     highlight_numbers: false,
     is_markdown: true,
     is_json: false,

@@ -49,6 +49,8 @@ pub struct UndoStack {
     last_kind: Option<OpKind>,
     last_time: Option<Instant>,
     last_cursor: Pos,
+    /// When true, all recorded operations go into the same group (no heuristic breaks).
+    force_group: bool,
 }
 
 impl UndoStack {
@@ -60,11 +62,24 @@ impl UndoStack {
             last_kind: None,
             last_time: None,
             last_cursor: Pos::zero(),
+            force_group: false,
         }
     }
 
     /// Immediately flush the current group, sealing it as a completed undo step.
     pub fn seal(&mut self) {
+        self.flush_current();
+    }
+
+    /// Begin a forced group: all operations until `end_group` go into one undo step.
+    pub fn begin_group(&mut self) {
+        self.flush_current();
+        self.force_group = true;
+    }
+
+    /// End a forced group and flush it as a single undo step.
+    pub fn end_group(&mut self) {
+        self.force_group = false;
         self.flush_current();
     }
 
@@ -94,6 +109,10 @@ impl UndoStack {
 
     fn should_break_group(&self, op: &Operation, cursor_before: Pos) -> bool {
         if self.current.is_none() {
+            return false;
+        }
+
+        if self.force_group {
             return false;
         }
 

@@ -72,6 +72,14 @@ impl Document {
         self.undo_stack.seal();
     }
 
+    pub fn begin_undo_group(&mut self) {
+        self.undo_stack.begin_group();
+    }
+
+    pub fn end_undo_group(&mut self) {
+        self.undo_stack.end_group();
+    }
+
     /// Undo the last operation group. Returns new cursor position.
     pub fn undo(&mut self) -> Option<Pos> {
         let (ops, cursor) = self.undo_stack.undo()?;
