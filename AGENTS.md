@@ -144,7 +144,7 @@ Entered via `^p` command palette. Available commands:
 - [x] Comment toggle (`^d` / `comment` command, language-aware)
 - [x] Tab completion in command palette
 - [x] Tab display as dark grey pipes
-- [x] Find navigation mode (up/down browse matches, "match X of Y", current match green, exits to selection)
+- [x] Find navigation mode (up/down browse matches, "match X of Y", current match green, centers viewport on match, exits to selection)
 - [x] Shift+Tab dedent (removes leading tab or 2 spaces from current/selected lines)
 - [x] File locking (`~/.config/e/buffers/<encoded_path>.elock`) to prevent concurrent edits
 - [x] Automatic `mkdir -p` on save when parent directories don't exist

@@ -63,6 +63,15 @@ impl View {
         }
     }
 
+    /// Center the viewport vertically on the given line.
+    pub fn center_on_line(&mut self, line: usize) {
+        let rows = self.text_rows();
+        if rows == 0 {
+            return;
+        }
+        self.scroll_line = line.saturating_sub(rows / 2);
+    }
+
     /// Convert a buffer (line, col) to screen (row, col). Returns None if off-screen.
     #[allow(dead_code)]
     pub fn buffer_to_screen(

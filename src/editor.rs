@@ -724,6 +724,7 @@ impl Editor {
         self.find_index = idx;
         let (_start, end) = self.find_matches[idx];
         self.set_cursor(end);
+        self.view.center_on_line(end.line);
         self.set_find_status();
     }
 
@@ -737,6 +738,7 @@ impl Editor {
         self.find_index = idx;
         let (_start, end) = self.find_matches[idx];
         self.set_cursor(end);
+        self.view.center_on_line(end.line);
         self.set_find_status();
     }
 
