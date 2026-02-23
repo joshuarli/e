@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 
 use crate::buffer::{self, GapBuffer};
+use crate::highlight::{self, HlState, HlType, SyntaxRules};
 use crate::selection::{Pos, Selection};
 use crate::view::View;
 
@@ -37,6 +38,7 @@ pub struct Renderer {
     #[allow(dead_code)]
     line_hashes: Vec<u64>,
     pub needs_full_redraw: bool,
+    syntax: Option<&'static SyntaxRules>,
 }
 
 impl Renderer {
@@ -44,7 +46,12 @@ impl Renderer {
         Self {
             line_hashes: Vec::new(),
             needs_full_redraw: true,
+            syntax: None,
         }
+    }
+
+    pub fn set_syntax(&mut self, rules: Option<&'static SyntaxRules>) {
+        self.syntax = rules;
     }
 
     pub fn force_full_redraw(&mut self) {
@@ -87,6 +94,20 @@ impl Renderer {
 
         write!(out, "\x1b[?25l")?;
 
+        // Compute per-line highlight states for visible lines
+        let last_visible = (view.scroll_line + text_rows).min(line_count);
+        let mut hl_states: Vec<HlState> = Vec::new();
+        if let Some(rules) = self.syntax {
+            hl_states.reserve(last_visible + 1);
+            let mut state = HlState::Normal;
+            for line_idx in 0..last_visible {
+                hl_states.push(state);
+                let raw = buf.line_text(line_idx);
+                let (_, next_state) = highlight::highlight_line(&raw, state, rules);
+                state = next_state;
+            }
+        }
+
         for row in 0..text_rows {
             let logical_line = view.scroll_line + row;
             write!(out, "\x1b[{};1H\x1b[2K", row + 1)?;
@@ -104,6 +125,14 @@ impl Renderer {
                 let chars: Vec<char> = line_str.chars().collect();
                 let visible_start = view.scroll_col.min(chars.len());
                 let visible_end = (view.scroll_col + text_cols).min(chars.len());
+
+                // Compute per-char syntax highlights for this line
+                let char_hl: Option<Vec<HlType>> = self.syntax.and_then(|rules| {
+                    hl_states.get(logical_line).map(|&state| {
+                        let (byte_hl, _) = highlight::highlight_line(&raw_text, state, rules);
+                        highlight::byte_hl_to_char_hl(&raw_text, &byte_hl)
+                    })
+                });
 
                 // Build per-character highlight info: selection or find match
                 let need_per_char =
@@ -176,32 +205,60 @@ impl Renderer {
                             }
                         } else if let Some((_, _, is_current)) = find_hit {
                             if *is_current {
-                                // Current match: green background, black text
                                 write!(out, "\x1b[42;30m{}\x1b[0m", ch)?;
                             } else {
-                                // Other matches: yellow background, black text
                                 write!(out, "\x1b[43;30m{}\x1b[0m", ch)?;
                             }
                         } else if is_tab_pipe {
-                            // Dark grey tab indicator
                             write!(out, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
-                            write!(out, "{}", ch)?;
+                            // Syntax color as fallback
+                            let ht = char_hl
+                                .as_ref()
+                                .and_then(|h| h.get(i).copied())
+                                .unwrap_or(HlType::Normal);
+                            let code = ht.ansi_code();
+                            if code.is_empty() {
+                                write!(out, "{}", ch)?;
+                            } else {
+                                write!(out, "{}{}\x1b[0m", code, ch)?;
+                            }
                         }
                     }
                 } else {
-                    // Fast path: no selection or find, but still need tab styling
+                    // Fast path: no selection or find — use syntax highlighting with minimal escapes
+                    let mut current_hl = HlType::Normal;
                     for (i, ch) in chars
                         .iter()
                         .enumerate()
                         .take(visible_end)
                         .skip(visible_start)
                     {
-                        if i < tab_pipes.len() && tab_pipes[i] {
+                        let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
+                        if is_tab_pipe {
+                            if current_hl != HlType::Normal {
+                                write!(out, "\x1b[0m")?;
+                                current_hl = HlType::Normal;
+                            }
                             write!(out, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
+                            let ht = char_hl
+                                .as_ref()
+                                .and_then(|h| h.get(i).copied())
+                                .unwrap_or(HlType::Normal);
+                            if ht != current_hl {
+                                if ht == HlType::Normal {
+                                    write!(out, "\x1b[0m")?;
+                                } else {
+                                    write!(out, "{}", ht.ansi_code())?;
+                                }
+                                current_hl = ht;
+                            }
                             write!(out, "{}", ch)?;
                         }
+                    }
+                    if current_hl != HlType::Normal {
+                        write!(out, "\x1b[0m")?;
                     }
                 }
             } else if ruler_on {

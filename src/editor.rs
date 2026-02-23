@@ -12,6 +12,7 @@ use crate::clipboard::Clipboard;
 use crate::command::{CommandAction, CommandRegistry};
 use crate::command_buffer::{CommandBuffer, CommandBufferMode, CommandBufferResult};
 use crate::document::Document;
+use crate::highlight;
 use crate::keybind::{EditorAction, KeybindingTable};
 use crate::language;
 use crate::render::{Renderer, gutter_width};
@@ -267,6 +268,10 @@ impl Editor {
         } else {
             None
         };
+
+        let lang = self.doc.filename.as_deref().and_then(language::detect);
+        let rules = lang.and_then(|l| highlight::rules_for_language(l.name));
+        self.renderer.set_syntax(rules);
 
         self.renderer.render(
             out,

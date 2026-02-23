@@ -24,7 +24,7 @@ src/
   selection.rs       Pos (line, col), Selection (anchor+cursor), word/line boundary helpers
   operation.rs       Operation enum (Insert/Delete), OperationGroup, UndoStack with grouping
   view.rs            Viewport: scroll offsets, cursor-to-screen mapping (no scroll margin)
-  render.rs          ANSI rendering: gutter, line content, tab pipes, selection/find highlighting, status bar, completions
+  render.rs          ANSI rendering: gutter, line content, tab pipes, syntax/selection/find highlighting, status bar, completions
   keybind.rs         EditorAction enum, KeybindingTable with defaults, INI config loader
   command.rs         CommandRegistry: HashMap<String, CommandFn>, built-in commands
   command_buffer.rs  Modal mini-editor for command palette, find, goto, save-as prompt, sudo password; tab completion
@@ -32,7 +32,7 @@ src/
   file_io.rs         Read/write files, CRLF→LF normalization, binary detection, trailing whitespace strip, file locking
   language.rs        Language detection by file extension (~45 languages), comment syntax lookup
   signal.rs          Placeholder (SIGWINCH handled directly in editor.rs via signal-hook)
-  highlight.rs       Stub: Highlighter trait + Span/Style types for future syntax highlighting
+  highlight.rs       Syntax highlighting: byte-by-byte highlighter, HlType/HlState types, per-language rules (14 languages), ANSI color theme
 ```
 
 ## Key Data Structures
@@ -54,7 +54,7 @@ Channel-based (`std::sync::mpsc`). No async runtime.
 
 ## Rendering
 
-All output buffered to a `Write` impl, flushed once per frame. Status bar (reverse video) on second-to-last row shows `Language │ Ln X, Col Y` on the right. Command buffer on last row when active with blinking cursor. Tab completions render above the status bar. Selection rendered as reverse video, find matches as yellow background (current match green). Line numbers in dim text (no separator). Tabs display as dark grey `|` pipe followed by space. Cursor hidden during find navigation mode.
+All output buffered to a `Write` impl, flushed once per frame. Syntax highlighting: per-line HlState computed from line 0 through last visible line each frame; per-char HlType mapped from byte highlights; ANSI colors emitted with minimal escape changes on the fast path. Selection/find highlights override syntax colors. Status bar (reverse video) on second-to-last row shows `Language │ Ln X, Col Y` on the right. Command buffer on last row when active with blinking cursor. Tab completions render above the status bar. Selection rendered as reverse video, find matches as yellow background (current match green). Line numbers in dim text (no separator). Tabs display as dark grey `|` pipe followed by space. Cursor hidden during find navigation mode.
 
 ## Keybindings
 
@@ -143,5 +143,5 @@ Entered via `^p` command palette. Available commands:
 
 ## Future Work
 
-- [ ] Syntax highlighting (foundation: `highlight.rs` stub with `Highlighter` trait)
+- [x] Syntax highlighting (14 languages: Rust, Python, Go, TypeScript, JavaScript, Shell, C, TOML, JSON, YAML, Makefile, HTML, CSS, Dockerfile)
 - [ ] Differential rendering with per-line hashes (field exists in `Renderer`, not yet wired up)

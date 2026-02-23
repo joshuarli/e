@@ -5,7 +5,6 @@ mod command_buffer;
 mod document;
 mod editor;
 mod file_io;
-#[allow(unused)]
 mod highlight;
 mod keybind;
 mod language;

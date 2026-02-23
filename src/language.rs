@@ -347,14 +347,21 @@ const LANGUAGES: &[(&[&str], Language)] = &[
 
 /// Detect language from a filename.
 pub fn detect(filename: &str) -> Option<Language> {
+    let basename = filename.rsplit('/').next().unwrap_or(filename);
     for (patterns, lang) in LANGUAGES {
         for pattern in *patterns {
             if pattern.starts_with('.') {
                 if filename.ends_with(pattern) {
                     return Some(*lang);
                 }
-            } else if filename.ends_with(pattern) {
-                return Some(*lang);
+            } else {
+                // Exact basename match or prefix+dot (e.g. "Dockerfile" matches "Dockerfile.release")
+                if basename == *pattern
+                    || (basename.starts_with(pattern)
+                        && basename.as_bytes().get(pattern.len()) == Some(&b'.'))
+                {
+                    return Some(*lang);
+                }
             }
         }
     }
@@ -394,5 +401,22 @@ mod tests {
     #[test]
     fn test_detect_with_path() {
         assert_eq!(detect("/some/path/main.rs").unwrap().name, "Rust");
+    }
+
+    #[test]
+    fn test_detect_dockerfile_prefix() {
+        assert_eq!(detect("Dockerfile").unwrap().name, "Dockerfile");
+        assert_eq!(detect("Dockerfile.release").unwrap().name, "Dockerfile");
+        assert_eq!(detect("Dockerfile.dev").unwrap().name, "Dockerfile");
+        assert_eq!(
+            detect("/path/to/Dockerfile.prod").unwrap().name,
+            "Dockerfile"
+        );
+    }
+
+    #[test]
+    fn test_detect_makefile_prefix() {
+        assert_eq!(detect("Makefile").unwrap().name, "Makefile");
+        assert_eq!(detect("/path/Makefile").unwrap().name, "Makefile");
     }
 }
