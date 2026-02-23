@@ -5,7 +5,7 @@ A performant, minimalist text editor in Rust. Single-file editing only — no ta
 ## Design Constraints
 
 - Rust 2024 edition
-- 3 dependencies only: `termion`, `regex`, `libc` — do not add crates without good reason
+- 3 dependencies only: `termion`, `regex-lite`, `libc` — do not add crates without good reason
 - Single-file editing — no tabs, no file browser, no split panes
 - macOS and Linux only (no Windows)
 - Indent: 2 spaces for all files except `.c`, `.h`, `.go`, `Makefile` which use tabs

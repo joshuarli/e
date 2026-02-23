@@ -648,11 +648,11 @@ impl Editor {
         // Smart-case: case-insensitive if all lowercase
         let case_insensitive = pattern.chars().all(|c| !c.is_uppercase());
         let re = if case_insensitive {
-            regex::RegexBuilder::new(pattern)
+            regex_lite::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
         } else {
-            regex::Regex::new(pattern)
+            regex_lite::Regex::new(pattern)
         };
 
         let re = match re {
@@ -738,11 +738,11 @@ impl Editor {
     fn replace_all(&mut self, pattern: &str, replacement: &str) {
         let case_insensitive = pattern.chars().all(|c| !c.is_uppercase());
         let re = if case_insensitive {
-            regex::RegexBuilder::new(pattern)
+            regex_lite::RegexBuilder::new(pattern)
                 .case_insensitive(true)
                 .build()
         } else {
-            regex::Regex::new(pattern)
+            regex_lite::Regex::new(pattern)
         };
         let re = match re {
             Ok(r) => r,

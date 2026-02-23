@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 termion = "4"
-regex = "1"
+regex-lite = "0.1"
 libc = "0.2"
 
 [profile.release]
