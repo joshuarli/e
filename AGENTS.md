@@ -48,7 +48,7 @@ src/
 
 Channel-based (`std::sync::mpsc`). No async runtime.
 
-1. Background thread: reads `stdin.events()` via termion → sends `EditorEvent::Term(Event)`
+1. Background thread: reads `stdin.events()` via termion → sends `EditorEvent::Term(Event)`. Detects bracketed paste markers (`\x1b[200~`/`\x1b[201~`) and buffers pasted text into a single `EditorEvent::Paste(String)` for atomic undo.
 2. Background thread: listens for `SIGWINCH` via `signal-hook` → sends `EditorEvent::Resize(w, h)`
 3. Main thread: `recv_timeout(500ms)` — dispatches events, expires status messages, redraws
 
@@ -139,6 +139,7 @@ Entered via `^p` command palette. Available commands:
 - [x] File locking (`~/.config/e/buffers/<encoded_path>.elock`) to prevent concurrent edits
 - [x] Automatic `mkdir -p` on save when parent directories don't exist
 - [x] Sudo save on permission denied (password prompt with asterisk masking, pipes to `sudo -S`)
+- [x] Bracketed paste mode (terminal paste detected as single atomic undo operation)
 
 ## Future Work
 

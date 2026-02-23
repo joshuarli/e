@@ -20,6 +20,17 @@ use crate::view::View;
 
 const SCROLL_LINES: usize = 3;
 
+const PASTE_START: &[u8] = &[0x1b, b'[', b'2', b'0', b'0', b'~'];
+const PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
+
+fn is_paste_start(ev: &Event) -> bool {
+    matches!(ev, Event::Unsupported(bytes) if bytes == PASTE_START)
+}
+
+fn is_paste_end(ev: &Event) -> bool {
+    matches!(ev, Event::Unsupported(bytes) if bytes == PASTE_END)
+}
+
 fn common_prefix(strings: &[&str]) -> String {
     if strings.is_empty() {
         return String::new();
@@ -71,6 +82,7 @@ pub struct Editor {
 
 enum EditorEvent {
     Term(Event),
+    Paste(String),
     Resize(u16, u16),
     #[allow(dead_code)]
     Tick,
@@ -111,7 +123,7 @@ impl Editor {
     pub fn run(&mut self) -> io::Result<()> {
         let mut stdout = stdout().into_raw_mode()?.into_alternate_screen()?;
 
-        write!(stdout, "\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
+        write!(stdout, "\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h")?;
         stdout.flush()?;
 
         let (tx, rx) = mpsc::channel::<EditorEvent>();
@@ -119,7 +131,32 @@ impl Editor {
         let tx_input = tx.clone();
         std::thread::spawn(move || {
             let stdin = io::stdin();
+            let mut in_paste = false;
+            let mut paste_buf = String::new();
             for ev in stdin.events().flatten() {
+                if is_paste_start(&ev) {
+                    in_paste = true;
+                    paste_buf.clear();
+                    continue;
+                }
+                if is_paste_end(&ev) {
+                    in_paste = false;
+                    if tx_input
+                        .send(EditorEvent::Paste(std::mem::take(&mut paste_buf)))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                if in_paste {
+                    match &ev {
+                        Event::Key(Key::Char(c)) => paste_buf.push(*c),
+                        Event::Key(Key::Backspace) => paste_buf.push('\x7f'),
+                        _ => {}
+                    }
+                    continue;
+                }
                 if tx_input.send(EditorEvent::Term(ev)).is_err() {
                     break;
                 }
@@ -152,6 +189,7 @@ impl Editor {
 
             match rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(EditorEvent::Term(ev)) => self.handle_event(ev),
+                Ok(EditorEvent::Paste(text)) => self.paste_text(&text),
                 Ok(EditorEvent::Resize(w, h)) => {
                     self.view.width = w;
                     self.view.height = h;
@@ -162,7 +200,7 @@ impl Editor {
             }
         }
 
-        write!(stdout, "\x1b[?1006l\x1b[?1002l\x1b[?1000l")?;
+        write!(stdout, "\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l")?;
         stdout.flush()?;
         Ok(())
     }
@@ -1290,6 +1328,10 @@ impl Editor {
 
     fn paste(&mut self) {
         let text = self.clipboard.paste();
+        self.paste_text(&text);
+    }
+
+    fn paste_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
