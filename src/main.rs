@@ -8,6 +8,7 @@ mod file_io;
 #[allow(unused)]
 mod highlight;
 mod keybind;
+mod language;
 mod operation;
 mod render;
 mod selection;
@@ -29,6 +30,11 @@ fn confirm(prompt: &str) -> bool {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    if args.len() > 2 {
+        eprintln!("Usage: e [file]");
+        process::exit(1);
+    }
 
     let (text, filename) = if args.len() > 1 {
         let path = Path::new(&args[1]);

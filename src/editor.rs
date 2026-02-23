@@ -12,11 +12,30 @@ use crate::command::{CommandAction, CommandRegistry};
 use crate::command_buffer::{CommandBuffer, CommandBufferMode, CommandBufferResult};
 use crate::document::Document;
 use crate::keybind::{EditorAction, KeybindingTable};
+use crate::language;
 use crate::render::{Renderer, gutter_width};
-use crate::selection::{Pos, Selection, is_word_char, prev_word_boundary};
+use crate::selection::{Pos, Selection, prev_word_boundary};
 use crate::view::View;
 
 const SCROLL_LINES: usize = 3;
+
+fn common_prefix(strings: &[&str]) -> String {
+    if strings.is_empty() {
+        return String::new();
+    }
+    let first = strings[0];
+    let mut len = first.len();
+    for s in &strings[1..] {
+        len = len.min(s.len());
+        for (i, (a, b)) in first.bytes().zip(s.bytes()).enumerate() {
+            if a != b {
+                len = len.min(i);
+                break;
+            }
+        }
+    }
+    first[..len].to_string()
+}
 
 pub struct Editor {
     doc: Document,
@@ -191,6 +210,8 @@ impl Editor {
             None
         };
 
+        let completions = &self.cmd_buf.completions;
+
         self.renderer.render(
             out,
             &mut self.doc.buf,
@@ -203,6 +224,7 @@ impl Editor {
             cmd_ref,
             sel,
             find_matches,
+            completions,
         )
     }
 
@@ -216,12 +238,18 @@ impl Editor {
     }
 
     fn status_right(&mut self) -> String {
-        let line_count = self.doc.buf.line_count();
+        let lang_name = self
+            .doc
+            .filename
+            .as_deref()
+            .and_then(language::detect)
+            .map(|l| l.name)
+            .unwrap_or("Text");
         format!(
-            "Ln {}, Col {} \u{2502} {} lines ",
+            "{} \u{2502} Ln {}, Col {} ",
+            lang_name,
             self.cursor().line + 1,
             self.cursor().col + 1,
-            line_count,
         )
     }
 
@@ -314,6 +342,7 @@ impl Editor {
                     self.find_matches.clear();
                 }
                 EditorAction::CtrlBackspace => self.ctrl_backspace(),
+                EditorAction::ToggleComment => self.toggle_comment(),
             }
             return;
         }
@@ -395,7 +424,49 @@ impl Editor {
                     self.update_find_highlights(&val);
                 }
             }
+            CommandBufferResult::TabComplete => {
+                if mode == CommandBufferMode::Command {
+                    self.complete_command();
+                }
+            }
             CommandBufferResult::Continue => {}
+        }
+    }
+
+    fn complete_command(&mut self) {
+        let input = self.cmd_buf.input.trim().to_string();
+        let names = self.commands.command_names();
+
+        if input.is_empty() {
+            // Show all commands
+            self.cmd_buf.completions = names.iter().map(|s| s.to_string()).collect();
+        } else {
+            let matches: Vec<&str> = names
+                .iter()
+                .filter(|n| n.starts_with(&input))
+                .copied()
+                .collect();
+
+            match matches.len() {
+                0 => {
+                    self.cmd_buf.completions.clear();
+                }
+                1 => {
+                    // Single match — autocomplete
+                    self.cmd_buf.input = matches[0].to_string();
+                    self.cmd_buf.cursor = self.cmd_buf.input.len();
+                    self.cmd_buf.completions.clear();
+                }
+                _ => {
+                    // Multiple matches — show them and complete common prefix
+                    self.cmd_buf.completions = matches.iter().map(|s| s.to_string()).collect();
+                    let common = common_prefix(&matches);
+                    if common.len() > input.len() {
+                        self.cmd_buf.input = common;
+                        self.cmd_buf.cursor = self.cmd_buf.input.len();
+                    }
+                }
+            }
         }
     }
 
@@ -422,6 +493,7 @@ impl Editor {
             } => {
                 self.replace_all(&pattern, &replacement);
             }
+            CommandAction::ToggleComment => self.toggle_comment(),
             CommandAction::StatusMsg(msg) => self.set_status(msg),
         }
     }
@@ -650,18 +722,20 @@ impl Editor {
             return;
         }
         let col = pos.col.min(line_text.len().saturating_sub(1));
-        if col < line_text.len() && is_word_char(line_text[col]) {
+        if col < line_text.len() && line_text[col] != b' ' && line_text[col] != b'\t' {
+            // Space-delineated: select everything between whitespace boundaries
             let mut start = col;
-            while start > 0 && is_word_char(line_text[start - 1]) {
+            while start > 0 && line_text[start - 1] != b' ' && line_text[start - 1] != b'\t' {
                 start -= 1;
             }
             let mut end = col;
-            while end < line_text.len() && is_word_char(line_text[end]) {
+            while end < line_text.len() && line_text[end] != b' ' && line_text[end] != b'\t' {
                 end += 1;
             }
+            // Anchor at end, cursor at start so the cursor doesn't appear past the word
             self.sel = Selection {
-                anchor: Pos::new(pos.line, start),
-                cursor: Pos::new(pos.line, end),
+                anchor: Pos::new(pos.line, end),
+                cursor: Pos::new(pos.line, start),
             };
         }
     }
@@ -974,6 +1048,86 @@ impl Editor {
         self.set_cursor(start);
     }
 
+    // -- commenting ---------------------------------------------------------
+
+    fn toggle_comment(&mut self) {
+        let comment = match self.doc.filename.as_deref().and_then(language::detect) {
+            Some(lang) => lang.comment,
+            None => {
+                self.set_status("No language detected for commenting".to_string());
+                return;
+            }
+        };
+
+        // Determine line range: selection or current line
+        let (start_line, end_line) = if self.sel.is_empty() {
+            (self.cursor().line, self.cursor().line)
+        } else {
+            let (s, e) = self.sel.ordered();
+            let end = if e.col == 0 && e.line > s.line {
+                e.line - 1
+            } else {
+                e.line
+            };
+            (s.line, end)
+        };
+
+        // Check if all lines are already commented
+        let prefix = format!("{} ", comment);
+        let all_commented = (start_line..=end_line).all(|line_idx| {
+            let text = self.doc.buf.line_text(line_idx);
+            let trimmed = text.iter().position(|&b| b != b' ' && b != b'\t');
+            match trimmed {
+                Some(pos) => text[pos..].starts_with(prefix.as_bytes()),
+                None => true, // empty/whitespace-only lines count as commented
+            }
+        });
+
+        self.doc.seal_undo();
+        if all_commented {
+            // Uncomment: remove first occurrence of "comment " from each line
+            for line_idx in (start_line..=end_line).rev() {
+                let text = self.doc.buf.line_text(line_idx);
+                let indent_pos = text
+                    .iter()
+                    .position(|&b| b != b' ' && b != b'\t')
+                    .unwrap_or(text.len());
+                if text[indent_pos..].starts_with(prefix.as_bytes()) {
+                    let indent_chars = crate::buffer::char_count(&text[..indent_pos]);
+                    let prefix_chars = crate::buffer::char_count(prefix.as_bytes());
+                    self.doc.delete_range(
+                        Pos::new(line_idx, indent_chars),
+                        Pos::new(line_idx, indent_chars + prefix_chars),
+                    );
+                }
+            }
+        } else {
+            // Comment: find minimum indent, insert comment prefix at that indent
+            let min_indent = (start_line..=end_line)
+                .filter_map(|line_idx| {
+                    let text = self.doc.buf.line_text(line_idx);
+                    text.iter().position(|&b| b != b' ' && b != b'\t') // None for blank lines
+                })
+                .min()
+                .unwrap_or(0);
+            let min_indent_chars = {
+                // Convert byte indent to char indent using first non-blank line
+                let text = self.doc.buf.line_text(start_line);
+                crate::buffer::char_count(&text[..min_indent.min(text.len())])
+            };
+            for line_idx in (start_line..=end_line).rev() {
+                let text = self.doc.buf.line_text(line_idx);
+                let is_blank = text.iter().all(|&b| b == b' ' || b == b'\t');
+                if is_blank {
+                    continue;
+                }
+                self.doc
+                    .insert(line_idx, min_indent_chars, prefix.as_bytes());
+            }
+        }
+        self.doc.seal_undo();
+    }
+
     // -- clipboard ----------------------------------------------------------
 
     fn copy(&mut self) {
@@ -1026,9 +1180,40 @@ impl Editor {
 
     // -- file I/O -----------------------------------------------------------
 
+    fn strip_trailing_whitespace(&mut self) {
+        let line_count = self.doc.buf.line_count();
+        self.doc.seal_undo();
+        for line_idx in (0..line_count).rev() {
+            let text = self.doc.buf.line_text(line_idx);
+            let trimmed_len = text
+                .iter()
+                .rposition(|&b| b != b' ' && b != b'\t')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let char_len = crate::buffer::char_count(&text);
+            let trim_char_len = crate::buffer::char_count(&text[..trimmed_len]);
+            if trim_char_len < char_len {
+                self.doc.delete_range(
+                    Pos::new(line_idx, trim_char_len),
+                    Pos::new(line_idx, char_len),
+                );
+            }
+        }
+        self.doc.seal_undo();
+        // Adjust cursor if past end of line
+        let c = self.cursor();
+        let line_len = self.doc.buf.line_char_len(c.line);
+        if c.col > line_len {
+            self.set_cursor(Pos::new(c.line, line_len));
+        }
+    }
+
     fn save_file(&mut self) {
-        if let Some(ref path) = self.doc.filename {
-            match crate::file_io::write_file(std::path::Path::new(path), &self.doc.buf.contents()) {
+        if self.doc.filename.is_some() {
+            self.strip_trailing_whitespace();
+            let path = self.doc.filename.clone().unwrap();
+            match crate::file_io::write_file(std::path::Path::new(&path), &self.doc.buf.contents())
+            {
                 Ok(()) => {
                     self.doc.dirty = false;
                     self.set_status(format!("Saved {}", path));

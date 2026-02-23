@@ -49,8 +49,6 @@ pub struct UndoStack {
     last_kind: Option<OpKind>,
     last_time: Option<Instant>,
     last_cursor: Pos,
-    /// Set to true when the next op should force a new group.
-    force_seal: bool,
 }
 
 impl UndoStack {
@@ -62,13 +60,12 @@ impl UndoStack {
             last_kind: None,
             last_time: None,
             last_cursor: Pos::zero(),
-            force_seal: false,
         }
     }
 
-    /// Mark that the next operation should start a new group.
+    /// Immediately flush the current group, sealing it as a completed undo step.
     pub fn seal(&mut self) {
-        self.force_seal = true;
+        self.flush_current();
     }
 
     /// Record an operation. Determines whether to extend current group or start new.
@@ -93,13 +90,9 @@ impl UndoStack {
         self.last_kind = Some(op.kind());
         self.last_time = Some(Instant::now());
         self.last_cursor = cursor_after;
-        self.force_seal = false;
     }
 
     fn should_break_group(&self, op: &Operation, cursor_before: Pos) -> bool {
-        if self.force_seal {
-            return true;
-        }
         if self.current.is_none() {
             return false;
         }

@@ -31,6 +31,7 @@ pub enum EditorAction {
     GotoLine,
     Find,
     CtrlBackspace,
+    ToggleComment,
 }
 
 pub struct KeybindingTable {
@@ -61,6 +62,7 @@ impl KeybindingTable {
         bindings.insert(kc(Key::Ctrl('l')), EditorAction::GotoLine);
         bindings.insert(kc(Key::Ctrl('f')), EditorAction::Find);
         bindings.insert(kc(Key::Ctrl('h')), EditorAction::CtrlBackspace);
+        bindings.insert(kc(Key::Ctrl('d')), EditorAction::ToggleComment);
         Self { bindings }
     }
 
@@ -133,6 +135,7 @@ fn parse_action(s: &str) -> Option<EditorAction> {
         "gotoline" => Some(EditorAction::GotoLine),
         "find" => Some(EditorAction::Find),
         "ctrlbackspace" => Some(EditorAction::CtrlBackspace),
+        "togglecomment" => Some(EditorAction::ToggleComment),
         _ => None,
     }
 }
@@ -207,6 +210,15 @@ mod tests {
     }
 
     #[test]
+    fn test_defaults_has_toggle_comment() {
+        let kb = KeybindingTable::with_defaults();
+        assert_eq!(
+            kb.lookup(Key::Ctrl('d')),
+            Some(&EditorAction::ToggleComment)
+        );
+    }
+
+    #[test]
     fn test_lookup_unbound_key() {
         let kb = KeybindingTable::with_defaults();
         assert_eq!(kb.lookup(Key::Ctrl('j')), None);
@@ -271,6 +283,10 @@ mod tests {
         assert_eq!(
             parse_action("ctrlbackspace"),
             Some(EditorAction::CtrlBackspace)
+        );
+        assert_eq!(
+            parse_action("togglecomment"),
+            Some(EditorAction::ToggleComment)
         );
     }
 

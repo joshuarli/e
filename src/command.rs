@@ -20,6 +20,7 @@ pub enum CommandAction {
         pattern: String,
         replacement: String,
     },
+    ToggleComment,
     StatusMsg(String),
 }
 
@@ -40,6 +41,13 @@ impl CommandRegistry {
         commands.insert("comment".to_string(), cmd_comment);
 
         Self { commands }
+    }
+
+    /// Return sorted list of unique command names.
+    pub fn command_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.commands.keys().map(|s| s.as_str()).collect();
+        names.sort();
+        names
     }
 
     pub fn execute(&self, input: &str) -> CommandAction {
@@ -106,7 +114,7 @@ fn cmd_replaceall(args: &str, ctx: &mut CommandContext) {
 }
 
 fn cmd_comment(_args: &str, ctx: &mut CommandContext) {
-    ctx.action = CommandAction::StatusMsg("comment: not yet implemented".to_string());
+    ctx.action = CommandAction::ToggleComment;
 }
 
 #[cfg(test)]
@@ -224,12 +232,12 @@ mod tests {
     }
 
     #[test]
-    fn test_comment_stub() {
+    fn test_comment_toggle() {
         let reg = CommandRegistry::new();
-        match reg.execute("comment on") {
-            CommandAction::StatusMsg(msg) => assert!(msg.contains("not yet implemented")),
-            _ => panic!("expected StatusMsg"),
-        }
+        assert!(matches!(
+            reg.execute("comment"),
+            CommandAction::ToggleComment
+        ));
     }
 
     #[test]

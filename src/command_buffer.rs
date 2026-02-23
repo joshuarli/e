@@ -7,6 +7,8 @@ pub struct CommandBuffer {
     pub prompt: String,
     pub mode: CommandBufferMode,
     pub active: bool,
+    /// Completion suggestions displayed below the command line.
+    pub completions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -26,6 +28,8 @@ pub enum CommandBufferResult {
     Continue,
     /// Input changed (for live find).
     Changed(String),
+    /// User pressed Tab — request completion.
+    TabComplete,
 }
 
 impl CommandBuffer {
@@ -38,6 +42,7 @@ impl CommandBuffer {
             prompt: "> ".to_string(),
             mode: CommandBufferMode::Command,
             active: false,
+            completions: Vec::new(),
         }
     }
 
@@ -58,6 +63,7 @@ impl CommandBuffer {
         self.cursor = 0;
         self.active = false;
         self.history_idx = None;
+        self.completions.clear();
     }
 
     pub fn display_line(&self) -> String {
@@ -72,12 +78,18 @@ impl CommandBuffer {
                 CommandBufferResult::Submit(val)
             }
             Key::Esc => CommandBufferResult::Cancel,
+            Key::Char('\t') => {
+                self.completions.clear();
+                CommandBufferResult::TabComplete
+            }
             Key::Char(c) => {
+                self.completions.clear();
                 self.input.insert(self.cursor, c);
                 self.cursor += 1;
                 CommandBufferResult::Changed(self.input.clone())
             }
             Key::Backspace => {
+                self.completions.clear();
                 if self.cursor > 0 {
                     self.cursor -= 1;
                     self.input.remove(self.cursor);

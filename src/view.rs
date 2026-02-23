@@ -10,9 +10,6 @@ pub struct View {
     pub height: u16,
 }
 
-/// How many lines from top/bottom before we start scrolling.
-const SCROLL_MARGIN: usize = 5;
-
 impl View {
     pub fn new(width: u16, height: u16) -> Self {
         Self {
@@ -33,7 +30,7 @@ impl View {
         (self.width as usize).saturating_sub(gutter_width)
     }
 
-    /// Adjust scroll so that the cursor line is visible with margin.
+    /// Adjust scroll so that the cursor line is visible.
     pub fn ensure_cursor_visible(
         &mut self,
         cursor_line: usize,
@@ -44,14 +41,13 @@ impl View {
         if rows == 0 {
             return;
         }
-        let margin = SCROLL_MARGIN.min(rows / 2);
 
-        // Vertical
-        if cursor_line < self.scroll_line + margin {
-            self.scroll_line = cursor_line.saturating_sub(margin);
+        // Vertical: scroll just enough to keep cursor on screen
+        if cursor_line < self.scroll_line {
+            self.scroll_line = cursor_line;
         }
-        if cursor_line >= self.scroll_line + rows - margin {
-            self.scroll_line = cursor_line.saturating_sub(rows - margin - 1);
+        if cursor_line >= self.scroll_line + rows {
+            self.scroll_line = cursor_line - rows + 1;
         }
 
         // Horizontal
@@ -153,18 +149,15 @@ mod tests {
     fn test_ensure_visible_cursor_already_visible() {
         let mut v = View::new(80, 24);
         v.ensure_cursor_visible(10, 5, 4);
-        // Cursor at line 10 is within 0..22 range, should scroll down to maintain margin
-        assert!(v.scroll_line <= 10);
-        assert!(v.scroll_line + v.text_rows() > 10);
+        assert_eq!(v.scroll_line, 0); // no scroll needed, line 10 is within 0..22
     }
 
     #[test]
     fn test_ensure_visible_scrolls_down() {
         let mut v = View::new(80, 24);
         v.ensure_cursor_visible(30, 0, 4);
-        // Cursor at line 30 must be visible
-        assert!(v.scroll_line + v.text_rows() > 30);
-        assert!(v.scroll_line <= 30);
+        // Cursor at line 30, text_rows=22, scroll_line should be 9
+        assert_eq!(v.scroll_line, 9);
     }
 
     #[test]
@@ -172,15 +165,13 @@ mod tests {
         let mut v = View::new(80, 24);
         v.scroll_line = 50;
         v.ensure_cursor_visible(10, 0, 4);
-        // Should scroll up so line 10 is visible
-        assert!(v.scroll_line <= 10);
+        assert_eq!(v.scroll_line, 10);
     }
 
     #[test]
     fn test_ensure_visible_horizontal_right() {
         let mut v = View::new(80, 24);
         v.ensure_cursor_visible(0, 100, 4);
-        // Cursor at col 100 should cause horizontal scroll
         assert!(v.scroll_col > 0);
         assert!(v.scroll_col + v.text_cols(4) > 100);
     }
@@ -190,39 +181,33 @@ mod tests {
         let mut v = View::new(80, 24);
         v.scroll_col = 50;
         v.ensure_cursor_visible(0, 10, 4);
-        // Should scroll left to show col 10
-        assert!(v.scroll_col <= 10);
+        assert_eq!(v.scroll_col, 10);
     }
 
     #[test]
     fn test_ensure_visible_zero_rows() {
         let mut v = View::new(80, 2); // text_rows = 0
         v.ensure_cursor_visible(10, 0, 4);
-        // Should return early without panic
         assert_eq!(v.scroll_line, 0);
     }
 
     #[test]
     fn test_ensure_visible_zero_text_cols() {
         let mut v = View::new(5, 24);
-        v.ensure_cursor_visible(0, 100, 10); // gutter > width
-        // Should handle gracefully (text_cols = 0)
+        v.ensure_cursor_visible(0, 100, 10);
         assert_eq!(v.scroll_col, 0);
     }
 
     #[test]
-    fn test_ensure_visible_margin_respected() {
+    fn test_ensure_visible_cursor_at_last_row() {
         let mut v = View::new(80, 24);
-        // Place cursor near bottom of visible area
-        v.ensure_cursor_visible(16, 0, 4);
-        // Margin is 5, text_rows is 22. cursor at 16 should be fine at scroll_line=0
-        // 16 < 0 + 22 - 5 = 17, so no scroll needed
+        // text_rows=22, cursor at line 21 should not scroll
+        v.ensure_cursor_visible(21, 0, 4);
         assert_eq!(v.scroll_line, 0);
 
-        // Now place cursor at line 17 — right at the margin
-        v.ensure_cursor_visible(17, 0, 4);
-        // 17 >= 0 + 22 - 5 = 17, so should scroll
-        assert!(v.scroll_line > 0);
+        // cursor at line 22 should scroll by 1
+        v.ensure_cursor_visible(22, 0, 4);
+        assert_eq!(v.scroll_line, 1);
     }
 
     #[test]

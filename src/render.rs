@@ -4,27 +4,33 @@ use crate::buffer::{self, GapBuffer};
 use crate::selection::{Pos, Selection};
 use crate::view::View;
 
-/// Compute gutter width: width of the largest line number + 2.
+/// Compute gutter width: width of the largest line number + 1 (trailing space).
 pub fn gutter_width(line_count: usize) -> usize {
     let digits = if line_count == 0 {
         1
     } else {
         ((line_count as f64).log10().floor() as usize) + 1
     };
-    digits + 2
+    digits + 1
 }
 
-fn expand_tabs(text: &[u8]) -> Vec<u8> {
+/// Expand tabs to display characters. Returns (expanded_bytes, tab_pipe_positions).
+/// tab_pipe_positions[i] is true if display column i is the '|' of a tab.
+fn expand_tabs(text: &[u8]) -> (Vec<u8>, Vec<bool>) {
     let mut out = Vec::with_capacity(text.len());
+    let mut tab_pipes = Vec::with_capacity(text.len());
     for &b in text {
         if b == b'\t' {
+            out.push(b'|');
+            tab_pipes.push(true);
             out.push(b' ');
-            out.push(b' ');
+            tab_pipes.push(false);
         } else {
             out.push(b);
+            tab_pipes.push(false);
         }
     }
-    out
+    (out, tab_pipes)
 }
 
 pub struct Renderer {
@@ -59,6 +65,7 @@ impl Renderer {
         command_line: Option<&str>,
         selection: Option<Selection>,
         find_matches: Option<&[(Pos, Pos)]>,
+        completions: &[String],
     ) -> io::Result<()> {
         let line_count = buf.line_count();
         let gw = if ruler_on {
@@ -66,7 +73,8 @@ impl Renderer {
         } else {
             0
         };
-        let text_rows = view.text_rows();
+        let completion_rows = completions.len();
+        let text_rows = view.text_rows().saturating_sub(completion_rows);
         let text_cols = view.text_cols(gw);
 
         let (sel_start, sel_end) = selection
@@ -83,17 +91,12 @@ impl Renderer {
             if logical_line < line_count {
                 if ruler_on {
                     let num_str = format!("{}", logical_line + 1);
-                    let pad = gw - 2;
-                    write!(
-                        out,
-                        "\x1b[2m{:>width$} \u{2502}\x1b[0m",
-                        num_str,
-                        width = pad
-                    )?;
+                    let pad = gw - 1;
+                    write!(out, "\x1b[2m{:>width$} \x1b[0m", num_str, width = pad)?;
                 }
 
                 let raw_text = buf.line_text(logical_line);
-                let expanded = expand_tabs(&raw_text);
+                let (expanded, tab_pipes) = expand_tabs(&raw_text);
                 let line_str = String::from_utf8_lossy(&expanded);
                 let chars: Vec<char> = line_str.chars().collect();
                 let visible_start = view.scroll_col.min(chars.len());
@@ -156,29 +159,53 @@ impl Renderer {
                     {
                         let in_sel = need_per_char && i >= line_sel_start && i < line_sel_end;
                         let in_find = find_ranges.iter().any(|(fs, fe)| i >= *fs && i < *fe);
+                        let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
 
                         if in_sel {
-                            // Selection: reverse video
-                            write!(out, "\x1b[7m{}\x1b[0m", ch)?;
+                            if is_tab_pipe {
+                                write!(out, "\x1b[7;90m{}\x1b[0m", ch)?;
+                            } else {
+                                write!(out, "\x1b[7m{}\x1b[0m", ch)?;
+                            }
                         } else if in_find {
-                            // Find match: yellow background
                             write!(out, "\x1b[43;30m{}\x1b[0m", ch)?;
+                        } else if is_tab_pipe {
+                            // Dark grey tab indicator
+                            write!(out, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
                             write!(out, "{}", ch)?;
                         }
                     }
                 } else {
-                    let visible: String = chars[visible_start..visible_end].iter().collect();
-                    write!(out, "{}", visible)?;
+                    // Fast path: no selection or find, but still need tab styling
+                    for (i, ch) in chars
+                        .iter()
+                        .enumerate()
+                        .take(visible_end)
+                        .skip(visible_start)
+                    {
+                        if i < tab_pipes.len() && tab_pipes[i] {
+                            write!(out, "\x1b[90m{}\x1b[0m", ch)?;
+                        } else {
+                            write!(out, "{}", ch)?;
+                        }
+                    }
                 }
             } else if ruler_on {
-                let pad = gw - 2;
-                write!(out, "\x1b[2m{:>width$} \u{2502}\x1b[0m", "", width = pad)?;
+                let pad = gw - 1;
+                write!(out, "\x1b[2m{:>width$} \x1b[0m", "", width = pad)?;
             }
         }
 
+        // Completions area
+        for (i, comp) in completions.iter().enumerate() {
+            let row = text_rows + i + 1;
+            write!(out, "\x1b[{};1H\x1b[2K", row)?;
+            write!(out, "\x1b[2m  {}\x1b[0m", comp)?;
+        }
+
         // Status bar
-        let status_row = text_rows + 1;
+        let status_row = text_rows + completion_rows + 1;
         write!(out, "\x1b[{};1H\x1b[2K", status_row)?;
         write!(out, "\x1b[7m")?;
         let width = view.width as usize;
@@ -195,7 +222,7 @@ impl Renderer {
         write!(out, "\x1b[0m")?;
 
         // Command line
-        let cmd_row = text_rows + 2;
+        let cmd_row = text_rows + completion_rows + 2;
         write!(out, "\x1b[{};1H\x1b[2K", cmd_row)?;
         if let Some(cmd) = command_line {
             write!(out, "{}", cmd)?;
@@ -241,63 +268,73 @@ mod tests {
 
     #[test]
     fn test_gutter_width_zero_lines() {
-        assert_eq!(gutter_width(0), 3); // 1 digit + 2
+        assert_eq!(gutter_width(0), 2); // 1 digit + 1
     }
 
     #[test]
     fn test_gutter_width_single_digit() {
-        assert_eq!(gutter_width(1), 3); // 1 digit + 2
-        assert_eq!(gutter_width(9), 3);
+        assert_eq!(gutter_width(1), 2); // 1 digit + 1
+        assert_eq!(gutter_width(9), 2);
     }
 
     #[test]
     fn test_gutter_width_two_digits() {
-        assert_eq!(gutter_width(10), 4); // 2 digits + 2
-        assert_eq!(gutter_width(99), 4);
+        assert_eq!(gutter_width(10), 3); // 2 digits + 1
+        assert_eq!(gutter_width(99), 3);
     }
 
     #[test]
     fn test_gutter_width_three_digits() {
-        assert_eq!(gutter_width(100), 5); // 3 digits + 2
-        assert_eq!(gutter_width(999), 5);
+        assert_eq!(gutter_width(100), 4); // 3 digits + 1
+        assert_eq!(gutter_width(999), 4);
     }
 
     #[test]
     fn test_gutter_width_four_digits() {
-        assert_eq!(gutter_width(1000), 6);
-        assert_eq!(gutter_width(9999), 6);
+        assert_eq!(gutter_width(1000), 5);
+        assert_eq!(gutter_width(9999), 5);
     }
 
     #[test]
     fn test_gutter_width_large() {
-        assert_eq!(gutter_width(100000), 8); // 6 digits + 2
+        assert_eq!(gutter_width(100000), 7); // 6 digits + 1
     }
 
     // -- expand_tabs ----------------------------------------------------------
 
     #[test]
     fn test_expand_tabs_no_tabs() {
-        assert_eq!(expand_tabs(b"hello"), b"hello");
+        let (bytes, pipes) = expand_tabs(b"hello");
+        assert_eq!(bytes, b"hello");
+        assert_eq!(pipes, vec![false; 5]);
     }
 
     #[test]
     fn test_expand_tabs_single_tab() {
-        assert_eq!(expand_tabs(b"\thello"), b"  hello");
+        let (bytes, pipes) = expand_tabs(b"\thello");
+        assert_eq!(bytes, b"| hello");
+        assert_eq!(pipes, vec![true, false, false, false, false, false, false]);
     }
 
     #[test]
     fn test_expand_tabs_multiple_tabs() {
-        assert_eq!(expand_tabs(b"\t\t"), b"    ");
+        let (bytes, pipes) = expand_tabs(b"\t\t");
+        assert_eq!(bytes, b"| | ");
+        assert_eq!(pipes, vec![true, false, true, false]);
     }
 
     #[test]
     fn test_expand_tabs_mixed() {
-        assert_eq!(expand_tabs(b"a\tb\tc"), b"a  b  c");
+        let (bytes, pipes) = expand_tabs(b"a\tb\tc");
+        assert_eq!(bytes, b"a| b| c");
+        assert_eq!(pipes, vec![false, true, false, false, true, false, false]);
     }
 
     #[test]
     fn test_expand_tabs_empty() {
-        assert_eq!(expand_tabs(b""), b"");
+        let (bytes, pipes) = expand_tabs(b"");
+        assert_eq!(bytes, b"");
+        assert!(pipes.is_empty());
     }
 
     // -- display_col_for_char_col ---------------------------------------------
@@ -381,6 +418,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
 
@@ -410,6 +448,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
 
@@ -438,6 +477,7 @@ mod tests {
             Some("find: test"),
             None,
             None,
+            &[],
         )
         .unwrap();
 
@@ -466,6 +506,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
 
@@ -496,6 +537,7 @@ mod tests {
             None,
             Some(sel),
             None,
+            &[],
         )
         .unwrap();
 
@@ -523,6 +565,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
 
