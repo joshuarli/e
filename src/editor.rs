@@ -232,6 +232,8 @@ impl Editor {
         };
         let ruler_on = self.ruler_on;
 
+        let bracket_pair = self.find_matching_bracket();
+
         let cmd_line = if self.cmd_buf.active {
             Some(self.cmd_buf.display_line())
         } else if !self.status_msg.is_empty() {
@@ -280,6 +282,7 @@ impl Editor {
             completions,
             cmd_cursor,
             self.find_active,
+            bracket_pair,
         )
     }
 
@@ -323,6 +326,17 @@ impl Editor {
             char_idx += 1;
         }
         display_col
+    }
+
+    fn find_matching_bracket(&mut self) -> Option<(Pos, Pos)> {
+        let cursor = self.cursor();
+        let line_count = self.doc.buf.line_count();
+        let match_pos = highlight::find_bracket_match(
+            cursor,
+            &mut |line_idx| self.doc.buf.line_text(line_idx),
+            line_count,
+        )?;
+        Some((cursor, match_pos))
     }
 
     fn handle_event(&mut self, ev: Event) {

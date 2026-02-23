@@ -76,6 +76,7 @@ impl Renderer {
         completions: &[String],
         cmd_cursor: Option<usize>,
         find_active: bool,
+        bracket_pair: Option<(Pos, Pos)>,
     ) -> io::Result<()> {
         let line_count = buf.line_count();
         let gw = if ruler_on {
@@ -134,6 +135,13 @@ impl Renderer {
                     })
                 });
 
+                // Bracket match display columns for this line
+                let bracket_cols: Vec<usize> = bracket_pair
+                    .iter()
+                    .filter(|(_, match_pos)| match_pos.line == logical_line)
+                    .map(|(_, match_pos)| display_col_for_char_col(&raw_text, match_pos.col))
+                    .collect();
+
                 // Build per-character highlight info: selection or find match
                 let need_per_char =
                     has_sel && logical_line >= sel_start.line && logical_line <= sel_end.line;
@@ -141,8 +149,9 @@ impl Renderer {
                     m.iter()
                         .any(|(s, e)| logical_line >= s.line && logical_line <= e.line)
                 });
+                let has_bracket = !bracket_cols.is_empty();
 
-                if need_per_char || has_find {
+                if need_per_char || has_find || has_bracket {
                     // Selection range (display cols)
                     let (line_sel_start, line_sel_end) = if need_per_char {
                         let s = if logical_line == sel_start.line {
@@ -197,6 +206,8 @@ impl Renderer {
                         let find_hit = find_ranges.iter().find(|(fs, fe, _)| i >= *fs && i < *fe);
                         let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
 
+                        let is_bracket_match = bracket_cols.contains(&i);
+
                         if in_sel {
                             if is_tab_pipe {
                                 write!(out, "\x1b[7;90m{}\x1b[0m", ch)?;
@@ -209,6 +220,8 @@ impl Renderer {
                             } else {
                                 write!(out, "\x1b[43;30m{}\x1b[0m", ch)?;
                             }
+                        } else if is_bracket_match {
+                            write!(out, "\x1b[45;30m{}\x1b[0m", ch)?;
                         } else if is_tab_pipe {
                             write!(out, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
@@ -501,6 +514,7 @@ mod tests {
             &[],
             None,
             false,
+            None,
         )
         .unwrap();
 
@@ -534,6 +548,7 @@ mod tests {
             &[],
             None,
             false,
+            None,
         )
         .unwrap();
 
@@ -566,6 +581,7 @@ mod tests {
             &[],
             None,
             false,
+            None,
         )
         .unwrap();
 
@@ -598,6 +614,7 @@ mod tests {
             &[],
             None,
             false,
+            None,
         )
         .unwrap();
 
@@ -632,6 +649,7 @@ mod tests {
             &[],
             None,
             false,
+            None,
         )
         .unwrap();
 
@@ -663,6 +681,7 @@ mod tests {
             &[],
             None,
             false,
+            None,
         )
         .unwrap();
 

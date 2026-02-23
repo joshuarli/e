@@ -120,6 +120,13 @@ const LANGUAGES: &[(&[&str], Language)] = &[
         },
     ),
     (
+        &[".json"],
+        Language {
+            name: "JSON",
+            comment: "",
+        },
+    ),
+    (
         &[".yaml", ".yml"],
         Language {
             name: "YAML",
@@ -341,6 +348,13 @@ const LANGUAGES: &[(&[&str], Language)] = &[
         Language {
             name: "GraphQL",
             comment: "#",
+        },
+    ),
+    (
+        &[".md", ".markdown", ".mkd", ".mdx"],
+        Language {
+            name: "Markdown",
+            comment: "<!--",
         },
     ),
 ];

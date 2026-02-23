@@ -32,7 +32,7 @@ src/
   file_io.rs         Read/write files, CRLF→LF normalization, binary detection, trailing whitespace strip, file locking
   language.rs        Language detection by file extension (~45 languages), comment syntax lookup
   signal.rs          SIGWINCH handler via libc::sigaction + AtomicBool polling
-  highlight.rs       Syntax highlighting: byte-by-byte highlighter, HlType/HlState types, per-language rules (14 languages), ANSI color theme
+  highlight.rs       Syntax highlighting: byte-by-byte highlighter, HlType/HlState types, per-language rules (15 languages), dedicated JSON/YAML/Markdown highlighters, semver detection, bracket matching
 ```
 
 ## Key Data Structures
@@ -53,7 +53,7 @@ Channel-based (`std::sync::mpsc`). No async runtime.
 
 ## Rendering
 
-All output buffered to a `Write` impl, flushed once per frame. Syntax highlighting: per-line HlState computed from line 0 through last visible line each frame; per-char HlType mapped from byte highlights; ANSI colors emitted with minimal escape changes on the fast path. Selection/find highlights override syntax colors. Status bar (reverse video) on second-to-last row shows `Language │ Ln X, Col Y` on the right. Command buffer on last row when active with blinking cursor. Tab completions render above the status bar. Selection rendered as reverse video, find matches as yellow background (current match green). Line numbers in dim text (no separator). Tabs display as dark grey `|` pipe followed by space. Cursor hidden during find navigation mode.
+All output buffered to a `Write` impl, flushed once per frame. Syntax highlighting: per-line HlState computed from line 0 through last visible line each frame; per-char HlType mapped from byte highlights; ANSI colors emitted with minimal escape changes on the fast path. Selection/find highlights override syntax colors. Bracket matching: when cursor is on a bracket `()[]{}`, the matching bracket is highlighted with magenta background/black text. Status bar (reverse video) on second-to-last row shows `Language │ Ln X, Col Y` on the right. Command buffer on last row when active with blinking cursor. Tab completions render above the status bar. Selection rendered as reverse video, find matches as yellow background (current match green). Line numbers in dim text (no separator). Tabs display as dark grey `|` pipe followed by space. Cursor hidden during find navigation mode.
 
 ## Keybindings
 
@@ -111,7 +111,7 @@ Entered via `^p` command palette. Available commands:
 ## Development Guidelines
 
 - Run `cargo clippy && cargo test` before every commit — zero warnings, all tests pass
-- All modules have inline `#[cfg(test)] mod tests` — 255 tests total
+- All modules have inline `#[cfg(test)] mod tests` — 264 tests total
 - Prefer `&self` over `&mut self` for read-only operations (the line cache uses interior mutability via `Option<Vec<usize>>`)
 - Minimize heap allocations in hot paths (render loop, cursor movement)
 - No `unwrap()` on user-facing I/O — propagate errors or show in status bar
@@ -154,4 +154,10 @@ Entered via `^p` command palette. Available commands:
 - [x] Duplicate line (`^j`)
 - [x] Forward delete key
 - [x] Select word at cursor (`^w`)
-- [x] Syntax highlighting (14 languages: Rust, Python, Go, TypeScript, JavaScript, Shell, C, TOML, JSON, YAML, Makefile, HTML, CSS, Dockerfile)
+- [x] Syntax highlighting (15 languages: Rust, Python, Go, TypeScript, JavaScript, Shell, C, TOML, JSON, YAML, Makefile, HTML, CSS, Dockerfile, Markdown)
+- [x] Purple bracket highlighting for `()[]{}` (magenta, not inside strings/comments)
+- [x] Bracket matching (cursor on bracket highlights matching bracket with magenta bg, scans up to 1000 lines)
+- [x] Markdown highlighting (headers, bold, italic, fenced code blocks, inline code, blockquotes, lists, horizontal rules, HTML comments)
+- [x] JSON key/value distinction (keys yellow, string values green, brackets purple)
+- [x] YAML key/value distinction (keys yellow, quoted strings green, anchors/aliases cyan, comments grey)
+- [x] Semver version highlighting (v1.2.3, 0.3.5-beta.1 → cyan, works inside strings, skips comments, all languages)
