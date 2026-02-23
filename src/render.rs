@@ -35,23 +35,35 @@ fn expand_tabs(text: &[u8]) -> (Vec<u8>, Vec<bool>) {
 }
 
 pub struct Renderer {
-    #[allow(dead_code)]
-    line_hashes: Vec<u64>,
     pub needs_full_redraw: bool,
     syntax: Option<&'static SyntaxRules>,
+    /// Cached highlight state at the start of each line.
+    hl_cache: Vec<HlState>,
+    /// Buffer version the cache was computed for.
+    hl_cache_version: u64,
 }
 
 impl Renderer {
     pub fn new() -> Self {
         Self {
-            line_hashes: Vec::new(),
             needs_full_redraw: true,
             syntax: None,
+            hl_cache: Vec::new(),
+            hl_cache_version: u64::MAX,
         }
     }
 
     pub fn set_syntax(&mut self, rules: Option<&'static SyntaxRules>) {
-        self.syntax = rules;
+        let same = match (self.syntax, rules) {
+            (Some(a), Some(b)) => std::ptr::eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.syntax = rules;
+            self.hl_cache.clear();
+            self.hl_cache_version = u64::MAX;
+        }
     }
 
     pub fn force_full_redraw(&mut self) {
@@ -101,19 +113,40 @@ impl Renderer {
         write!(w, "\x1b[?2026h")?;
         write!(w, "\x1b[?25l")?;
 
-        // Compute per-line highlight states for visible lines
-        let last_visible = (view.scroll_line + text_rows).min(line_count);
-        let mut hl_states: Vec<HlState> = Vec::new();
+        // Compute per-line highlight states (cached across frames)
+        let buf_version = buf.version();
         if let Some(rules) = self.syntax {
-            hl_states.reserve(last_visible + 1);
-            let mut state = HlState::Normal;
-            for line_idx in 0..last_visible {
-                hl_states.push(state);
-                let raw = buf.line_text(line_idx);
-                let (_, next_state) = highlight::highlight_line(&raw, state, rules);
-                state = next_state;
+            if buf_version != self.hl_cache_version {
+                // Buffer changed — recompute all states from scratch
+                self.hl_cache.clear();
+                let mut state = HlState::Normal;
+                for line_idx in 0..line_count {
+                    self.hl_cache.push(state);
+                    let raw = buf.line_text(line_idx);
+                    let (_, next_state) = highlight::highlight_line(&raw, state, rules);
+                    state = next_state;
+                }
+                self.hl_cache_version = buf_version;
+            } else if self.hl_cache.len() < line_count {
+                // Extend cache if file grew (shouldn't happen without version bump, but safe)
+                let mut state = self.hl_cache.last().copied().unwrap_or(HlState::Normal);
+                let start = self.hl_cache.len();
+                if start > 0 {
+                    let raw = buf.line_text(start - 1);
+                    let (_, next_state) = highlight::highlight_line(&raw, state, rules);
+                    state = next_state;
+                }
+                for line_idx in start..line_count {
+                    self.hl_cache.push(state);
+                    let raw = buf.line_text(line_idx);
+                    let (_, next_state) = highlight::highlight_line(&raw, state, rules);
+                    state = next_state;
+                }
             }
+        } else {
+            self.hl_cache.clear();
         }
+        let hl_states = &self.hl_cache;
 
         for row in 0..text_rows {
             let logical_line = view.scroll_line + row;

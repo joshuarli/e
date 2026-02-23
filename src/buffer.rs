@@ -10,6 +10,8 @@ pub struct GapBuffer {
     /// first character on that line, with line 0 always == 0).  `None` means the
     /// cache is fully invalidated and must be rebuilt.
     line_starts: Option<Vec<usize>>,
+    /// Monotonically increasing counter, bumped on every insert/delete.
+    version: u64,
 }
 
 const MIN_GAP: usize = 128;
@@ -22,6 +24,7 @@ impl GapBuffer {
             gap_start: 0,
             gap_end: gap,
             line_starts: None,
+            version: 0,
         }
     }
 
@@ -35,7 +38,12 @@ impl GapBuffer {
             gap_start: text.len(),
             gap_end: text.len() + gap,
             line_starts: None,
+            version: 0,
         }
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     // -- low level helpers --------------------------------------------------
@@ -100,6 +108,7 @@ impl GapBuffer {
         self.data[self.gap_start..self.gap_start + bytes.len()].copy_from_slice(bytes);
         self.gap_start += bytes.len();
         self.invalidate_lines_from(pos);
+        self.version += 1;
     }
 
     /// Delete `count` bytes starting at logical byte offset `pos`.
@@ -108,6 +117,7 @@ impl GapBuffer {
         self.move_gap_to(pos);
         self.gap_end += count;
         self.invalidate_lines_from(pos);
+        self.version += 1;
     }
 
     // -- read access --------------------------------------------------------
