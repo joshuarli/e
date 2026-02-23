@@ -16,7 +16,7 @@ use crate::document::Document;
 use crate::highlight;
 use crate::keybind::{EditorAction, KeybindingTable};
 use crate::language;
-use crate::render::{Renderer, gutter_width};
+use crate::render::{Renderer, char_col_for_display_col, display_col_for_char_col, gutter_width};
 use crate::selection::{Pos, Selection, is_word_char, prev_word_boundary};
 use crate::view::View;
 
@@ -237,8 +237,14 @@ impl Editor {
 
         let display_col = self.cursor_display_col();
         let cursor_line = self.sel.cursor.line;
+        let mut line_display_width = |line: usize| -> usize {
+            display_col_for_char_col(
+                &self.doc.buf.line_text(line),
+                self.doc.buf.line_char_len(line),
+            )
+        };
         self.view
-            .ensure_cursor_visible(cursor_line, display_col, gw);
+            .ensure_cursor_visible(cursor_line, display_col, gw, &mut line_display_width);
 
         let status_left = self.status_left();
         let status_right = self.status_right();
@@ -326,6 +332,18 @@ impl Editor {
             self.cursor().line + 1,
             self.cursor().col + 1,
         )
+    }
+
+    fn center_view_on_line(&mut self, line: usize) {
+        let gw = if self.ruler_on {
+            gutter_width(self.doc.buf.line_count())
+        } else {
+            0
+        };
+        let mut ldw = |l: usize| -> usize {
+            display_col_for_char_col(&self.doc.buf.line_text(l), self.doc.buf.line_char_len(l))
+        };
+        self.view.center_on_line(line, &mut ldw, gw);
     }
 
     fn cursor_display_col(&mut self) -> usize {
@@ -733,7 +751,7 @@ impl Editor {
         self.find_index = idx;
         let (_start, end) = self.find_matches[idx];
         self.set_cursor(end);
-        self.view.center_on_line(end.line);
+        self.center_view_on_line(end.line);
         self.set_find_status();
     }
 
@@ -747,7 +765,7 @@ impl Editor {
         self.find_index = idx;
         let (_start, end) = self.find_matches[idx];
         self.set_cursor(end);
-        self.view.center_on_line(end.line);
+        self.center_view_on_line(end.line);
         self.set_find_status();
     }
 
@@ -847,14 +865,48 @@ impl Editor {
         } else {
             0
         };
+        let text_cols = self.view.text_cols(gw);
+        if text_cols == 0 {
+            return Pos::zero();
+        }
 
-        let row = (y as usize).saturating_sub(1);
-        let col = (x as usize).saturating_sub(1);
+        let target_row = (y as usize).saturating_sub(1);
+        let click_col = (x as usize).saturating_sub(1).saturating_sub(gw);
 
-        let logical_line = (self.view.scroll_line + row).min(line_count.saturating_sub(1));
-        let text_col = col.saturating_sub(gw) + self.view.scroll_col;
-        let line_len = self.doc.buf.line_char_len(logical_line);
-        Pos::new(logical_line, text_col.min(line_len))
+        // Walk from (scroll_line, scroll_wrap) counting screen rows
+        let mut screen_row: usize = 0;
+        let mut line_idx = self.view.scroll_line;
+        let first_wrap = self.view.scroll_wrap;
+
+        while line_idx < line_count {
+            let raw_text = self.doc.buf.line_text(line_idx);
+            let char_len = self.doc.buf.line_char_len(line_idx);
+            let display_width = display_col_for_char_col(&raw_text, char_len);
+            let total_wraps = crate::view::wrapped_rows(display_width, text_cols);
+            let start_wrap = if line_idx == self.view.scroll_line {
+                first_wrap
+            } else {
+                0
+            };
+
+            for wrap in start_wrap..total_wraps {
+                if screen_row == target_row {
+                    // This is the screen row the user clicked on
+                    let display_col = wrap * text_cols + click_col;
+                    // Convert display col back to char col
+                    let char_col = char_col_for_display_col(&raw_text, display_col);
+                    return Pos::new(line_idx, char_col.min(char_len));
+                }
+                screen_row += 1;
+            }
+
+            line_idx += 1;
+        }
+
+        // Clicked below all content — return end of last line
+        let last_line = line_count.saturating_sub(1);
+        let last_col = self.doc.buf.line_char_len(last_line);
+        Pos::new(last_line, last_col)
     }
 
     fn mouse_press(&mut self, x: u16, y: u16) {
@@ -933,30 +985,138 @@ impl Editor {
     }
 
     fn scroll_up(&mut self) {
-        if self.view.scroll_line == 0 {
+        if self.view.scroll_line == 0 && self.view.scroll_wrap == 0 {
             return;
         }
-        self.view.scroll_line = self.view.scroll_line.saturating_sub(SCROLL_LINES);
-        let max_visible = self.view.scroll_line + self.view.text_rows().saturating_sub(1);
-        if self.cursor().line > max_visible {
-            let line_len = self.doc.buf.line_char_len(max_visible);
-            self.set_cursor(Pos::new(max_visible, self.cursor().col.min(line_len)));
+        let gw = if self.ruler_on {
+            gutter_width(self.doc.buf.line_count())
+        } else {
+            0
+        };
+        let text_cols = self.view.text_cols(gw);
+        // Scroll back by SCROLL_LINES screen rows
+        let mut remaining = SCROLL_LINES;
+        while remaining > 0 {
+            if self.view.scroll_wrap > 0 {
+                let step = remaining.min(self.view.scroll_wrap);
+                self.view.scroll_wrap -= step;
+                remaining -= step;
+            } else if self.view.scroll_line > 0 {
+                self.view.scroll_line -= 1;
+                let dw = display_col_for_char_col(
+                    &self.doc.buf.line_text(self.view.scroll_line),
+                    self.doc.buf.line_char_len(self.view.scroll_line),
+                );
+                let wraps = crate::view::wrapped_rows(dw, text_cols);
+                remaining -= 1;
+                if remaining > 0 && wraps > 1 {
+                    let step = remaining.min(wraps - 1);
+                    self.view.scroll_wrap = (wraps - 1).saturating_sub(step);
+                    remaining -= step;
+                }
+            } else {
+                break;
+            }
         }
+        // Move cursor into viewport if it scrolled past the bottom
+        self.clamp_cursor_to_viewport(gw, text_cols);
     }
 
     fn scroll_down(&mut self) {
         let line_count = self.doc.buf.line_count();
-        let max_scroll = line_count.saturating_sub(1);
-        if self.view.scroll_line >= max_scroll {
+        if self.view.scroll_line >= line_count.saturating_sub(1) {
             return;
         }
-        self.view.scroll_line = (self.view.scroll_line + SCROLL_LINES).min(max_scroll);
-        if self.cursor().line < self.view.scroll_line {
+        let gw = if self.ruler_on {
+            gutter_width(line_count)
+        } else {
+            0
+        };
+        let text_cols = self.view.text_cols(gw);
+        // Scroll forward by SCROLL_LINES screen rows
+        let mut remaining = SCROLL_LINES;
+        while remaining > 0 && self.view.scroll_line < line_count.saturating_sub(1) {
+            let dw = display_col_for_char_col(
+                &self.doc.buf.line_text(self.view.scroll_line),
+                self.doc.buf.line_char_len(self.view.scroll_line),
+            );
+            let wraps = crate::view::wrapped_rows(dw, text_cols);
+            let remaining_in_line = wraps.saturating_sub(self.view.scroll_wrap);
+            if remaining < remaining_in_line {
+                self.view.scroll_wrap += remaining;
+                remaining = 0;
+            } else {
+                remaining -= remaining_in_line;
+                self.view.scroll_line += 1;
+                self.view.scroll_wrap = 0;
+            }
+        }
+        // Move cursor into viewport if it scrolled past the top
+        self.clamp_cursor_to_viewport(gw, text_cols);
+    }
+
+    /// After a mouse-wheel scroll, move the cursor so it stays within the visible area.
+    fn clamp_cursor_to_viewport(&mut self, _gw: usize, text_cols: usize) {
+        let text_rows = self.view.text_rows();
+        if text_rows == 0 || text_cols == 0 {
+            return;
+        }
+        let line_count = self.doc.buf.line_count();
+        let cursor = self.cursor();
+        let cursor_dcol = self.cursor_display_col();
+        let cursor_wrap = cursor_dcol / text_cols;
+
+        // Check if cursor is above viewport
+        if cursor.line < self.view.scroll_line
+            || (cursor.line == self.view.scroll_line && cursor_wrap < self.view.scroll_wrap)
+        {
+            // Snap cursor to the first visible position
+            // The first visible char col is scroll_wrap * text_cols
+            let first_dcol = self.view.scroll_wrap * text_cols;
+            let raw = self.doc.buf.line_text(self.view.scroll_line);
+            let char_col = char_col_for_display_col(&raw, first_dcol);
             let line_len = self.doc.buf.line_char_len(self.view.scroll_line);
-            self.set_cursor(Pos::new(
-                self.view.scroll_line,
-                self.cursor().col.min(line_len),
-            ));
+            self.set_cursor(Pos::new(self.view.scroll_line, char_col.min(line_len)));
+            return;
+        }
+
+        // Check if cursor is below viewport — walk screen rows to find last visible position
+        let mut screen_row = 0usize;
+        let mut line_idx = self.view.scroll_line;
+        let mut last_visible_line = self.view.scroll_line;
+        let mut last_visible_wrap = self.view.scroll_wrap;
+
+        while screen_row < text_rows && line_idx < line_count {
+            let dw = display_col_for_char_col(
+                &self.doc.buf.line_text(line_idx),
+                self.doc.buf.line_char_len(line_idx),
+            );
+            let total = crate::view::wrapped_rows(dw, text_cols);
+            let start_w = if line_idx == self.view.scroll_line {
+                self.view.scroll_wrap
+            } else {
+                0
+            };
+            for w in start_w..total {
+                if screen_row >= text_rows {
+                    break;
+                }
+                last_visible_line = line_idx;
+                last_visible_wrap = w;
+                screen_row += 1;
+            }
+            line_idx += 1;
+        }
+
+        if cursor.line > last_visible_line
+            || (cursor.line == last_visible_line && cursor_wrap > last_visible_wrap)
+        {
+            // Snap cursor to last visible wrap row
+            let target_dcol = last_visible_wrap * text_cols;
+            let raw = self.doc.buf.line_text(last_visible_line);
+            let char_col = char_col_for_display_col(&raw, target_dcol);
+            let line_len = self.doc.buf.line_char_len(last_visible_line);
+            self.set_cursor(Pos::new(last_visible_line, char_col.min(line_len)));
         }
     }
 

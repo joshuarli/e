@@ -148,103 +148,113 @@ impl Renderer {
         }
         let hl_states = &self.hl_cache;
 
-        for row in 0..text_rows {
-            let logical_line = view.scroll_line + row;
-            write!(w, "\x1b[{};1H", row + 1)?;
+        // Wrap-aware render loop
+        let mut screen_row: usize = 0;
+        let mut line_idx = view.scroll_line;
+        let first_wrap = view.scroll_wrap;
 
-            if logical_line < line_count {
-                if ruler_on {
-                    let num_str = format!("{}", logical_line + 1);
-                    let pad = gw - 1;
-                    write!(w, "\x1b[0;2m{:>width$} \x1b[0m", num_str, width = pad)?;
-                }
+        while screen_row < text_rows && line_idx < line_count {
+            let raw_text = buf.line_text(line_idx);
+            let (expanded, tab_pipes) = expand_tabs(&raw_text);
+            let line_str = String::from_utf8_lossy(&expanded);
+            let chars: Vec<char> = line_str.chars().collect();
+            let total_wraps = crate::view::wrapped_rows(chars.len(), text_cols);
+            let start_wrap = if line_idx == view.scroll_line {
+                first_wrap
+            } else {
+                0
+            };
 
-                let raw_text = buf.line_text(logical_line);
-                let (expanded, tab_pipes) = expand_tabs(&raw_text);
-                let line_str = String::from_utf8_lossy(&expanded);
-                let chars: Vec<char> = line_str.chars().collect();
-                let visible_start = view.scroll_col.min(chars.len());
-                let visible_end = (view.scroll_col + text_cols).min(chars.len());
+            // Compute per-char syntax highlights for this line (once per logical line)
+            let char_hl: Option<Vec<HlType>> = self.syntax.and_then(|rules| {
+                hl_states.get(line_idx).map(|&state| {
+                    let (byte_hl, _) = highlight::highlight_line(&raw_text, state, rules);
+                    highlight::byte_hl_to_char_hl(&raw_text, &byte_hl)
+                })
+            });
 
-                // Compute per-char syntax highlights for this line
-                let char_hl: Option<Vec<HlType>> = self.syntax.and_then(|rules| {
-                    hl_states.get(logical_line).map(|&state| {
-                        let (byte_hl, _) = highlight::highlight_line(&raw_text, state, rules);
-                        highlight::byte_hl_to_char_hl(&raw_text, &byte_hl)
-                    })
-                });
+            // Bracket match display columns for this line
+            let bracket_cols: Vec<usize> = bracket_pair
+                .iter()
+                .filter(|(_, match_pos)| match_pos.line == line_idx)
+                .map(|(_, match_pos)| display_col_for_char_col(&raw_text, match_pos.col))
+                .collect();
 
-                // Bracket match display columns for this line
-                let bracket_cols: Vec<usize> = bracket_pair
-                    .iter()
-                    .filter(|(_, match_pos)| match_pos.line == logical_line)
-                    .map(|(_, match_pos)| display_col_for_char_col(&raw_text, match_pos.col))
-                    .collect();
+            // Per-character highlight info
+            let need_per_char = has_sel && line_idx >= sel_start.line && line_idx <= sel_end.line;
+            let has_find = find_matches.is_some_and(|m| {
+                m.iter()
+                    .any(|(s, e)| line_idx >= s.line && line_idx <= e.line)
+            });
+            let has_bracket = !bracket_cols.is_empty();
 
-                // Build per-character highlight info: selection or find match
-                let need_per_char =
-                    has_sel && logical_line >= sel_start.line && logical_line <= sel_end.line;
-                let has_find = find_matches.is_some_and(|m| {
-                    m.iter()
-                        .any(|(s, e)| logical_line >= s.line && logical_line <= e.line)
-                });
-                let has_bracket = !bracket_cols.is_empty();
+            // Pre-compute selection and find ranges once per logical line
+            let (line_sel_start, line_sel_end) = if need_per_char {
+                let s = if line_idx == sel_start.line {
+                    display_col_for_char_col(&raw_text, sel_start.col)
+                } else {
+                    0
+                };
+                let e = if line_idx == sel_end.line {
+                    display_col_for_char_col(&raw_text, sel_end.col)
+                } else {
+                    chars.len()
+                };
+                (s, e)
+            } else {
+                (0, 0)
+            };
 
-                if need_per_char || has_find || has_bracket {
-                    // Selection range (display cols)
-                    let (line_sel_start, line_sel_end) = if need_per_char {
-                        let s = if logical_line == sel_start.line {
-                            display_col_for_char_col(&raw_text, sel_start.col)
-                        } else {
-                            0
-                        };
-                        let e = if logical_line == sel_end.line {
-                            display_col_for_char_col(&raw_text, sel_end.col)
-                        } else {
-                            chars.len()
-                        };
-                        (s, e)
-                    } else {
-                        (0, 0)
-                    };
-
-                    // Find match ranges (display cols, match_index) for this line
-                    let find_ranges: Vec<(usize, usize, bool)> = find_matches
-                        .map(|matches| {
-                            matches
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, (s, e))| {
-                                    logical_line >= s.line && logical_line <= e.line
-                                })
-                                .map(|(idx, (s, e))| {
-                                    let fs = if logical_line == s.line {
-                                        display_col_for_char_col(&raw_text, s.col)
-                                    } else {
-                                        0
-                                    };
-                                    let fe = if logical_line == e.line {
-                                        display_col_for_char_col(&raw_text, e.col)
-                                    } else {
-                                        chars.len()
-                                    };
-                                    let is_current = find_current == Some(idx);
-                                    (fs, fe, is_current)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                    for (i, ch) in chars
+            let find_ranges: Vec<(usize, usize, bool)> = find_matches
+                .map(|matches| {
+                    matches
                         .iter()
                         .enumerate()
-                        .take(visible_end)
-                        .skip(visible_start)
-                    {
+                        .filter(|(_, (s, e))| line_idx >= s.line && line_idx <= e.line)
+                        .map(|(idx, (s, e))| {
+                            let fs = if line_idx == s.line {
+                                display_col_for_char_col(&raw_text, s.col)
+                            } else {
+                                0
+                            };
+                            let fe = if line_idx == e.line {
+                                display_col_for_char_col(&raw_text, e.col)
+                            } else {
+                                chars.len()
+                            };
+                            let is_current = find_current == Some(idx);
+                            (fs, fe, is_current)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            for wrap in start_wrap..total_wraps {
+                if screen_row >= text_rows {
+                    break;
+                }
+
+                write!(w, "\x1b[{};1H", screen_row + 1)?;
+
+                // Gutter: line number on first wrap row, blank on continuations
+                if ruler_on {
+                    if wrap == 0 {
+                        let num_str = format!("{}", line_idx + 1);
+                        let pad = gw - 1;
+                        write!(w, "\x1b[0;2m{:>width$} \x1b[0m", num_str, width = pad)?;
+                    } else {
+                        write!(w, "\x1b[0;2m{:>width$} \x1b[0m", "", width = gw - 1)?;
+                    }
+                }
+
+                let chunk_start = wrap * text_cols;
+                let chunk_end = ((wrap + 1) * text_cols).min(chars.len());
+
+                if need_per_char || has_find || has_bracket {
+                    for (i, ch) in chars.iter().enumerate().take(chunk_end).skip(chunk_start) {
                         let in_sel = need_per_char && i >= line_sel_start && i < line_sel_end;
                         let find_hit = find_ranges.iter().find(|(fs, fe, _)| i >= *fs && i < *fe);
                         let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
-
                         let is_bracket_match = bracket_cols.contains(&i);
 
                         if in_sel {
@@ -264,7 +274,6 @@ impl Renderer {
                         } else if is_tab_pipe {
                             write!(w, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
-                            // Syntax color as fallback
                             let ht = char_hl
                                 .as_ref()
                                 .and_then(|h| h.get(i).copied())
@@ -278,14 +287,9 @@ impl Renderer {
                         }
                     }
                 } else {
-                    // Fast path: no selection or find — use syntax highlighting with minimal escapes
+                    // Fast path: syntax highlighting only
                     let mut current_hl = HlType::Normal;
-                    for (i, ch) in chars
-                        .iter()
-                        .enumerate()
-                        .take(visible_end)
-                        .skip(visible_start)
-                    {
+                    for (i, ch) in chars.iter().enumerate().take(chunk_end).skip(chunk_start) {
                         let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
                         if is_tab_pipe {
                             if current_hl != HlType::Normal {
@@ -313,14 +317,24 @@ impl Renderer {
                         write!(w, "\x1b[0m")?;
                     }
                 }
-                // Reset attributes + erase remainder of line after content
+
                 write!(w, "\x1b[0m\x1b[K")?;
-            } else if ruler_on {
+                screen_row += 1;
+            }
+
+            line_idx += 1;
+        }
+
+        // Fill remaining screen rows with empty lines
+        while screen_row < text_rows {
+            write!(w, "\x1b[{};1H", screen_row + 1)?;
+            if ruler_on {
                 let pad = gw - 1;
                 write!(w, "\x1b[0;2m{:>width$} \x1b[0m\x1b[K", "", width = pad)?;
             } else {
                 write!(w, "\x1b[K")?;
             }
+            screen_row += 1;
         }
 
         // Completions area
@@ -364,12 +378,33 @@ impl Renderer {
             write!(w, "\x1b[{};{}H", cmd_row, col + 1)?;
             write!(w, "\x1b[?25h")?;
         } else {
-            let screen_col = if ruler_on {
-                cursor_col.saturating_sub(view.scroll_col) + gw
-            } else {
-                cursor_col.saturating_sub(view.scroll_col)
+            let screen_col = (cursor_col % text_cols.max(1)) + gw;
+            // Count screen rows from scroll position to cursor
+            let cursor_wrap = cursor_col / text_cols.max(1);
+            let screen_row = {
+                let mut sr = 0usize;
+                if cursor_line == view.scroll_line {
+                    sr = cursor_wrap.saturating_sub(view.scroll_wrap);
+                } else {
+                    // Remaining wraps of scroll_line
+                    let first_wraps = crate::view::wrapped_rows(
+                        display_col_for_char_col(
+                            &buf.line_text(view.scroll_line),
+                            buf.line_char_len(view.scroll_line),
+                        ),
+                        text_cols,
+                    );
+                    sr += first_wraps.saturating_sub(view.scroll_wrap);
+                    for l in (view.scroll_line + 1)..cursor_line {
+                        sr += crate::view::wrapped_rows(
+                            display_col_for_char_col(&buf.line_text(l), buf.line_char_len(l)),
+                            text_cols,
+                        );
+                    }
+                    sr += cursor_wrap;
+                }
+                sr
             };
-            let screen_row = cursor_line.saturating_sub(view.scroll_line);
             write!(w, "\x1b[{};{}H", screen_row + 1, screen_col + 1)?;
             write!(w, "\x1b[?25h")?;
         }
@@ -384,7 +419,24 @@ impl Renderer {
     }
 }
 
-fn display_col_for_char_col(raw_text: &[u8], char_col: usize) -> usize {
+/// Convert a display column back to a char column (inverse of display_col_for_char_col).
+pub(crate) fn char_col_for_display_col(raw_text: &[u8], target_display: usize) -> usize {
+    let mut display = 0;
+    let mut ci = 0;
+    let mut bi = 0;
+    while bi < raw_text.len() {
+        let width = if raw_text[bi] == b'\t' { 2 } else { 1 };
+        if display + width > target_display {
+            break;
+        }
+        display += width;
+        bi += buffer::utf8_char_len(raw_text[bi]);
+        ci += 1;
+    }
+    ci
+}
+
+pub(crate) fn display_col_for_char_col(raw_text: &[u8], char_col: usize) -> usize {
     let mut display = 0;
     let mut ci = 0;
     let mut bi = 0;

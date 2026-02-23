@@ -23,7 +23,7 @@ src/
   document.rs        wraps GapBuffer + UndoStack + dirty flag + filename
   selection.rs       Pos (line, col), Selection (anchor+cursor), word/line boundary helpers
   operation.rs       Operation enum (Insert/Delete), OperationGroup, UndoStack with grouping
-  view.rs            Viewport: scroll offsets, cursor-to-screen mapping (no scroll margin)
+  view.rs            Viewport: scroll offsets (scroll_line + scroll_wrap for soft-wrap), cursor-to-screen mapping, wrapped_rows helper
   render.rs          ANSI rendering: gutter, line content, tab pipes, syntax/selection/find highlighting, status bar, completions
   keybind.rs         EditorAction enum, KeybindingTable with defaults, INI config loader
   command.rs         CommandRegistry: HashMap<String, CommandFn>, built-in commands
@@ -53,7 +53,7 @@ Channel-based (`std::sync::mpsc`). No async runtime.
 
 ## Rendering
 
-All output buffered to a `Vec<u8>`, written to terminal in a single `write_all` per frame. Synchronized output protocol (`\x1b[?2026h`/`\x1b[?2026l`) wraps each frame so supporting terminals (kitty, iTerm2, WezTerm, ghostty, foot) hold rendering until complete; unsupporting terminals ignore the sequences. Lines are overwritten in-place with `\x1b[K` (erase to end of line) after content rather than `\x1b[2K` (erase entire line) before, eliminating clear-then-draw flicker. Scroll at document boundaries short-circuits (no redraw). Syntax highlighting: per-line HlState cached across frames (keyed by GapBuffer version counter); cache reused during scrolling (zero recomputation), recomputed on edits; per-char HlType mapped from byte highlights; ANSI colors emitted with minimal escape changes on the fast path. Selection/find highlights override syntax colors. Bracket matching: when cursor is on a bracket `()[]{}`, the matching bracket is highlighted with magenta background/black text. Status bar (reverse video) on second-to-last row shows `Language │ Ln X, Col Y` on the right. Command buffer on last row when active with blinking cursor. Tab completions render above the status bar. Selection rendered as reverse video, find matches as yellow background (current match green). Line numbers in dim text (no separator). Tabs display as dark grey `|` pipe followed by space. Cursor hidden during find navigation mode and when selection is active.
+All output buffered to a `Vec<u8>`, written to terminal in a single `write_all` per frame. Synchronized output protocol (`\x1b[?2026h`/`\x1b[?2026l`) wraps each frame so supporting terminals (kitty, iTerm2, WezTerm, ghostty, foot) hold rendering until complete; unsupporting terminals ignore the sequences. Lines are overwritten in-place with `\x1b[K` (erase to end of line) after content rather than `\x1b[2K` (erase entire line) before, eliminating clear-then-draw flicker. Scroll at document boundaries short-circuits (no redraw). **Soft-wrap**: long lines wrap at the right edge of the viewport (no horizontal scrolling). A logical line occupying `ceil(display_width / text_cols)` screen rows is rendered as multiple chunks. Line numbers appear only on the first wrapped row; continuation rows get blank gutters. The viewport tracks `(scroll_line, scroll_wrap)` — both which logical line and which wrapped sub-row of that line is at the top of the screen. Cursor screen position uses `col % text_cols` for the column and counts wrapped rows from the scroll position for the row. Mouse clicks walk from the scroll position through wrapped rows to map screen coordinates to buffer positions. Syntax highlighting: per-line HlState cached across frames (keyed by GapBuffer version counter); cache reused during scrolling (zero recomputation), recomputed on edits; per-char HlType mapped from byte highlights; ANSI colors emitted with minimal escape changes on the fast path. Selection/find highlights override syntax colors. Bracket matching: when cursor is on a bracket `()[]{}`, the matching bracket is highlighted with magenta background/black text. Status bar (reverse video) on second-to-last row shows `Language │ Ln X, Col Y` on the right. Command buffer on last row when active with blinking cursor. Tab completions render above the status bar. Selection rendered as reverse video, find matches as yellow background (current match green). Line numbers in dim text (no separator). Tabs display as dark grey `|` pipe followed by space. Cursor hidden during find navigation mode and when selection is active.
 
 ## Keybindings
 
@@ -111,7 +111,7 @@ Entered via `^p` command palette. Available commands:
 ## Development Guidelines
 
 - Run `cargo clippy && cargo test` before every commit — zero warnings, all tests pass
-- All modules have inline `#[cfg(test)] mod tests` — 264 tests total
+- All modules have inline `#[cfg(test)] mod tests` — 267 tests total
 - Prefer `&self` over `&mut self` for read-only operations (the line cache uses interior mutability via `Option<Vec<usize>>`)
 - Minimize heap allocations in hot paths (render loop, cursor movement)
 - No `unwrap()` on user-facing I/O — propagate errors or show in status bar
@@ -137,7 +137,7 @@ Entered via `^p` command palette. Available commands:
 - [x] Quit confirmation when dirty
 - [x] Save-as prompt for unnamed buffers
 - [x] Mouse support (click, drag, double/triple click, scroll wheel)
-- [x] Horizontal scrolling for long lines
+- [x] Soft-wrap long lines at viewport edge (no horizontal scrolling)
 - [x] Timed status messages
 - [x] Toggle ruler (`^r`)
 - [x] Language detection (~45 languages by file extension)
