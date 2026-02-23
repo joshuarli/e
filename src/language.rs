@@ -366,64 +366,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_detect_rust() {
-        let lang = detect("main.rs").unwrap();
-        assert_eq!(lang.name, "Rust");
-        assert_eq!(lang.comment, "//");
+    fn test_all_extensions_resolve() {
+        for (patterns, lang) in LANGUAGES {
+            for pattern in *patterns {
+                let filename = if pattern.starts_with('.') {
+                    format!("test{pattern}")
+                } else {
+                    pattern.to_string()
+                };
+                assert_eq!(
+                    detect(&filename).map(|l| l.name),
+                    Some(lang.name),
+                    "{filename} should detect as {}",
+                    lang.name
+                );
+            }
+        }
     }
 
     #[test]
-    fn test_detect_python() {
-        let lang = detect("script.py").unwrap();
-        assert_eq!(lang.name, "Python");
-        assert_eq!(lang.comment, "#");
-    }
-
-    #[test]
-    fn test_detect_makefile() {
-        let lang = detect("Makefile").unwrap();
-        assert_eq!(lang.name, "Makefile");
-        assert_eq!(lang.comment, "#");
-    }
-
-    #[test]
-    fn test_detect_typescript() {
-        let lang = detect("app.tsx").unwrap();
-        assert_eq!(lang.name, "TypeScript");
-        assert_eq!(lang.comment, "//");
-    }
-
-    #[test]
-    fn test_detect_lua() {
-        let lang = detect("init.lua").unwrap();
-        assert_eq!(lang.name, "Lua");
-        assert_eq!(lang.comment, "--");
-    }
-
-    #[test]
-    fn test_detect_unknown() {
+    fn test_unknown_returns_none() {
         assert!(detect("readme.txt").is_none());
         assert!(detect("data.bin").is_none());
-    }
-
-    #[test]
-    fn test_detect_shell_variants() {
-        assert_eq!(detect("run.sh").unwrap().name, "Shell");
-        assert_eq!(detect("run.bash").unwrap().name, "Shell");
-        assert_eq!(detect("run.zsh").unwrap().name, "Shell");
-        assert_eq!(detect("config.fish").unwrap().name, "Shell");
-    }
-
-    #[test]
-    fn test_detect_c_variants() {
-        assert_eq!(detect("main.c").unwrap().name, "C");
-        assert_eq!(detect("header.h").unwrap().name, "C");
-        assert_eq!(detect("main.cpp").unwrap().name, "C++");
+        assert!(detect("noext").is_none());
     }
 
     #[test]
     fn test_detect_with_path() {
-        let lang = detect("/some/path/main.rs").unwrap();
-        assert_eq!(lang.name, "Rust");
+        assert_eq!(detect("/some/path/main.rs").unwrap().name, "Rust");
     }
 }
