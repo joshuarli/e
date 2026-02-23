@@ -69,7 +69,7 @@ Configurable via `~/.config/e/keybindings.ini`. Format: `ctrl+key = action`.
 | `^c` | Copy |
 | `^x` | Cut |
 | `^v` | Paste |
-| `^f` | Find (regex, smart-case, prefills from selection); Enter → browse with up/down, Esc exits |
+| `^f` | Find (regex, smart-case, prefills from selection); jumps to first match as you type; Enter → browse with up/down, Esc exits |
 | `^p` | Command palette |
 | `^l` | Goto line |
 | `^k` | Kill line |
@@ -128,7 +128,7 @@ Entered via `^p` command palette. Available commands:
 - [x] Regex find with smart-case and live highlighting
 - [x] Replace all (selection-aware)
 - [x] Command palette (`^p`)
-- [x] Goto line (`^l`)
+- [x] Goto line (`^l`, centers viewport on target)
 - [x] Configurable keybindings (INI file)
 - [x] SIGWINCH window resize handling
 - [x] File safety checks (binary detection, >5MB confirmation)
@@ -144,7 +144,7 @@ Entered via `^p` command palette. Available commands:
 - [x] Comment toggle (`^d` / `comment` command, language-aware)
 - [x] Tab completion in command palette
 - [x] Tab display as dark grey pipes
-- [x] Find navigation mode (up/down browse matches, "match X of Y", current match green, centers viewport on match, exits to selection)
+- [x] Find navigation mode (jumps to first match as you type, up/down browse matches, "match X of Y", current match green, centers viewport on match, exits to selection)
 - [x] Shift+Tab dedent (removes leading tab or 2 spaces from current/selected lines)
 - [x] File locking (`~/.config/e/buffers/<encoded_path>.elock`) to prevent concurrent edits
 - [x] Automatic `mkdir -p` on save when parent directories don't exist

@@ -569,6 +569,13 @@ impl Editor {
             CommandBufferResult::Changed(val) => {
                 if mode == CommandBufferMode::Find {
                     self.update_find_highlights(&val);
+                    if !self.find_matches.is_empty() {
+                        self.find_index = 0;
+                        let (_start, end) = self.find_matches[0];
+                        self.set_cursor(end);
+                        self.center_view_on_line(end.line);
+                        self.set_find_status();
+                    }
                 }
             }
             CommandBufferResult::TabComplete => {
@@ -653,6 +660,7 @@ impl Editor {
             (n - 1).min(line_count.saturating_sub(1))
         };
         self.set_cursor(Pos::new(target, 0));
+        self.center_view_on_line(target);
     }
 
     fn goto_top(&mut self) {
