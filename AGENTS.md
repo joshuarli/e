@@ -1,6 +1,6 @@
 # `e` — Minimalist Terminal Text Editor
 
-A performant, minimalist text editor in Rust. Single-file editing only — no tabs, no file browser. macOS and Linux.
+A performant, minimalist, intuitive text editor in Rust.
 
 ## Design Constraints
 
@@ -53,7 +53,7 @@ Channel-based (`std::sync::mpsc`). No async runtime.
 
 ## Rendering
 
-All output buffered to a `Vec<u8>`, written to terminal in a single `write_all` per frame. Synchronized output protocol (`\x1b[?2026h`/`\x1b[?2026l`) wraps each frame so supporting terminals (kitty, iTerm2, WezTerm, ghostty, foot) hold rendering until complete; unsupporting terminals ignore the sequences. Lines are overwritten in-place with `\x1b[K` (erase to end of line) after content rather than `\x1b[2K` (erase entire line) before, eliminating clear-then-draw flicker. Scroll at document boundaries short-circuits (no redraw). Syntax highlighting: per-line HlState cached across frames (keyed by GapBuffer version counter); cache reused during scrolling (zero recomputation), recomputed on edits; per-char HlType mapped from byte highlights; ANSI colors emitted with minimal escape changes on the fast path. Selection/find highlights override syntax colors. Bracket matching: when cursor is on a bracket `()[]{}`, the matching bracket is highlighted with magenta background/black text. Status bar (reverse video) on second-to-last row shows `Language │ Ln X, Col Y` on the right. Command buffer on last row when active with blinking cursor. Tab completions render above the status bar. Selection rendered as reverse video, find matches as yellow background (current match green). Line numbers in dim text (no separator). Tabs display as dark grey `|` pipe followed by space. Cursor hidden during find navigation mode.
+All output buffered to a `Vec<u8>`, written to terminal in a single `write_all` per frame. Synchronized output protocol (`\x1b[?2026h`/`\x1b[?2026l`) wraps each frame so supporting terminals (kitty, iTerm2, WezTerm, ghostty, foot) hold rendering until complete; unsupporting terminals ignore the sequences. Lines are overwritten in-place with `\x1b[K` (erase to end of line) after content rather than `\x1b[2K` (erase entire line) before, eliminating clear-then-draw flicker. Scroll at document boundaries short-circuits (no redraw). Syntax highlighting: per-line HlState cached across frames (keyed by GapBuffer version counter); cache reused during scrolling (zero recomputation), recomputed on edits; per-char HlType mapped from byte highlights; ANSI colors emitted with minimal escape changes on the fast path. Selection/find highlights override syntax colors. Bracket matching: when cursor is on a bracket `()[]{}`, the matching bracket is highlighted with magenta background/black text. Status bar (reverse video) on second-to-last row shows `Language │ Ln X, Col Y` on the right. Command buffer on last row when active with blinking cursor. Tab completions render above the status bar. Selection rendered as reverse video, find matches as yellow background (current match green). Line numbers in dim text (no separator). Tabs display as dark grey `|` pipe followed by space. Cursor hidden during find navigation mode and when selection is active.
 
 ## Keybindings
 
@@ -69,7 +69,7 @@ Configurable via `~/.config/e/keybindings.ini`. Format: `ctrl+key = action`.
 | `^c` | Copy |
 | `^x` | Cut |
 | `^v` | Paste |
-| `^f` | Find (regex, smart-case); Enter → browse with up/down, Esc exits |
+| `^f` | Find (regex, smart-case, prefills from selection); Enter → browse with up/down, Esc exits |
 | `^p` | Command palette |
 | `^l` | Goto line |
 | `^k` | Kill line |
@@ -87,7 +87,7 @@ Configurable via `~/.config/e/keybindings.ini`. Format: `ctrl+key = action`.
 | `Shift+Arrows` | Extend selection (left/right also snap to indent stops) |
 | `Esc` | Clear selection / find highlights |
 
-Mouse: click to place cursor, drag to select, double-click selects word (space-delineated), triple-click selects line, scroll wheel scrolls.
+Mouse: click to place cursor, drag to select, double-click selects word (`is_word_char`: alphanumeric + underscore), triple-click selects line, scroll wheel scrolls.
 
 ## Commands
 

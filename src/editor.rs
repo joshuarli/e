@@ -17,7 +17,7 @@ use crate::highlight;
 use crate::keybind::{EditorAction, KeybindingTable};
 use crate::language;
 use crate::render::{Renderer, gutter_width};
-use crate::selection::{Pos, Selection, prev_word_boundary};
+use crate::selection::{Pos, Selection, is_word_char, prev_word_boundary};
 use crate::view::View;
 
 const SCROLL_LINES: usize = 3;
@@ -450,7 +450,16 @@ impl Editor {
                     self.cmd_buf.open(CommandBufferMode::Goto, "goto: ", "");
                 }
                 EditorAction::Find => {
-                    self.cmd_buf.open(CommandBufferMode::Find, "find: ", "");
+                    let prefill = if !self.sel.is_empty() {
+                        let (start, end) = self.sel.ordered();
+                        let text = self.doc.text_in_range(start, end);
+                        let s = String::from_utf8_lossy(&text).to_string();
+                        if s.len() <= 100 { s } else { String::new() }
+                    } else {
+                        String::new()
+                    };
+                    self.cmd_buf
+                        .open(CommandBufferMode::Find, "find: ", &prefill);
                     self.find_matches.clear();
                 }
                 EditorAction::CtrlBackspace => self.ctrl_backspace(),
@@ -890,17 +899,15 @@ impl Editor {
             return;
         }
         let col = pos.col.min(line_text.len().saturating_sub(1));
-        if col < line_text.len() && line_text[col] != b' ' && line_text[col] != b'\t' {
-            // Space-delineated: select everything between whitespace boundaries
+        if col < line_text.len() && is_word_char(line_text[col]) {
             let mut start = col;
-            while start > 0 && line_text[start - 1] != b' ' && line_text[start - 1] != b'\t' {
+            while start > 0 && is_word_char(line_text[start - 1]) {
                 start -= 1;
             }
             let mut end = col;
-            while end < line_text.len() && line_text[end] != b' ' && line_text[end] != b'\t' {
+            while end < line_text.len() && is_word_char(line_text[end]) {
                 end += 1;
             }
-            // Anchor at end, cursor at start so the cursor doesn't appear past the word
             self.sel = Selection {
                 anchor: Pos::new(pos.line, end),
                 cursor: Pos::new(pos.line, start),

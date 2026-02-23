@@ -356,8 +356,8 @@ impl Renderer {
         write!(w, "\x1b[K")?;
 
         // Position cursor
-        if find_active {
-            // Hide cursor while browsing find results
+        if find_active || has_sel {
+            // Hide cursor while browsing find results or when selection is active
             write!(w, "\x1b[?25l")?;
         } else if let Some(col) = cmd_cursor {
             // Blinking cursor in command buffer
