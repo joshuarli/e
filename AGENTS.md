@@ -101,6 +101,12 @@ Entered via `^p` command palette. Available commands:
 | `replaceall <regex> <replacement>` | Replace all matches (in selection if active, else whole file) |
 | `comment` | Toggle line comments (language-aware) |
 
+## Building
+
+- `cargo build` — debug build
+- `just release` — optimized release build (~313KB), requires nightly + rust-src
+- `just install` — release build + copy to `/usr/local/bin/e`
+
 ## Development Guidelines
 
 - Run `cargo clippy && cargo test` before every commit — zero warnings, all tests pass
