@@ -62,6 +62,8 @@ pub struct Editor {
     find_pattern: String,
     find_matches: Vec<(Pos, Pos)>,
     find_index: usize,
+    /// True while browsing find results with up/down arrows.
+    find_active: bool,
 }
 
 enum EditorEvent {
@@ -98,6 +100,7 @@ impl Editor {
             find_pattern: String::new(),
             find_matches: Vec::new(),
             find_index: 0,
+            find_active: false,
         }
     }
 
@@ -209,8 +212,19 @@ impl Editor {
         } else {
             None
         };
+        let find_current = if self.find_active {
+            Some(self.find_index)
+        } else {
+            None
+        };
 
         let completions = &self.cmd_buf.completions;
+
+        let cmd_cursor = if self.cmd_buf.active {
+            Some(self.cmd_buf.prompt.len() + self.cmd_buf.cursor)
+        } else {
+            None
+        };
 
         self.renderer.render(
             out,
@@ -224,7 +238,10 @@ impl Editor {
             cmd_ref,
             sel,
             find_matches,
+            find_current,
             completions,
+            cmd_cursor,
+            self.find_active,
         )
     }
 
@@ -281,6 +298,9 @@ impl Editor {
             }
             Event::Mouse(mouse) => {
                 if !self.cmd_buf.active {
+                    if self.find_active {
+                        self.exit_find_mode();
+                    }
                     self.handle_mouse(mouse);
                 }
             }
@@ -306,6 +326,29 @@ impl Editor {
                 }
             }
             return;
+        }
+
+        // Find navigation mode: up/down browse matches, anything else exits
+        if self.find_active {
+            match key {
+                Key::Up => {
+                    self.find_prev();
+                    return;
+                }
+                Key::Down => {
+                    self.find_next();
+                    return;
+                }
+                Key::Esc => {
+                    self.exit_find_mode();
+                    self.clear_selection();
+                    return;
+                }
+                _ => {
+                    self.exit_find_mode();
+                    // Fall through to process the key normally
+                }
+            }
         }
 
         self.desired_col = match key {
@@ -578,24 +621,65 @@ impl Editor {
 
     fn find_next_from_submit(&mut self, pattern: &str) {
         self.update_find_highlights(pattern);
+        if self.find_matches.is_empty() {
+            self.set_status("Find: no matches".to_string());
+            return;
+        }
+        self.find_active = true;
         self.find_next();
     }
 
     fn find_next(&mut self) {
         if self.find_matches.is_empty() {
-            self.set_status("Find: no matches".to_string());
             return;
         }
         let cursor = self.cursor();
-        // Find the next match after cursor
         let idx = self
             .find_matches
             .iter()
-            .position(|(start, _)| *start > cursor);
+            .position(|(start, _)| *start >= cursor);
         let idx = idx.unwrap_or(0); // wrap around
         self.find_index = idx;
-        let (start, _end) = self.find_matches[idx];
-        self.set_cursor(start);
+        let (_start, end) = self.find_matches[idx];
+        self.set_cursor(end);
+        self.set_find_status();
+    }
+
+    fn find_prev(&mut self) {
+        if self.find_matches.is_empty() {
+            return;
+        }
+        let cursor = self.cursor();
+        let idx = self.find_matches.iter().rposition(|(_, end)| *end < cursor);
+        let idx = idx.unwrap_or(self.find_matches.len() - 1); // wrap around
+        self.find_index = idx;
+        let (_start, end) = self.find_matches[idx];
+        self.set_cursor(end);
+        self.set_find_status();
+    }
+
+    fn set_find_status(&mut self) {
+        self.status_msg = format!(
+            "match {} of {}",
+            self.find_index + 1,
+            self.find_matches.len()
+        );
+        self.status_time = None; // don't auto-expire while browsing
+    }
+
+    fn exit_find_mode(&mut self) {
+        // Select the current match so copy/backspace/etc. act on it
+        if !self.find_matches.is_empty() && self.find_index < self.find_matches.len() {
+            let (start, end) = self.find_matches[self.find_index];
+            self.sel = Selection {
+                anchor: start,
+                cursor: end,
+            };
+        }
+        self.find_active = false;
+        self.find_matches.clear();
+        self.status_msg.clear();
+        self.status_time = None;
     }
 
     // -- replace all --------------------------------------------------------

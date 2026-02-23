@@ -56,7 +56,7 @@ Channel-based (`std::sync::mpsc`). No async runtime.
 
 ## Rendering
 
-All output buffered to a `Write` impl, flushed once per frame. Status bar (reverse video) on second-to-last row shows `Language │ Ln X, Col Y` on the right. Command buffer on last row when active. Tab completions render above the status bar. Selection rendered as reverse video, find matches as yellow background. Line numbers in dim text (no separator). Tabs display as dark grey `|` pipe followed by space.
+All output buffered to a `Write` impl, flushed once per frame. Status bar (reverse video) on second-to-last row shows `Language │ Ln X, Col Y` on the right. Command buffer on last row when active with blinking cursor. Tab completions render above the status bar. Selection rendered as reverse video, find matches as yellow background (current match green). Line numbers in dim text (no separator). Tabs display as dark grey `|` pipe followed by space. Cursor hidden during find navigation mode.
 
 ## Keybindings
 
@@ -72,7 +72,7 @@ Configurable via `~/.config/e/keybindings.ini`. Format: `ctrl+key = action`.
 | `^c` | Copy |
 | `^x` | Cut |
 | `^v` | Paste |
-| `^f` | Find (regex, smart-case) |
+| `^f` | Find (regex, smart-case); Enter → browse with up/down, Esc exits |
 | `^p` | Command palette |
 | `^l` | Goto line |
 | `^k` | Kill line |
@@ -135,6 +135,7 @@ Entered via `^p` command palette. Available commands:
 - [x] Comment toggle (`^d` / `comment` command, language-aware)
 - [x] Tab completion in command palette
 - [x] Tab display as dark grey pipes
+- [x] Find navigation mode (up/down browse matches, "match X of Y", current match green, exits to selection)
 
 ## Future Work
 

@@ -65,7 +65,10 @@ impl Renderer {
         command_line: Option<&str>,
         selection: Option<Selection>,
         find_matches: Option<&[(Pos, Pos)]>,
+        find_current: Option<usize>,
         completions: &[String],
+        cmd_cursor: Option<usize>,
+        find_active: bool,
     ) -> io::Result<()> {
         let line_count = buf.line_count();
         let gw = if ruler_on {
@@ -128,13 +131,16 @@ impl Renderer {
                         (0, 0)
                     };
 
-                    // Find match ranges (display cols) for this line
-                    let find_ranges: Vec<(usize, usize)> = find_matches
+                    // Find match ranges (display cols, match_index) for this line
+                    let find_ranges: Vec<(usize, usize, bool)> = find_matches
                         .map(|matches| {
                             matches
                                 .iter()
-                                .filter(|(s, e)| logical_line >= s.line && logical_line <= e.line)
-                                .map(|(s, e)| {
+                                .enumerate()
+                                .filter(|(_, (s, e))| {
+                                    logical_line >= s.line && logical_line <= e.line
+                                })
+                                .map(|(idx, (s, e))| {
                                     let fs = if logical_line == s.line {
                                         display_col_for_char_col(&raw_text, s.col)
                                     } else {
@@ -145,7 +151,8 @@ impl Renderer {
                                     } else {
                                         chars.len()
                                     };
-                                    (fs, fe)
+                                    let is_current = find_current == Some(idx);
+                                    (fs, fe, is_current)
                                 })
                                 .collect()
                         })
@@ -158,7 +165,7 @@ impl Renderer {
                         .skip(visible_start)
                     {
                         let in_sel = need_per_char && i >= line_sel_start && i < line_sel_end;
-                        let in_find = find_ranges.iter().any(|(fs, fe)| i >= *fs && i < *fe);
+                        let find_hit = find_ranges.iter().find(|(fs, fe, _)| i >= *fs && i < *fe);
                         let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
 
                         if in_sel {
@@ -167,8 +174,14 @@ impl Renderer {
                             } else {
                                 write!(out, "\x1b[7m{}\x1b[0m", ch)?;
                             }
-                        } else if in_find {
-                            write!(out, "\x1b[43;30m{}\x1b[0m", ch)?;
+                        } else if let Some((_, _, is_current)) = find_hit {
+                            if *is_current {
+                                // Current match: green background, black text
+                                write!(out, "\x1b[42;30m{}\x1b[0m", ch)?;
+                            } else {
+                                // Other matches: yellow background, black text
+                                write!(out, "\x1b[43;30m{}\x1b[0m", ch)?;
+                            }
                         } else if is_tab_pipe {
                             // Dark grey tab indicator
                             write!(out, "\x1b[90m{}\x1b[0m", ch)?;
@@ -229,14 +242,23 @@ impl Renderer {
         }
 
         // Position cursor
-        let screen_col = if ruler_on {
-            cursor_col.saturating_sub(view.scroll_col) + gw
+        if find_active {
+            // Hide cursor while browsing find results
+            write!(out, "\x1b[?25l")?;
+        } else if let Some(col) = cmd_cursor {
+            // Blinking cursor in command buffer
+            write!(out, "\x1b[{};{}H", cmd_row, col + 1)?;
+            write!(out, "\x1b[?25h")?;
         } else {
-            cursor_col.saturating_sub(view.scroll_col)
-        };
-        let screen_row = cursor_line.saturating_sub(view.scroll_line);
-        write!(out, "\x1b[{};{}H", screen_row + 1, screen_col + 1)?;
-        write!(out, "\x1b[?25h")?;
+            let screen_col = if ruler_on {
+                cursor_col.saturating_sub(view.scroll_col) + gw
+            } else {
+                cursor_col.saturating_sub(view.scroll_col)
+            };
+            let screen_row = cursor_line.saturating_sub(view.scroll_line);
+            write!(out, "\x1b[{};{}H", screen_row + 1, screen_col + 1)?;
+            write!(out, "\x1b[?25h")?;
+        }
 
         out.flush()?;
         self.needs_full_redraw = false;
@@ -418,7 +440,10 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
+            None,
+            false,
         )
         .unwrap();
 
@@ -448,7 +473,10 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
+            None,
+            false,
         )
         .unwrap();
 
@@ -477,7 +505,10 @@ mod tests {
             Some("find: test"),
             None,
             None,
+            None,
             &[],
+            None,
+            false,
         )
         .unwrap();
 
@@ -506,7 +537,10 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
+            None,
+            false,
         )
         .unwrap();
 
@@ -537,7 +571,10 @@ mod tests {
             None,
             Some(sel),
             None,
+            None,
             &[],
+            None,
+            false,
         )
         .unwrap();
 
@@ -565,7 +602,10 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
+            None,
+            false,
         )
         .unwrap();
 
