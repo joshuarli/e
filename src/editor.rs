@@ -84,7 +84,6 @@ pub struct Editor {
 enum EditorEvent {
     Term(Event),
     Paste(String),
-    Resize(u16, u16),
     #[allow(dead_code)]
     Tick,
 }
@@ -164,18 +163,7 @@ impl Editor {
             }
         });
 
-        let tx_sig = tx.clone();
-        std::thread::spawn(move || {
-            let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])
-                .expect("failed to register SIGWINCH");
-            for _ in signals.forever() {
-                if let Ok((w, h)) = termion::terminal_size()
-                    && tx_sig.send(EditorEvent::Resize(w, h)).is_err()
-                {
-                    break;
-                }
-            }
-        });
+        crate::signal::register_sigwinch();
 
         while self.running {
             // Expire status messages after 3 seconds
@@ -191,12 +179,15 @@ impl Editor {
             match rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(EditorEvent::Term(ev)) => self.handle_event(ev),
                 Ok(EditorEvent::Paste(text)) => self.paste_text(&text),
-                Ok(EditorEvent::Resize(w, h)) => {
-                    self.view.width = w;
-                    self.view.height = h;
-                    self.renderer.force_full_redraw();
+                Ok(EditorEvent::Tick) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if crate::signal::take_sigwinch()
+                        && let Ok((w, h)) = termion::terminal_size()
+                    {
+                        self.view.width = w;
+                        self.view.height = h;
+                        self.renderer.force_full_redraw();
+                    }
                 }
-                Ok(EditorEvent::Tick) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }

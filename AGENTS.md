@@ -5,7 +5,7 @@ A performant, minimalist text editor in Rust. Single-file editing only — no ta
 ## Design Constraints
 
 - Rust 2024 edition
-- 3 dependencies only: `termion`, `regex`, `signal-hook` — do not add crates without good reason
+- 3 dependencies only: `termion`, `regex`, `libc` — do not add crates without good reason
 - Single-file editing — no tabs, no file browser, no split panes
 - macOS and Linux only (no Windows)
 - Indent: 2 spaces for all files except `.c`, `.h`, `.go`, `Makefile` which use tabs
@@ -31,7 +31,7 @@ src/
   clipboard.rs       Platform-detected clipboard: pbcopy/wl-copy/xclip/xsel/internal fallback
   file_io.rs         Read/write files, CRLF→LF normalization, binary detection, trailing whitespace strip, file locking
   language.rs        Language detection by file extension (~45 languages), comment syntax lookup
-  signal.rs          Placeholder (SIGWINCH handled directly in editor.rs via signal-hook)
+  signal.rs          SIGWINCH handler via libc::sigaction + AtomicBool polling
   highlight.rs       Syntax highlighting: byte-by-byte highlighter, HlType/HlState types, per-language rules (14 languages), ANSI color theme
 ```
 
@@ -42,15 +42,14 @@ src/
 - **Pos** (`selection.rs`): `{ line: usize, col: usize }` — 0-indexed, col is character index not byte offset. Implements `Ord`.
 - **Selection** (`selection.rs`): `{ anchor: Pos, cursor: Pos }`. `anchor == cursor` means no selection. `ordered()` returns `(start, end)`.
 - **UndoStack** (`operation.rs`): Groups operations automatically by: kind change (insert vs delete), word boundary (space/newline), time gap (>1s), cursor jump, or explicit `seal()`. `seal()` immediately flushes the current group for atomic undo of paste/comment operations.
-- **Editor** (`editor.rs`): Owns everything. Event loop uses `mpsc` channels — background thread for stdin, another for SIGWINCH. Main thread does `recv_timeout(500ms)` for status message expiry.
+- **Editor** (`editor.rs`): Owns everything. Event loop uses `mpsc` channels — background thread for stdin. SIGWINCH polled via atomic flag on 500ms timeout. Main thread does `recv_timeout(500ms)` for status message expiry.
 
 ## Event Loop
 
 Channel-based (`std::sync::mpsc`). No async runtime.
 
 1. Background thread: reads `stdin.events()` via termion → sends `EditorEvent::Term(Event)`. Detects bracketed paste markers (`\x1b[200~`/`\x1b[201~`) and buffers pasted text into a single `EditorEvent::Paste(String)` for atomic undo.
-2. Background thread: listens for `SIGWINCH` via `signal-hook` → sends `EditorEvent::Resize(w, h)`
-3. Main thread: `recv_timeout(500ms)` — dispatches events, expires status messages, redraws
+2. Main thread: `recv_timeout(500ms)` — dispatches events, polls SIGWINCH atomic flag, expires status messages, redraws
 
 ## Rendering
 
@@ -148,8 +147,4 @@ Entered via `^p` command palette. Available commands:
 - [x] Duplicate line (`^j`)
 - [x] Forward delete key
 - [x] Select word at cursor (`^w`)
-
-## Future Work
-
 - [x] Syntax highlighting (14 languages: Rust, Python, Go, TypeScript, JavaScript, Shell, C, TOML, JSON, YAML, Makefile, HTML, CSS, Dockerfile)
-- [ ] Differential rendering with per-line hashes (field exists in `Renderer`, not yet wired up)
