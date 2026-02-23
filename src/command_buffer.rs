@@ -83,7 +83,7 @@ impl CommandBuffer {
                 let val = self.input.clone();
                 CommandBufferResult::Submit(val)
             }
-            Key::Esc => CommandBufferResult::Cancel,
+            Key::Esc | Key::Ctrl('q') => CommandBufferResult::Cancel,
             Key::Char('\t') => {
                 self.completions.clear();
                 CommandBufferResult::TabComplete
@@ -126,6 +126,14 @@ impl CommandBuffer {
             }
             _ => CommandBufferResult::Continue,
         }
+    }
+
+    pub fn insert_str(&mut self, s: &str) -> CommandBufferResult {
+        self.completions.clear();
+        let clean: String = s.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        self.input.insert_str(self.cursor, &clean);
+        self.cursor += clean.len();
+        CommandBufferResult::Changed(self.input.clone())
     }
 
     fn history_prev(&mut self) {

@@ -365,9 +365,10 @@ impl Renderer {
         let cmd_row = text_rows + completion_rows + 2;
         write!(w, "\x1b[{};1H", cmd_row)?;
         if let Some(cmd) = command_line {
-            write!(w, "{}", cmd)?;
+            write!(w, "\x1b[30;43m{}\x1b[K\x1b[0m", cmd)?;
+        } else {
+            write!(w, "\x1b[K")?;
         }
-        write!(w, "\x1b[K")?;
 
         // Position cursor
         if find_active || has_sel {

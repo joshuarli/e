@@ -195,7 +195,15 @@ impl Editor {
 
             match rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(EditorEvent::Term(ev)) => self.handle_event(ev),
-                Ok(EditorEvent::Paste(text)) => self.paste_text(&text),
+                Ok(EditorEvent::Paste(text)) => {
+                    if self.cmd_buf.active {
+                        let result = self.cmd_buf.insert_str(&text);
+                        let mode = self.cmd_buf.mode;
+                        self.handle_cmd_result(mode, result);
+                    } else {
+                        self.paste_text(&text);
+                    }
+                }
                 Ok(EditorEvent::Tick) | Err(mpsc::RecvTimeoutError::Timeout) => {
                     if crate::signal::take_sigwinch()
                         && let Ok((w, h)) = termion::terminal_size()
@@ -533,7 +541,10 @@ impl Editor {
     fn handle_cmd_key(&mut self, key: Key) {
         let mode = self.cmd_buf.mode;
         let result = self.cmd_buf.handle_key(key);
+        self.handle_cmd_result(mode, result);
+    }
 
+    fn handle_cmd_result(&mut self, mode: CommandBufferMode, result: CommandBufferResult) {
         match result {
             CommandBufferResult::Submit(val) => {
                 self.cmd_buf.close();
@@ -738,7 +749,12 @@ impl Editor {
             return;
         }
         self.find_active = true;
-        self.find_next();
+        // Live search already jumped to match 0; just activate browse mode there.
+        self.find_index = 0;
+        let (_start, end) = self.find_matches[0];
+        self.set_cursor(end);
+        self.center_view_on_line(end.line);
+        self.set_find_status();
     }
 
     fn find_next(&mut self) {
