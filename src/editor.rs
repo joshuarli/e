@@ -433,6 +433,8 @@ impl Editor {
                 }
                 EditorAction::CtrlBackspace => self.ctrl_backspace(),
                 EditorAction::ToggleComment => self.toggle_comment(),
+                EditorAction::DuplicateLine => self.duplicate_line(),
+                EditorAction::SelectWord => self.select_word_at(self.cursor()),
             }
             return;
         }
@@ -461,6 +463,7 @@ impl Editor {
             }
 
             // Editing
+            Key::Delete => self.delete_forward(),
             Key::Backspace => self.backspace(),
             Key::Char('\t') => self.insert_tab(),
             Key::BackTab => self.dedent(),
@@ -1088,7 +1091,8 @@ impl Editor {
 
     fn insert_tab(&mut self) {
         if !self.sel.is_empty() {
-            self.delete_selection();
+            self.indent_selection();
+            return;
         }
         let use_tab = self.doc.filename.as_ref().is_some_and(|f| {
             f.ends_with(".c") || f.ends_with(".h") || f.ends_with(".go") || f.contains("Makefile")
@@ -1098,6 +1102,41 @@ impl Editor {
             .doc
             .insert(self.cursor().line, self.cursor().col, bytes);
         self.set_cursor(pos);
+    }
+
+    fn indent_selection(&mut self) {
+        let (s, e) = self.sel.ordered();
+        let end_line = if e.col == 0 && e.line > s.line {
+            e.line - 1
+        } else {
+            e.line
+        };
+        let start_line = s.line;
+
+        let use_tab = self.doc.filename.as_ref().is_some_and(|f| {
+            f.ends_with(".c") || f.ends_with(".h") || f.ends_with(".go") || f.contains("Makefile")
+        });
+        let indent_bytes: &[u8] = if use_tab { b"\t" } else { b"  " };
+        let indent_char_len = if use_tab { 1 } else { 2 };
+
+        self.doc.seal_undo();
+        let cursor_line = self.cursor().line;
+        let mut cursor_added = 0usize;
+        for line_idx in (start_line..=end_line).rev() {
+            let text = self.doc.buf.line_text(line_idx);
+            let is_blank = text.iter().all(|&b| b == b' ' || b == b'\t');
+            if is_blank {
+                continue;
+            }
+            self.doc.insert(line_idx, 0, indent_bytes);
+            if line_idx == cursor_line {
+                cursor_added = indent_char_len;
+            }
+        }
+        self.doc.seal_undo();
+
+        let c = self.cursor();
+        self.set_cursor(Pos::new(c.line, c.col + cursor_added));
     }
 
     fn insert_newline(&mut self) {
@@ -1187,6 +1226,34 @@ impl Editor {
         self.doc.delete_range(start, end);
         self.doc.seal_undo();
         self.set_cursor(start);
+    }
+
+    fn delete_forward(&mut self) {
+        if !self.sel.is_empty() {
+            self.delete_selection();
+            return;
+        }
+        let c = self.cursor();
+        let line_len = self.doc.buf.line_char_len(c.line);
+        if c.col < line_len {
+            self.doc
+                .delete_range(Pos::new(c.line, c.col), Pos::new(c.line, c.col + 1));
+        } else if c.line + 1 < self.doc.buf.line_count() {
+            self.doc
+                .delete_range(Pos::new(c.line, c.col), Pos::new(c.line + 1, 0));
+        }
+    }
+
+    fn duplicate_line(&mut self) {
+        let c = self.cursor();
+        let line_text = self.doc.buf.line_text(c.line);
+        let mut new_content = vec![b'\n'];
+        new_content.extend_from_slice(&line_text);
+        let line_char_len = self.doc.buf.line_char_len(c.line);
+        self.doc.seal_undo();
+        self.doc.insert(c.line, line_char_len, &new_content);
+        self.doc.seal_undo();
+        self.set_cursor(Pos::new(c.line + 1, c.col));
     }
 
     // -- commenting ---------------------------------------------------------

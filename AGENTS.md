@@ -79,7 +79,11 @@ Configurable via `~/.config/e/keybindings.ini`. Format: `ctrl+key = action`.
 | `^d` | Toggle comment |
 | `^r` | Toggle ruler |
 | `^h` | Ctrl+Backspace (delete word) |
+| `^j` | Duplicate line |
+| `^w` | Select word at cursor |
+| `Tab` | Indent selected lines (or insert tab/spaces) |
 | `Shift+Tab` | Dedent line(s) |
+| `Delete` | Forward delete (non-configurable) |
 | `Shift+Arrows` | Extend selection |
 | `Esc` | Clear selection / find highlights |
 
@@ -107,7 +111,7 @@ Entered via `^p` command palette. Available commands:
 - No `unwrap()` on user-facing I/O — propagate errors or show in status bar
 - Keep the dependency count at 3 — solve problems with std
 - Tests should be self-contained with no external file dependencies (use `std::env::temp_dir()` for integration tests)
-- When adding new keybindings, update `KeybindingTable::with_defaults()` in `keybind.rs` and `parse_action()` match arm
+- When adding new keybindings, update `KeybindingTable::with_defaults()` in `keybind.rs`, `parse_action()` match arm, and `~/.config/e/keybindings.ini`
 
 ## v0 Feature Status
 
@@ -140,6 +144,10 @@ Entered via `^p` command palette. Available commands:
 - [x] Automatic `mkdir -p` on save when parent directories don't exist
 - [x] Sudo save on permission denied (password prompt with asterisk masking, pipes to `sudo -S`)
 - [x] Bracketed paste mode (terminal paste detected as single atomic undo operation)
+- [x] Tab indents selected lines (instead of deleting selection)
+- [x] Duplicate line (`^j`)
+- [x] Forward delete key
+- [x] Select word at cursor (`^w`)
 
 ## Future Work
 

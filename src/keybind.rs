@@ -32,6 +32,8 @@ pub enum EditorAction {
     Find,
     CtrlBackspace,
     ToggleComment,
+    DuplicateLine,
+    SelectWord,
 }
 
 pub struct KeybindingTable {
@@ -63,6 +65,8 @@ impl KeybindingTable {
         bindings.insert(kc(Key::Ctrl('f')), EditorAction::Find);
         bindings.insert(kc(Key::Ctrl('h')), EditorAction::CtrlBackspace);
         bindings.insert(kc(Key::Ctrl('d')), EditorAction::ToggleComment);
+        bindings.insert(kc(Key::Ctrl('j')), EditorAction::DuplicateLine);
+        bindings.insert(kc(Key::Ctrl('w')), EditorAction::SelectWord);
         Self { bindings }
     }
 
@@ -136,6 +140,8 @@ fn parse_action(s: &str) -> Option<EditorAction> {
         "find" => Some(EditorAction::Find),
         "ctrlbackspace" => Some(EditorAction::CtrlBackspace),
         "togglecomment" => Some(EditorAction::ToggleComment),
+        "duplicateline" => Some(EditorAction::DuplicateLine),
+        "selectword" => Some(EditorAction::SelectWord),
         _ => None,
     }
 }
@@ -219,9 +225,18 @@ mod tests {
     }
 
     #[test]
+    fn test_defaults_has_duplicate_and_selectword() {
+        let kb = KeybindingTable::with_defaults();
+        assert_eq!(
+            kb.lookup(Key::Ctrl('j')),
+            Some(&EditorAction::DuplicateLine)
+        );
+        assert_eq!(kb.lookup(Key::Ctrl('w')), Some(&EditorAction::SelectWord));
+    }
+
+    #[test]
     fn test_lookup_unbound_key() {
         let kb = KeybindingTable::with_defaults();
-        assert_eq!(kb.lookup(Key::Ctrl('j')), None);
         assert_eq!(kb.lookup(Key::Char('a')), None);
         assert_eq!(kb.lookup(Key::F(1)), None);
     }
@@ -288,6 +303,11 @@ mod tests {
             parse_action("togglecomment"),
             Some(EditorAction::ToggleComment)
         );
+        assert_eq!(
+            parse_action("duplicateline"),
+            Some(EditorAction::DuplicateLine)
+        );
+        assert_eq!(parse_action("selectword"), Some(EditorAction::SelectWord));
     }
 
     #[test]
