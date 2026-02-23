@@ -17,7 +17,7 @@ Ownership chain: `main.rs` → `Editor` → `Document` → `GapBuffer`
 
 ```
 src/
-  main.rs            arg parsing (single file only), file safety checks (binary, >5MB), file locking, enter raw mode
+  main.rs            arg parsing (single file only), file safety checks (binary, >5MB), file locking, piped stdin detection, enter raw mode
   editor.rs          Editor struct: all state, channel-based event loop, action dispatch
   buffer.rs          GapBuffer (Vec<u8> with gap) + lazy line-start index cache
   document.rs        wraps GapBuffer + UndoStack + dirty flag + filename
@@ -42,13 +42,13 @@ src/
 - **Pos** (`selection.rs`): `{ line: usize, col: usize }` — 0-indexed, col is character index not byte offset. Implements `Ord`.
 - **Selection** (`selection.rs`): `{ anchor: Pos, cursor: Pos }`. `anchor == cursor` means no selection. `ordered()` returns `(start, end)`.
 - **UndoStack** (`operation.rs`): Groups operations automatically by: kind change (insert vs delete), word boundary (space/newline), time gap (>1s), cursor jump, or explicit `seal()`. `seal()` immediately flushes the current group for atomic undo of paste/comment operations.
-- **Editor** (`editor.rs`): Owns everything. Event loop uses `mpsc` channels — background thread for stdin. SIGWINCH polled via atomic flag on 500ms timeout. Main thread does `recv_timeout(500ms)` for status message expiry.
+- **Editor** (`editor.rs`): Owns everything. Event loop uses `mpsc` channels — background thread for stdin (or `/dev/tty` when stdin is piped). SIGWINCH polled via atomic flag on 500ms timeout. Main thread does `recv_timeout(500ms)` for status message expiry.
 
 ## Event Loop
 
 Channel-based (`std::sync::mpsc`). No async runtime.
 
-1. Background thread: reads `stdin.events()` via termion → sends `EditorEvent::Term(Event)`. Detects bracketed paste markers (`\x1b[200~`/`\x1b[201~`) and buffers pasted text into a single `EditorEvent::Paste(String)` for atomic undo.
+1. Background thread: reads `stdin.events()` via termion (or `/dev/tty` when stdin was piped) → sends `EditorEvent::Term(Event)`. Detects bracketed paste markers (`\x1b[200~`/`\x1b[201~`) and buffers pasted text into a single `EditorEvent::Paste(String)` for atomic undo.
 2. Main thread: `recv_timeout(500ms)` — dispatches events, polls SIGWINCH atomic flag, expires status messages, redraws
 
 ## Rendering
@@ -149,6 +149,7 @@ Entered via `^p` command palette. Available commands:
 - [x] File locking (`~/.config/e/buffers/<encoded_path>.elock`) to prevent concurrent edits
 - [x] Automatic `mkdir -p` on save when parent directories don't exist
 - [x] Sudo save on permission denied (password prompt with asterisk masking, pipes to `sudo -S`)
+- [x] Piped stdin support (`git log | e` reads pipe as buffer, uses `/dev/tty` for keyboard input)
 - [x] Bracketed paste mode (terminal paste detected as single atomic undo operation)
 - [x] Tab indents selected lines (instead of deleting selection)
 - [x] Duplicate line (`^j`)

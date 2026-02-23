@@ -15,7 +15,7 @@ mod selection;
 mod signal;
 mod view;
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process;
 
@@ -34,6 +34,8 @@ fn main() {
         eprintln!("Usage: e [file]");
         process::exit(1);
     }
+
+    let piped_stdin = unsafe { libc::isatty(0) } == 0;
 
     let (text, filename) = if args.len() > 1 {
         let path = Path::new(&args[1]);
@@ -73,6 +75,13 @@ fn main() {
             // New file — empty buffer with name set
             (Vec::new(), Some(args[1].clone()))
         }
+    } else if piped_stdin {
+        let mut buf = Vec::new();
+        io::stdin().read_to_end(&mut buf).unwrap_or_else(|e| {
+            eprintln!("e: failed to read stdin: {}", e);
+            process::exit(1);
+        });
+        (buf, None)
     } else {
         (Vec::new(), None)
     };
@@ -86,7 +95,7 @@ fn main() {
         }
     }
 
-    let mut ed = editor::Editor::new(text, filename.clone());
+    let mut ed = editor::Editor::new(text, filename.clone(), piped_stdin);
     let result = ed.run();
 
     // Release file lock

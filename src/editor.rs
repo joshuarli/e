@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::io::{self, Write, stdout};
 use std::process::Command;
 use std::sync::mpsc;
@@ -79,6 +80,8 @@ pub struct Editor {
     find_active: bool,
     /// Temp file path for sudo save flow.
     sudo_save_tmp: Option<String>,
+    /// True when stdin was a pipe (e.g. `git show | e`).
+    piped_stdin: bool,
 }
 
 enum EditorEvent {
@@ -89,7 +92,7 @@ enum EditorEvent {
 }
 
 impl Editor {
-    pub fn new(text: Vec<u8>, filename: Option<String>) -> Self {
+    pub fn new(text: Vec<u8>, filename: Option<String>, piped_stdin: bool) -> Self {
         let (w, h) = termion::terminal_size().unwrap_or((80, 24));
         let mut keybindings = KeybindingTable::with_defaults();
         keybindings.load_config();
@@ -117,6 +120,7 @@ impl Editor {
             find_index: 0,
             find_active: false,
             sudo_save_tmp: None,
+            piped_stdin,
         }
     }
 
@@ -129,11 +133,24 @@ impl Editor {
         let (tx, rx) = mpsc::channel::<EditorEvent>();
 
         let tx_input = tx.clone();
+        let use_tty = self.piped_stdin;
         std::thread::spawn(move || {
-            let stdin = io::stdin();
+            let tty_file: Option<File> = if use_tty {
+                File::open("/dev/tty").ok()
+            } else {
+                None
+            };
+            let stdin_handle;
+            let events: Box<dyn Iterator<Item = Result<Event, io::Error>>> =
+                if let Some(f) = tty_file {
+                    Box::new(f.events())
+                } else {
+                    stdin_handle = io::stdin();
+                    Box::new(stdin_handle.events())
+                };
             let mut in_paste = false;
             let mut paste_buf = String::new();
-            for ev in stdin.events().flatten() {
+            for ev in events.flatten() {
                 if is_paste_start(&ev) {
                     in_paste = true;
                     paste_buf.clear();
