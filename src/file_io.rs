@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Read a file, converting CRLF → LF. Returns the bytes.
 pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
@@ -34,6 +34,11 @@ pub fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Clean data for writing: strip trailing whitespace and ensure trailing newline.
+pub fn clean_for_write(data: &[u8]) -> Vec<u8> {
+    strip_trailing_whitespace_and_ensure_newline(data)
+}
+
 fn strip_trailing_whitespace_and_ensure_newline(data: &[u8]) -> Vec<u8> {
     let text = String::from_utf8_lossy(data);
     let mut out = String::new();
@@ -47,6 +52,72 @@ fn strip_trailing_whitespace_and_ensure_newline(data: &[u8]) -> Vec<u8> {
         out.push('\n');
     }
     out.into_bytes()
+}
+
+/// Directory for lock files and future buffer backups: `~/.config/e/buffers/`
+fn buffers_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".config/e/buffers")
+}
+
+/// Encode an absolute file path for use as a filename.
+/// `/path/to/file.txt` → `%2Fpath%2Fto%2Ffile.txt`
+fn encode_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'/' => out.push_str("%2F"),
+            b'%' => out.push_str("%25"),
+            _ => out.push(b as char),
+        }
+    }
+    out
+}
+
+/// Compute lock file path: `~/.config/e/buffers/<encoded_path>.elock`
+pub fn lock_path(path: &Path) -> PathBuf {
+    buffers_dir().join(format!("{}.elock", encode_path(path)))
+}
+
+/// Resolve a path to absolute. Uses canonicalize if the file exists,
+/// otherwise canonicalizes the parent and appends the filename.
+fn resolve_absolute(path: &Path) -> PathBuf {
+    if let Ok(abs) = path.canonicalize() {
+        return abs;
+    }
+    // File doesn't exist yet — resolve parent
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let name = path.file_name().unwrap_or_default();
+    let abs_parent = parent.canonicalize().unwrap_or_else(|_| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(parent)
+    });
+    abs_parent.join(name)
+}
+
+/// Acquire a lock file. Returns Err if lock already exists.
+pub fn acquire_lock(path: &Path) -> Result<(), String> {
+    let abs = resolve_absolute(path);
+    let lock = lock_path(&abs);
+    if lock.exists() {
+        return Err(format!(
+            "Lock file exists: {} (another e instance may be editing this file)",
+            lock.display()
+        ));
+    }
+    let dir = buffers_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create buffers dir: {}", e))?;
+    fs::File::create(&lock).map_err(|e| format!("Failed to create lock file: {}", e))?;
+    Ok(())
+}
+
+/// Release the lock file, ignoring errors.
+pub fn release_lock(path: &Path) {
+    let abs = resolve_absolute(path);
+    let lock = lock_path(&abs);
+    let _ = fs::remove_file(lock);
 }
 
 /// Check the first 8KB for null bytes → likely binary.

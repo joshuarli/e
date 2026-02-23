@@ -78,8 +78,24 @@ fn main() {
         (Vec::new(), None)
     };
 
-    let mut ed = editor::Editor::new(text, filename);
-    if let Err(e) = ed.run() {
+    // Acquire file lock
+    if let Some(ref name) = filename {
+        let path = Path::new(name);
+        if let Err(msg) = file_io::acquire_lock(path) {
+            eprintln!("e: {}", msg);
+            process::exit(1);
+        }
+    }
+
+    let mut ed = editor::Editor::new(text, filename.clone());
+    let result = ed.run();
+
+    // Release file lock
+    if let Some(ref name) = filename {
+        file_io::release_lock(Path::new(name));
+    }
+
+    if let Err(e) = result {
         eprintln!("e: {}", e);
         process::exit(1);
     }

@@ -1,5 +1,3 @@
-This file must be updated before each commit.
-
 # `e` — Minimalist Terminal Text Editor
 
 A performant, minimalist text editor in Rust. Single-file editing only — no tabs, no file browser. macOS and Linux.
@@ -19,7 +17,7 @@ Ownership chain: `main.rs` → `Editor` → `Document` → `GapBuffer`
 
 ```
 src/
-  main.rs            arg parsing (single file only), file safety checks (binary, >5MB), enter raw mode
+  main.rs            arg parsing (single file only), file safety checks (binary, >5MB), file locking, enter raw mode
   editor.rs          Editor struct: all state, channel-based event loop, action dispatch
   buffer.rs          GapBuffer (Vec<u8> with gap) + lazy line-start index cache
   document.rs        wraps GapBuffer + UndoStack + dirty flag + filename
@@ -29,9 +27,9 @@ src/
   render.rs          ANSI rendering: gutter, line content, tab pipes, selection/find highlighting, status bar, completions
   keybind.rs         EditorAction enum, KeybindingTable with defaults, INI config loader
   command.rs         CommandRegistry: HashMap<String, CommandFn>, built-in commands
-  command_buffer.rs  Modal mini-editor for command palette, find, goto, save-as prompt; tab completion
+  command_buffer.rs  Modal mini-editor for command palette, find, goto, save-as prompt, sudo password; tab completion
   clipboard.rs       Platform-detected clipboard: pbcopy/wl-copy/xclip/xsel/internal fallback
-  file_io.rs         Read/write files, CRLF→LF normalization, binary detection, trailing whitespace strip
+  file_io.rs         Read/write files, CRLF→LF normalization, binary detection, trailing whitespace strip, file locking
   language.rs        Language detection by file extension (~45 languages), comment syntax lookup
   signal.rs          Placeholder (SIGWINCH handled directly in editor.rs via signal-hook)
   highlight.rs       Stub: Highlighter trait + Span/Style types for future syntax highlighting
@@ -81,6 +79,7 @@ Configurable via `~/.config/e/keybindings.ini`. Format: `ctrl+key = action`.
 | `^d` | Toggle comment |
 | `^r` | Toggle ruler |
 | `^h` | Ctrl+Backspace (delete word) |
+| `Shift+Tab` | Dedent line(s) |
 | `Shift+Arrows` | Extend selection |
 | `Esc` | Clear selection / find highlights |
 
@@ -136,10 +135,12 @@ Entered via `^p` command palette. Available commands:
 - [x] Tab completion in command palette
 - [x] Tab display as dark grey pipes
 - [x] Find navigation mode (up/down browse matches, "match X of Y", current match green, exits to selection)
+- [x] Shift+Tab dedent (removes leading tab or 2 spaces from current/selected lines)
+- [x] File locking (`~/.config/e/buffers/<encoded_path>.elock`) to prevent concurrent edits
+- [x] Automatic `mkdir -p` on save when parent directories don't exist
+- [x] Sudo save on permission denied (password prompt with asterisk masking, pipes to `sudo -S`)
 
 ## Future Work
 
 - [ ] Syntax highlighting (foundation: `highlight.rs` stub with `Highlighter` trait)
-- [ ] `mkdir -p` prompt when saving to non-existent parent directories
-- [ ] Permission denied handling on save
 - [ ] Differential rendering with per-line hashes (field exists in `Renderer`, not yet wired up)

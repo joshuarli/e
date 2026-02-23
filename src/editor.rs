@@ -1,4 +1,5 @@
 use std::io::{self, Write, stdout};
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -64,6 +65,8 @@ pub struct Editor {
     find_index: usize,
     /// True while browsing find results with up/down arrows.
     find_active: bool,
+    /// Temp file path for sudo save flow.
+    sudo_save_tmp: Option<String>,
 }
 
 enum EditorEvent {
@@ -101,6 +104,7 @@ impl Editor {
             find_matches: Vec::new(),
             find_index: 0,
             find_active: false,
+            sudo_save_tmp: None,
         }
     }
 
@@ -416,6 +420,7 @@ impl Editor {
             // Editing
             Key::Backspace => self.backspace(),
             Key::Char('\t') => self.insert_tab(),
+            Key::BackTab => self.dedent(),
             Key::Char('\n') => self.insert_newline(),
             Key::Char(c) => self.insert_char(c),
             _ => {}
@@ -454,12 +459,21 @@ impl Editor {
                         self.doc.filename = Some(val.clone());
                         self.save_file();
                     }
+                    CommandBufferMode::SudoSave => {
+                        self.save_file_sudo(&val);
+                    }
                 }
             }
             CommandBufferResult::Cancel => {
                 self.cmd_buf.close();
                 if mode == CommandBufferMode::Find {
                     self.find_matches.clear();
+                }
+                if mode == CommandBufferMode::SudoSave {
+                    if let Some(tmp) = self.sudo_save_tmp.take() {
+                        let _ = std::fs::remove_file(tmp);
+                    }
+                    self.set_status("sudo save cancelled".to_string());
                 }
             }
             CommandBufferResult::Changed(val) => {
@@ -1212,6 +1226,48 @@ impl Editor {
         self.doc.seal_undo();
     }
 
+    // -- dedent -------------------------------------------------------------
+
+    fn dedent(&mut self) {
+        let (start_line, end_line) = if self.sel.is_empty() {
+            (self.cursor().line, self.cursor().line)
+        } else {
+            let (s, e) = self.sel.ordered();
+            let end = if e.col == 0 && e.line > s.line {
+                e.line - 1
+            } else {
+                e.line
+            };
+            (s.line, end)
+        };
+
+        self.doc.seal_undo();
+        let cursor_line = self.cursor().line;
+        let mut cursor_removed = 0usize;
+        for line_idx in (start_line..=end_line).rev() {
+            let text = self.doc.buf.line_text(line_idx);
+            let removed = if text.starts_with(b"\t") {
+                self.doc
+                    .delete_range(Pos::new(line_idx, 0), Pos::new(line_idx, 1));
+                1
+            } else if text.starts_with(b"  ") {
+                self.doc
+                    .delete_range(Pos::new(line_idx, 0), Pos::new(line_idx, 2));
+                2
+            } else {
+                0
+            };
+            if line_idx == cursor_line {
+                cursor_removed = removed;
+            }
+        }
+        self.doc.seal_undo();
+
+        let c = self.cursor();
+        let new_col = c.col.saturating_sub(cursor_removed);
+        self.set_cursor(Pos::new(c.line, new_col));
+    }
+
     // -- clipboard ----------------------------------------------------------
 
     fn copy(&mut self) {
@@ -1296,11 +1352,33 @@ impl Editor {
         if self.doc.filename.is_some() {
             self.strip_trailing_whitespace();
             let path = self.doc.filename.clone().unwrap();
-            match crate::file_io::write_file(std::path::Path::new(&path), &self.doc.buf.contents())
+            let path_ref = std::path::Path::new(&path);
+
+            // mkdir -p for parent directory
+            if let Some(parent) = path_ref.parent()
+                && !parent.as_os_str().is_empty()
+                && !parent.exists()
             {
+                match std::fs::create_dir_all(parent) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                        self.start_sudo_save();
+                        return;
+                    }
+                    Err(e) => {
+                        self.set_status(format!("Error creating dirs: {}", e));
+                        return;
+                    }
+                }
+            }
+
+            match crate::file_io::write_file(path_ref, &self.doc.buf.contents()) {
                 Ok(()) => {
                     self.doc.dirty = false;
                     self.set_status(format!("Saved {}", path));
+                }
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                    self.start_sudo_save();
                 }
                 Err(e) => {
                     self.set_status(format!("Error saving: {}", e));
@@ -1310,6 +1388,99 @@ impl Editor {
             // Prompt for filename
             self.cmd_buf
                 .open(CommandBufferMode::Prompt, "Save as: ", "");
+        }
+    }
+
+    fn start_sudo_save(&mut self) {
+        let pid = std::process::id();
+        let tmp = format!("/tmp/e_sudo_{}", pid);
+        let contents = self.doc.buf.contents();
+        let cleaned = crate::file_io::clean_for_write(&contents);
+        match std::fs::write(&tmp, &cleaned) {
+            Ok(()) => {
+                self.sudo_save_tmp = Some(tmp);
+                let path = self.doc.filename.as_deref().unwrap_or("?");
+                let prompt = format!("sudo password (to save {}): ", path);
+                self.cmd_buf.open(CommandBufferMode::SudoSave, &prompt, "");
+            }
+            Err(e) => {
+                self.set_status(format!("Error writing temp file: {}", e));
+            }
+        }
+    }
+
+    fn save_file_sudo(&mut self, password: &str) {
+        let tmp = match self.sudo_save_tmp.take() {
+            Some(t) => t,
+            None => return,
+        };
+        let path = match self.doc.filename.clone() {
+            Some(p) => p,
+            None => return,
+        };
+        let path_ref = std::path::Path::new(&path);
+
+        // mkdir -p via sudo if needed
+        if let Some(parent) = path_ref.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            let status = Command::new("sudo")
+                .args(["-S", "mkdir", "-p"])
+                .arg(parent)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    if let Some(ref mut stdin) = child.stdin {
+                        let _ = stdin.write_all(password.as_bytes());
+                        let _ = stdin.write_all(b"\n");
+                    }
+                    child.wait()
+                });
+            match status {
+                Ok(s) if !s.success() => {
+                    let _ = std::fs::remove_file(&tmp);
+                    self.set_status("sudo mkdir failed".to_string());
+                    return;
+                }
+                Err(_) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    self.set_status("sudo mkdir failed".to_string());
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // cp via sudo
+        let status = Command::new("sudo")
+            .args(["-S", "cp"])
+            .arg(&tmp)
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                if let Some(ref mut stdin) = child.stdin {
+                    let _ = stdin.write_all(password.as_bytes());
+                    let _ = stdin.write_all(b"\n");
+                }
+                child.wait()
+            });
+
+        let _ = std::fs::remove_file(&tmp);
+
+        match status {
+            Ok(s) if s.success() => {
+                self.doc.dirty = false;
+                self.set_status(format!("Saved {} (sudo)", path));
+            }
+            _ => {
+                self.set_status("sudo save failed".to_string());
+            }
         }
     }
 }

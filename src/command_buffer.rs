@@ -13,10 +13,11 @@ pub struct CommandBuffer {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CommandBufferMode {
-    Command, // ^p command palette
-    Find,    // ^f regex find
-    Goto,    // ^l goto line
-    Prompt,  // save-as, quit confirmation, etc.
+    Command,  // ^p command palette
+    Find,     // ^f regex find
+    Goto,     // ^l goto line
+    Prompt,   // save-as, quit confirmation, etc.
+    SudoSave, // password prompt for sudo save
 }
 
 pub enum CommandBufferResult {
@@ -67,7 +68,12 @@ impl CommandBuffer {
     }
 
     pub fn display_line(&self) -> String {
-        format!("{}{}", self.prompt, self.input)
+        if self.mode == CommandBufferMode::SudoSave {
+            let masked: String = "*".repeat(self.input.len());
+            format!("{}{}", self.prompt, masked)
+        } else {
+            format!("{}{}", self.prompt, self.input)
+        }
     }
 
     pub fn handle_key(&mut self, key: termion::event::Key) -> CommandBufferResult {
