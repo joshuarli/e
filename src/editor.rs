@@ -17,10 +17,32 @@ use crate::highlight;
 use crate::keybind::{EditorAction, KeybindingTable};
 use crate::language;
 use crate::render::{Renderer, char_col_for_display_col, display_col_for_char_col, gutter_width};
-use crate::selection::{Pos, Selection, is_word_char, prev_word_boundary};
+use crate::selection::{Pos, Selection, is_word_char, merge_overlapping, prev_word_boundary};
 use crate::view::View;
 
 const SCROLL_LINES: usize = 3;
+
+/// Parse SGR mouse escape: `\x1b[<Cb;Cx;CyM` (press) or `\x1b[<Cb;Cx;Cym` (release).
+/// Returns (button_and_modifiers, x, y) only for press events.
+fn parse_sgr_mouse(bytes: &[u8]) -> Option<(u16, u16, u16)> {
+    // Must start with \x1b[< and end with M (press)
+    if bytes.len() < 6 || bytes[0] != 0x1b || bytes[1] != b'[' || bytes[2] != b'<' {
+        return None;
+    }
+    let last = *bytes.last()?;
+    if last != b'M' {
+        return None; // release events end with 'm'
+    }
+    let inner = std::str::from_utf8(&bytes[3..bytes.len() - 1]).ok()?;
+    let parts: Vec<&str> = inner.split(';').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let cb: u16 = parts[0].parse().ok()?;
+    let cx: u16 = parts[1].parse().ok()?;
+    let cy: u16 = parts[2].parse().ok()?;
+    Some((cb, cx, cy))
+}
 
 const PASTE_START: &[u8] = &[0x1b, b'[', b'2', b'0', b'0', b'~'];
 const PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
@@ -53,8 +75,8 @@ fn common_prefix(strings: &[&str]) -> String {
 
 pub struct Editor {
     doc: Document,
-    sel: Selection,
-    desired_col: Option<usize>,
+    cursors: Vec<Selection>,
+    desired_cols: Vec<Option<usize>>,
     view: View,
     renderer: Renderer,
     clipboard: Clipboard,
@@ -98,8 +120,8 @@ impl Editor {
         keybindings.load_config();
         Self {
             doc: Document::new(text, filename),
-            sel: Selection::caret(Pos::zero()),
-            desired_col: None,
+            cursors: vec![Selection::caret(Pos::zero())],
+            desired_cols: vec![None],
             view: View::new(w, h),
             renderer: Renderer::new(),
             clipboard: Clipboard::detect(),
@@ -220,11 +242,28 @@ impl Editor {
     }
 
     fn cursor(&self) -> Pos {
-        self.sel.cursor
+        self.cursors[0].cursor
     }
 
     fn set_cursor(&mut self, pos: Pos) {
-        self.sel = Selection::caret(pos);
+        self.cursors = vec![Selection::caret(pos)];
+        self.desired_cols = vec![None];
+    }
+
+    fn has_multi_cursor(&self) -> bool {
+        self.cursors.len() > 1
+    }
+
+    fn clear_extra_cursors(&mut self) {
+        let primary = self.cursors[0];
+        self.cursors = vec![primary];
+        self.desired_cols = vec![self.desired_cols.first().copied().flatten()];
+    }
+
+    fn sort_and_merge_cursors(&mut self) {
+        merge_overlapping(&mut self.cursors);
+        // Sync desired_cols length
+        self.desired_cols.resize(self.cursors.len(), None);
     }
 
     fn draw(&mut self, out: &mut impl Write) -> io::Result<()> {
@@ -236,7 +275,7 @@ impl Editor {
         };
 
         let display_col = self.cursor_display_col();
-        let cursor_line = self.sel.cursor.line;
+        let cursor_line = self.cursors[0].cursor.line;
         let mut line_display_width = |line: usize| -> usize {
             display_col_for_char_col(
                 &self.doc.buf.line_text(line),
@@ -248,11 +287,15 @@ impl Editor {
 
         let status_left = self.status_left();
         let status_right = self.status_right();
-        let sel = if self.sel.is_empty() {
-            None
-        } else {
-            Some(self.sel)
-        };
+        // Collect all non-empty selections
+        let selections: Vec<Selection> = self
+            .cursors
+            .iter()
+            .filter(|s| !s.is_empty())
+            .copied()
+            .collect();
+        // Collect extra cursor positions (non-primary cursors)
+        let extra_cursors: Vec<Pos> = self.cursors.iter().skip(1).map(|s| s.cursor).collect();
         let ruler_on = self.ruler_on;
 
         let bracket_pair = self.find_matching_bracket();
@@ -299,7 +342,8 @@ impl Editor {
             &status_left,
             &status_right,
             cmd_ref,
-            sel,
+            &selections,
+            &extra_cursors,
             find_matches,
             find_current,
             completions,
@@ -326,7 +370,15 @@ impl Editor {
     }
 
     fn status_right(&self) -> String {
-        format!(" e v{} ", env!("CARGO_PKG_VERSION"))
+        if self.cursors.len() > 1 {
+            format!(
+                " {}C | e v{} ",
+                self.cursors.len(),
+                env!("CARGO_PKG_VERSION")
+            )
+        } else {
+            format!(" e v{} ", env!("CARGO_PKG_VERSION"))
+        }
     }
 
     fn center_view_on_line(&mut self, line: usize) {
@@ -342,11 +394,12 @@ impl Editor {
     }
 
     fn cursor_display_col(&mut self) -> usize {
-        let line_text = self.doc.buf.line_text(self.cursor().line);
+        let pos = self.cursors[0].cursor;
+        let line_text = self.doc.buf.line_text(pos.line);
         let mut display_col = 0;
         let mut char_idx = 0;
         let mut byte_idx = 0;
-        while char_idx < self.cursor().col && byte_idx < line_text.len() {
+        while char_idx < pos.col && byte_idx < line_text.len() {
             if line_text[byte_idx] == b'\t' {
                 display_col += 2;
             } else {
@@ -386,7 +439,14 @@ impl Editor {
                     self.handle_mouse(mouse);
                 }
             }
-            _ => {}
+            Event::Unsupported(ref bytes) => {
+                if !self.cmd_buf.active
+                    && let Some((modifiers, x, y)) = parse_sgr_mouse(bytes)
+                    && modifiers & 16 != 0
+                {
+                    self.add_cursor_at(x, y);
+                }
+            }
         }
     }
 
@@ -433,9 +493,13 @@ impl Editor {
             }
         }
 
-        self.desired_col = match key {
-            Key::Up | Key::Down | Key::PageUp | Key::PageDown => self.desired_col,
-            _ => None,
+        match key {
+            Key::Up | Key::Down | Key::PageUp | Key::PageDown => {}
+            _ => {
+                for dc in &mut self.desired_cols {
+                    *dc = None;
+                }
+            }
         };
 
         // Check keybinding table first
@@ -463,8 +527,8 @@ impl Editor {
                     self.cmd_buf.open(CommandBufferMode::Goto, "goto: ", "");
                 }
                 EditorAction::Find => {
-                    let prefill = if !self.sel.is_empty() {
-                        let (start, end) = self.sel.ordered();
+                    let prefill = if !self.cursors[0].is_empty() {
+                        let (start, end) = self.cursors[0].ordered();
                         let text = self.doc.text_in_range(start, end);
                         let s = String::from_utf8_lossy(&text).to_string();
                         if s.len() <= 100 { s } else { String::new() }
@@ -479,6 +543,8 @@ impl Editor {
                 EditorAction::ToggleComment => self.toggle_comment(),
                 EditorAction::DuplicateLine => self.duplicate_line(),
                 EditorAction::SelectWord => self.select_word_at(self.cursor()),
+                EditorAction::AddCursorNextMatch => self.add_cursor_next_match(),
+                EditorAction::RemoveLastCursor => self.remove_last_cursor(),
             }
             return;
         }
@@ -502,7 +568,11 @@ impl Editor {
             Key::PageDown => self.page_down(),
 
             Key::Esc => {
-                self.clear_selection();
+                if self.has_multi_cursor() {
+                    self.clear_extra_cursors();
+                } else {
+                    self.clear_selection();
+                }
                 self.find_matches.clear();
             }
 
@@ -777,10 +847,11 @@ impl Editor {
         // Select the current match so copy/backspace/etc. act on it
         if !self.find_matches.is_empty() && self.find_index < self.find_matches.len() {
             let (start, end) = self.find_matches[self.find_index];
-            self.sel = Selection {
+            self.cursors = vec![Selection {
                 anchor: start,
                 cursor: end,
-            };
+            }];
+            self.desired_cols = vec![None];
         }
         self.find_active = false;
         self.find_matches.clear();
@@ -808,8 +879,8 @@ impl Editor {
         };
 
         // Determine the range to operate on
-        let (range_start, range_end) = if !self.sel.is_empty() {
-            self.sel.ordered()
+        let (range_start, range_end) = if !self.cursors[0].is_empty() {
+            self.cursors[0].ordered()
         } else {
             let line_count = self.doc.buf.line_count();
             let last_line = line_count.saturating_sub(1);
@@ -937,7 +1008,7 @@ impl Editor {
             return;
         }
         let pos = self.screen_to_buffer_pos(x, y);
-        self.sel.cursor = pos;
+        self.cursors[0].cursor = pos;
     }
 
     fn select_word_at(&mut self, pos: Pos) {
@@ -955,7 +1026,7 @@ impl Editor {
             while end < line_text.len() && is_word_char(line_text[end]) {
                 end += 1;
             }
-            self.sel = Selection {
+            self.cursors[0] = Selection {
                 anchor: Pos::new(pos.line, end),
                 cursor: Pos::new(pos.line, start),
             };
@@ -973,7 +1044,7 @@ impl Editor {
             let len = self.doc.buf.line_char_len(line);
             Pos::new(line, len)
         };
-        self.sel = Selection {
+        self.cursors[0] = Selection {
             anchor: Pos::new(line, 0),
             cursor: end,
         };
@@ -1118,51 +1189,83 @@ impl Editor {
     // -- selection helpers --------------------------------------------------
 
     fn delete_selection(&mut self) {
-        if self.sel.is_empty() {
+        if self.cursors[0].is_empty() && !self.has_multi_cursor() {
             return;
         }
-        let (start, end) = self.sel.ordered();
+        // For multi-cursor, delete each non-empty selection in reverse order
         self.doc.seal_undo();
-        let pos = self.doc.delete_range(start, end);
-        self.doc.seal_undo();
-        self.set_cursor(pos);
+        self.doc.begin_undo_group();
+        self.doc.set_undo_cursors_before(self.cursors.clone());
+        let mut new_cursors: Vec<Selection> = Vec::new();
+        // Process in reverse document order
+        let mut sorted_indices: Vec<usize> = (0..self.cursors.len()).collect();
+        sorted_indices.sort_by(|&a, &b| {
+            self.cursors[b]
+                .ordered()
+                .0
+                .cmp(&self.cursors[a].ordered().0)
+        });
+        for &i in &sorted_indices {
+            if !self.cursors[i].is_empty() {
+                let (start, end) = self.cursors[i].ordered();
+                let pos = self.doc.delete_range(start, end);
+                new_cursors.push(Selection::caret(pos));
+            } else {
+                new_cursors.push(self.cursors[i]);
+            }
+        }
+        new_cursors.reverse();
+        self.doc.end_undo_group();
+        self.cursors = new_cursors;
+        self.desired_cols = vec![None; self.cursors.len()];
+        self.sort_and_merge_cursors();
+        self.doc.set_undo_cursors_after(self.cursors.clone());
     }
 
     fn clear_selection(&mut self) {
-        self.sel = Selection::caret(self.cursor());
+        self.cursors[0] = Selection::caret(self.cursors[0].cursor);
     }
 
     fn select_all(&mut self) {
         let line_count = self.doc.buf.line_count();
         let last_line = line_count.saturating_sub(1);
         let last_col = self.doc.buf.line_char_len(last_line);
-        self.sel = Selection {
+        self.cursors = vec![Selection {
             anchor: Pos::zero(),
             cursor: Pos::new(last_line, last_col),
-        };
+        }];
+        self.desired_cols = vec![None];
     }
 
     // -- movement (no selection) --------------------------------------------
 
     fn move_up(&mut self) {
-        if self.cursor().line > 0 {
-            let target_col = self.desired_col.unwrap_or(self.cursor().col);
-            self.desired_col = Some(target_col);
-            let new_line = self.cursor().line - 1;
-            let line_len = self.doc.buf.line_char_len(new_line);
-            self.set_cursor(Pos::new(new_line, target_col.min(line_len)));
+        for i in 0..self.cursors.len() {
+            let c = self.cursors[i].cursor;
+            if c.line > 0 {
+                let target_col = self.desired_cols[i].unwrap_or(c.col);
+                self.desired_cols[i] = Some(target_col);
+                let new_line = c.line - 1;
+                let line_len = self.doc.buf.line_char_len(new_line);
+                self.cursors[i] = Selection::caret(Pos::new(new_line, target_col.min(line_len)));
+            }
         }
+        self.sort_and_merge_cursors();
     }
 
     fn move_down(&mut self) {
         let line_count = self.doc.buf.line_count();
-        if self.cursor().line + 1 < line_count {
-            let target_col = self.desired_col.unwrap_or(self.cursor().col);
-            self.desired_col = Some(target_col);
-            let new_line = self.cursor().line + 1;
-            let line_len = self.doc.buf.line_char_len(new_line);
-            self.set_cursor(Pos::new(new_line, target_col.min(line_len)));
+        for i in 0..self.cursors.len() {
+            let c = self.cursors[i].cursor;
+            if c.line + 1 < line_count {
+                let target_col = self.desired_cols[i].unwrap_or(c.col);
+                self.desired_cols[i] = Some(target_col);
+                let new_line = c.line + 1;
+                let line_len = self.doc.buf.line_char_len(new_line);
+                self.cursors[i] = Selection::caret(Pos::new(new_line, target_col.min(line_len)));
+            }
         }
+        self.sort_and_merge_cursors();
     }
 
     fn indent_snap_left(&mut self, line: usize, col: usize) -> usize {
@@ -1191,125 +1294,176 @@ impl Editor {
     }
 
     fn move_left(&mut self) {
-        if !self.sel.is_empty() {
-            let (start, _) = self.sel.ordered();
-            self.set_cursor(start);
-            return;
+        for i in 0..self.cursors.len() {
+            if !self.cursors[i].is_empty() {
+                let (start, _) = self.cursors[i].ordered();
+                self.cursors[i] = Selection::caret(start);
+                continue;
+            }
+            let c = self.cursors[i].cursor;
+            if c.col > 0 {
+                let new_col = self.indent_snap_left(c.line, c.col);
+                self.cursors[i] = Selection::caret(Pos::new(c.line, new_col));
+            } else if c.line > 0 {
+                let prev_len = self.doc.buf.line_char_len(c.line - 1);
+                self.cursors[i] = Selection::caret(Pos::new(c.line - 1, prev_len));
+            }
         }
-        let c = self.cursor();
-        if c.col > 0 {
-            let new_col = self.indent_snap_left(c.line, c.col);
-            self.set_cursor(Pos::new(c.line, new_col));
-        } else if c.line > 0 {
-            let prev_len = self.doc.buf.line_char_len(c.line - 1);
-            self.set_cursor(Pos::new(c.line - 1, prev_len));
-        }
+        self.sort_and_merge_cursors();
     }
 
     fn move_right(&mut self) {
-        if !self.sel.is_empty() {
-            let (_, end) = self.sel.ordered();
-            self.set_cursor(end);
-            return;
+        for i in 0..self.cursors.len() {
+            if !self.cursors[i].is_empty() {
+                let (_, end) = self.cursors[i].ordered();
+                self.cursors[i] = Selection::caret(end);
+                continue;
+            }
+            let c = self.cursors[i].cursor;
+            let line_len = self.doc.buf.line_char_len(c.line);
+            if c.col < line_len {
+                let new_col = self.indent_snap_right(c.line, c.col);
+                self.cursors[i] = Selection::caret(Pos::new(c.line, new_col));
+            } else if c.line + 1 < self.doc.buf.line_count() {
+                self.cursors[i] = Selection::caret(Pos::new(c.line + 1, 0));
+            }
         }
-        let c = self.cursor();
-        let line_len = self.doc.buf.line_char_len(c.line);
-        if c.col < line_len {
-            let new_col = self.indent_snap_right(c.line, c.col);
-            self.set_cursor(Pos::new(c.line, new_col));
-        } else if c.line + 1 < self.doc.buf.line_count() {
-            self.set_cursor(Pos::new(c.line + 1, 0));
-        }
+        self.sort_and_merge_cursors();
     }
 
     fn move_home(&mut self) {
-        self.set_cursor(Pos::new(self.cursor().line, 0));
+        for i in 0..self.cursors.len() {
+            let c = self.cursors[i].cursor;
+            self.cursors[i] = Selection::caret(Pos::new(c.line, 0));
+        }
+        self.sort_and_merge_cursors();
     }
 
     fn move_end(&mut self) {
-        let c = self.cursor();
-        let len = self.doc.buf.line_char_len(c.line);
-        self.set_cursor(Pos::new(c.line, len));
+        for i in 0..self.cursors.len() {
+            let c = self.cursors[i].cursor;
+            let len = self.doc.buf.line_char_len(c.line);
+            self.cursors[i] = Selection::caret(Pos::new(c.line, len));
+        }
+        self.sort_and_merge_cursors();
     }
 
     fn page_up(&mut self) {
         let rows = self.view.text_rows();
-        let target_col = self.desired_col.unwrap_or(self.cursor().col);
-        self.desired_col = Some(target_col);
-        let new_line = self.cursor().line.saturating_sub(rows);
-        let line_len = self.doc.buf.line_char_len(new_line);
-        self.set_cursor(Pos::new(new_line, target_col.min(line_len)));
+        for i in 0..self.cursors.len() {
+            let c = self.cursors[i].cursor;
+            let target_col = self.desired_cols[i].unwrap_or(c.col);
+            self.desired_cols[i] = Some(target_col);
+            let new_line = c.line.saturating_sub(rows);
+            let line_len = self.doc.buf.line_char_len(new_line);
+            self.cursors[i] = Selection::caret(Pos::new(new_line, target_col.min(line_len)));
+        }
+        self.sort_and_merge_cursors();
     }
 
     fn page_down(&mut self) {
         let rows = self.view.text_rows();
         let line_count = self.doc.buf.line_count();
-        let target_col = self.desired_col.unwrap_or(self.cursor().col);
-        self.desired_col = Some(target_col);
-        let new_line = (self.cursor().line + rows).min(line_count.saturating_sub(1));
-        let line_len = self.doc.buf.line_char_len(new_line);
-        self.set_cursor(Pos::new(new_line, target_col.min(line_len)));
+        for i in 0..self.cursors.len() {
+            let c = self.cursors[i].cursor;
+            let target_col = self.desired_cols[i].unwrap_or(c.col);
+            self.desired_cols[i] = Some(target_col);
+            let new_line = (c.line + rows).min(line_count.saturating_sub(1));
+            let line_len = self.doc.buf.line_char_len(new_line);
+            self.cursors[i] = Selection::caret(Pos::new(new_line, target_col.min(line_len)));
+        }
+        self.sort_and_merge_cursors();
     }
 
     // -- movement (extend selection) ----------------------------------------
 
     fn move_up_extend(&mut self) {
-        if self.cursor().line > 0 {
-            let target_col = self.desired_col.unwrap_or(self.cursor().col);
-            self.desired_col = Some(target_col);
-            let new_line = self.cursor().line - 1;
-            let line_len = self.doc.buf.line_char_len(new_line);
-            self.sel.cursor = Pos::new(new_line, target_col.min(line_len));
+        for i in 0..self.cursors.len() {
+            let c = self.cursors[i].cursor;
+            if c.line > 0 {
+                let target_col = self.desired_cols[i].unwrap_or(c.col);
+                self.desired_cols[i] = Some(target_col);
+                let new_line = c.line - 1;
+                let line_len = self.doc.buf.line_char_len(new_line);
+                self.cursors[i].cursor = Pos::new(new_line, target_col.min(line_len));
+            }
         }
+        self.sort_and_merge_cursors();
     }
 
     fn move_down_extend(&mut self) {
         let line_count = self.doc.buf.line_count();
-        if self.cursor().line + 1 < line_count {
-            let target_col = self.desired_col.unwrap_or(self.cursor().col);
-            self.desired_col = Some(target_col);
-            let new_line = self.cursor().line + 1;
-            let line_len = self.doc.buf.line_char_len(new_line);
-            self.sel.cursor = Pos::new(new_line, target_col.min(line_len));
+        for i in 0..self.cursors.len() {
+            let c = self.cursors[i].cursor;
+            if c.line + 1 < line_count {
+                let target_col = self.desired_cols[i].unwrap_or(c.col);
+                self.desired_cols[i] = Some(target_col);
+                let new_line = c.line + 1;
+                let line_len = self.doc.buf.line_char_len(new_line);
+                self.cursors[i].cursor = Pos::new(new_line, target_col.min(line_len));
+            }
         }
+        self.sort_and_merge_cursors();
     }
 
     fn move_left_extend(&mut self) {
-        let c = self.cursor();
-        if c.col > 0 {
-            self.sel.cursor = Pos::new(c.line, self.indent_snap_left(c.line, c.col));
-        } else if c.line > 0 {
-            let prev_len = self.doc.buf.line_char_len(c.line - 1);
-            self.sel.cursor = Pos::new(c.line - 1, prev_len);
+        for i in 0..self.cursors.len() {
+            let c = self.cursors[i].cursor;
+            if c.col > 0 {
+                self.cursors[i].cursor = Pos::new(c.line, self.indent_snap_left(c.line, c.col));
+            } else if c.line > 0 {
+                let prev_len = self.doc.buf.line_char_len(c.line - 1);
+                self.cursors[i].cursor = Pos::new(c.line - 1, prev_len);
+            }
         }
+        self.sort_and_merge_cursors();
     }
 
     fn move_right_extend(&mut self) {
-        let c = self.cursor();
-        let line_len = self.doc.buf.line_char_len(c.line);
-        if c.col < line_len {
-            self.sel.cursor = Pos::new(c.line, self.indent_snap_right(c.line, c.col));
-        } else if c.line + 1 < self.doc.buf.line_count() {
-            self.sel.cursor = Pos::new(c.line + 1, 0);
+        for i in 0..self.cursors.len() {
+            let c = self.cursors[i].cursor;
+            let line_len = self.doc.buf.line_char_len(c.line);
+            if c.col < line_len {
+                self.cursors[i].cursor = Pos::new(c.line, self.indent_snap_right(c.line, c.col));
+            } else if c.line + 1 < self.doc.buf.line_count() {
+                self.cursors[i].cursor = Pos::new(c.line + 1, 0);
+            }
         }
+        self.sort_and_merge_cursors();
     }
 
     // -- editing ------------------------------------------------------------
 
     fn insert_char(&mut self, c: char) {
-        if !self.sel.is_empty() {
+        let has_sel = self.cursors.iter().any(|s| !s.is_empty());
+        if has_sel {
             self.delete_selection();
         }
         let mut bytes = [0u8; 4];
         let s = c.encode_utf8(&mut bytes);
-        let pos = self
-            .doc
-            .insert(self.cursor().line, self.cursor().col, s.as_bytes());
-        self.set_cursor(pos);
+        if self.has_multi_cursor() {
+            self.doc.begin_undo_group();
+            self.doc.set_undo_cursors_before(self.cursors.clone());
+            // Iterate in reverse document order
+            for i in (0..self.cursors.len()).rev() {
+                let cur = self.cursors[i].cursor;
+                let pos = self.doc.insert(cur.line, cur.col, s.as_bytes());
+                self.cursors[i] = Selection::caret(pos);
+            }
+            self.doc.end_undo_group();
+            self.doc.set_undo_cursors_after(self.cursors.clone());
+        } else {
+            let pos = self
+                .doc
+                .insert(self.cursor().line, self.cursor().col, s.as_bytes());
+            self.cursors[0] = Selection::caret(pos);
+        }
     }
 
     fn insert_tab(&mut self) {
-        if !self.sel.is_empty() {
+        if self.cursors[0].is_empty() && !self.has_multi_cursor() {
+            // Single cursor, no selection — just insert
+        } else if !self.has_multi_cursor() {
             self.indent_selection();
             return;
         }
@@ -1317,14 +1471,26 @@ impl Editor {
             f.ends_with(".c") || f.ends_with(".h") || f.ends_with(".go") || f.contains("Makefile")
         });
         let bytes: &[u8] = if use_tab { b"\t" } else { b"  " };
-        let pos = self
-            .doc
-            .insert(self.cursor().line, self.cursor().col, bytes);
-        self.set_cursor(pos);
+        if self.has_multi_cursor() {
+            self.doc.begin_undo_group();
+            self.doc.set_undo_cursors_before(self.cursors.clone());
+            for i in (0..self.cursors.len()).rev() {
+                let cur = self.cursors[i].cursor;
+                let pos = self.doc.insert(cur.line, cur.col, bytes);
+                self.cursors[i] = Selection::caret(pos);
+            }
+            self.doc.end_undo_group();
+            self.doc.set_undo_cursors_after(self.cursors.clone());
+        } else {
+            let pos = self
+                .doc
+                .insert(self.cursor().line, self.cursor().col, bytes);
+            self.cursors[0] = Selection::caret(pos);
+        }
     }
 
     fn indent_selection(&mut self) {
-        let (s, e) = self.sel.ordered();
+        let (s, e) = self.cursors[0].ordered();
         let end_line = if e.col == 0 && e.line > s.line {
             e.line - 1
         } else {
@@ -1359,107 +1525,214 @@ impl Editor {
     }
 
     fn insert_newline(&mut self) {
-        if !self.sel.is_empty() {
+        let has_sel = self.cursors.iter().any(|s| !s.is_empty());
+        if has_sel {
             self.delete_selection();
         }
-        let line_text = self.doc.buf.line_text(self.cursor().line);
-        let indent: Vec<u8> = line_text
-            .iter()
-            .take_while(|&&b| b == b' ' || b == b'\t')
-            .copied()
-            .collect();
-
-        let mut newline = vec![b'\n'];
-        newline.extend_from_slice(&indent);
-
         self.doc.seal_undo();
-        let pos = self
-            .doc
-            .insert(self.cursor().line, self.cursor().col, &newline);
-        self.doc.seal_undo();
-        self.set_cursor(pos);
+        if self.has_multi_cursor() {
+            self.doc.begin_undo_group();
+            self.doc.set_undo_cursors_before(self.cursors.clone());
+            for i in (0..self.cursors.len()).rev() {
+                let cur = self.cursors[i].cursor;
+                let line_text = self.doc.buf.line_text(cur.line);
+                let indent: Vec<u8> = line_text
+                    .iter()
+                    .take_while(|&&b| b == b' ' || b == b'\t')
+                    .copied()
+                    .collect();
+                let mut newline = vec![b'\n'];
+                newline.extend_from_slice(&indent);
+                let pos = self.doc.insert(cur.line, cur.col, &newline);
+                self.cursors[i] = Selection::caret(pos);
+            }
+            self.doc.end_undo_group();
+            self.doc.set_undo_cursors_after(self.cursors.clone());
+        } else {
+            let line_text = self.doc.buf.line_text(self.cursor().line);
+            let indent: Vec<u8> = line_text
+                .iter()
+                .take_while(|&&b| b == b' ' || b == b'\t')
+                .copied()
+                .collect();
+            let mut newline = vec![b'\n'];
+            newline.extend_from_slice(&indent);
+            let pos = self
+                .doc
+                .insert(self.cursor().line, self.cursor().col, &newline);
+            self.doc.seal_undo();
+            self.cursors[0] = Selection::caret(pos);
+        }
     }
 
     fn backspace(&mut self) {
-        if !self.sel.is_empty() {
+        let has_sel = self.cursors.iter().any(|s| !s.is_empty());
+        if has_sel {
             self.delete_selection();
             return;
         }
-        let c = self.cursor();
-        if c.col > 0 {
-            let line_text = self.doc.buf.line_text(c.line);
-            let leading_ws: usize = line_text
-                .iter()
-                .take_while(|&&b| b == b' ' || b == b'\t')
-                .count();
-
-            if c.col <= leading_ws && c.col >= 2 {
-                let before = &line_text[..c.col];
-                let all_spaces = before.iter().all(|&b| b == b' ');
-                if all_spaces && c.col.is_multiple_of(2) {
+        if self.has_multi_cursor() {
+            self.doc.begin_undo_group();
+            self.doc.set_undo_cursors_before(self.cursors.clone());
+            for i in (0..self.cursors.len()).rev() {
+                let c = self.cursors[i].cursor;
+                if c.col > 0 {
+                    let line_text = self.doc.buf.line_text(c.line);
+                    let leading_ws: usize = line_text
+                        .iter()
+                        .take_while(|&&b| b == b' ' || b == b'\t')
+                        .count();
+                    if c.col <= leading_ws && c.col >= 2 {
+                        let before = &line_text[..c.col];
+                        let all_spaces = before.iter().all(|&b| b == b' ');
+                        if all_spaces && c.col.is_multiple_of(2) {
+                            let end = Pos::new(c.line, c.col);
+                            let start = Pos::new(c.line, c.col - 2);
+                            self.doc.delete_range(start, end);
+                            self.cursors[i] = Selection::caret(start);
+                            continue;
+                        }
+                    }
+                    let start = Pos::new(c.line, c.col - 1);
                     let end = Pos::new(c.line, c.col);
-                    let start = Pos::new(c.line, c.col - 2);
                     self.doc.delete_range(start, end);
-                    self.set_cursor(start);
-                    return;
+                    self.cursors[i] = Selection::caret(start);
+                } else if c.line > 0 {
+                    let prev_len = self.doc.buf.line_char_len(c.line - 1);
+                    let start = Pos::new(c.line - 1, prev_len);
+                    let end = Pos::new(c.line, 0);
+                    self.doc.delete_range(start, end);
+                    self.cursors[i] = Selection::caret(start);
                 }
             }
+            self.doc.end_undo_group();
+            self.sort_and_merge_cursors();
+            self.doc.set_undo_cursors_after(self.cursors.clone());
+        } else {
+            let c = self.cursor();
+            if c.col > 0 {
+                let line_text = self.doc.buf.line_text(c.line);
+                let leading_ws: usize = line_text
+                    .iter()
+                    .take_while(|&&b| b == b' ' || b == b'\t')
+                    .count();
 
-            let start = Pos::new(c.line, c.col - 1);
-            let end = Pos::new(c.line, c.col);
-            self.doc.delete_range(start, end);
-            self.set_cursor(start);
-        } else if c.line > 0 {
-            let prev_len = self.doc.buf.line_char_len(c.line - 1);
-            let start = Pos::new(c.line - 1, prev_len);
-            let end = Pos::new(c.line, 0);
-            self.doc.delete_range(start, end);
-            self.set_cursor(start);
+                if c.col <= leading_ws && c.col >= 2 {
+                    let before = &line_text[..c.col];
+                    let all_spaces = before.iter().all(|&b| b == b' ');
+                    if all_spaces && c.col.is_multiple_of(2) {
+                        let end = Pos::new(c.line, c.col);
+                        let start = Pos::new(c.line, c.col - 2);
+                        self.doc.delete_range(start, end);
+                        self.cursors[0] = Selection::caret(start);
+                        return;
+                    }
+                }
+
+                let start = Pos::new(c.line, c.col - 1);
+                let end = Pos::new(c.line, c.col);
+                self.doc.delete_range(start, end);
+                self.cursors[0] = Selection::caret(start);
+            } else if c.line > 0 {
+                let prev_len = self.doc.buf.line_char_len(c.line - 1);
+                let start = Pos::new(c.line - 1, prev_len);
+                let end = Pos::new(c.line, 0);
+                self.doc.delete_range(start, end);
+                self.cursors[0] = Selection::caret(start);
+            }
         }
     }
 
     fn ctrl_backspace(&mut self) {
-        if !self.sel.is_empty() {
+        let has_sel = self.cursors.iter().any(|s| !s.is_empty());
+        if has_sel {
             self.delete_selection();
             return;
         }
-        let c = self.cursor();
-        if c.col == 0 && c.line == 0 {
-            return;
-        }
-        if c.col == 0 {
-            let prev_len = self.doc.buf.line_char_len(c.line - 1);
-            let start = Pos::new(c.line - 1, prev_len);
-            let end = Pos::new(c.line, 0);
-            self.doc.seal_undo();
+        self.doc.seal_undo();
+        if self.has_multi_cursor() {
+            self.doc.begin_undo_group();
+            self.doc.set_undo_cursors_before(self.cursors.clone());
+            for i in (0..self.cursors.len()).rev() {
+                let c = self.cursors[i].cursor;
+                if c.col == 0 && c.line == 0 {
+                    continue;
+                }
+                if c.col == 0 {
+                    let prev_len = self.doc.buf.line_char_len(c.line - 1);
+                    let start = Pos::new(c.line - 1, prev_len);
+                    let end = Pos::new(c.line, 0);
+                    self.doc.delete_range(start, end);
+                    self.cursors[i] = Selection::caret(start);
+                    continue;
+                }
+                let line_text = self.doc.buf.line_text(c.line);
+                let boundary = prev_word_boundary(&line_text, c.col);
+                let start = Pos::new(c.line, boundary);
+                let end = Pos::new(c.line, c.col);
+                self.doc.delete_range(start, end);
+                self.cursors[i] = Selection::caret(start);
+            }
+            self.doc.end_undo_group();
+            self.sort_and_merge_cursors();
+            self.doc.set_undo_cursors_after(self.cursors.clone());
+        } else {
+            let c = self.cursor();
+            if c.col == 0 && c.line == 0 {
+                return;
+            }
+            if c.col == 0 {
+                let prev_len = self.doc.buf.line_char_len(c.line - 1);
+                let start = Pos::new(c.line - 1, prev_len);
+                let end = Pos::new(c.line, 0);
+                self.doc.delete_range(start, end);
+                self.doc.seal_undo();
+                self.cursors[0] = Selection::caret(start);
+                return;
+            }
+            let line_text = self.doc.buf.line_text(c.line);
+            let boundary = prev_word_boundary(&line_text, c.col);
+            let start = Pos::new(c.line, boundary);
+            let end = Pos::new(c.line, c.col);
             self.doc.delete_range(start, end);
             self.doc.seal_undo();
-            self.set_cursor(start);
-            return;
+            self.cursors[0] = Selection::caret(start);
         }
-        let line_text = self.doc.buf.line_text(c.line);
-        let boundary = prev_word_boundary(&line_text, c.col);
-        let start = Pos::new(c.line, boundary);
-        let end = Pos::new(c.line, c.col);
-        self.doc.seal_undo();
-        self.doc.delete_range(start, end);
-        self.doc.seal_undo();
-        self.set_cursor(start);
     }
 
     fn delete_forward(&mut self) {
-        if !self.sel.is_empty() {
+        let has_sel = self.cursors.iter().any(|s| !s.is_empty());
+        if has_sel {
             self.delete_selection();
             return;
         }
-        let c = self.cursor();
-        let line_len = self.doc.buf.line_char_len(c.line);
-        if c.col < line_len {
-            self.doc
-                .delete_range(Pos::new(c.line, c.col), Pos::new(c.line, c.col + 1));
-        } else if c.line + 1 < self.doc.buf.line_count() {
-            self.doc
-                .delete_range(Pos::new(c.line, c.col), Pos::new(c.line + 1, 0));
+        if self.has_multi_cursor() {
+            self.doc.begin_undo_group();
+            self.doc.set_undo_cursors_before(self.cursors.clone());
+            for i in (0..self.cursors.len()).rev() {
+                let c = self.cursors[i].cursor;
+                let line_len = self.doc.buf.line_char_len(c.line);
+                if c.col < line_len {
+                    self.doc
+                        .delete_range(Pos::new(c.line, c.col), Pos::new(c.line, c.col + 1));
+                } else if c.line + 1 < self.doc.buf.line_count() {
+                    self.doc
+                        .delete_range(Pos::new(c.line, c.col), Pos::new(c.line + 1, 0));
+                }
+            }
+            self.doc.end_undo_group();
+            self.sort_and_merge_cursors();
+            self.doc.set_undo_cursors_after(self.cursors.clone());
+        } else {
+            let c = self.cursor();
+            let line_len = self.doc.buf.line_char_len(c.line);
+            if c.col < line_len {
+                self.doc
+                    .delete_range(Pos::new(c.line, c.col), Pos::new(c.line, c.col + 1));
+            } else if c.line + 1 < self.doc.buf.line_count() {
+                self.doc
+                    .delete_range(Pos::new(c.line, c.col), Pos::new(c.line + 1, 0));
+            }
         }
     }
 
@@ -1487,10 +1760,10 @@ impl Editor {
         };
 
         // Determine line range: selection or current line
-        let (start_line, end_line) = if self.sel.is_empty() {
+        let (start_line, end_line) = if self.cursors[0].is_empty() {
             (self.cursor().line, self.cursor().line)
         } else {
-            let (s, e) = self.sel.ordered();
+            let (s, e) = self.cursors[0].ordered();
             let end = if e.col == 0 && e.line > s.line {
                 e.line - 1
             } else {
@@ -1558,10 +1831,10 @@ impl Editor {
     // -- dedent -------------------------------------------------------------
 
     fn dedent(&mut self) {
-        let (start_line, end_line) = if self.sel.is_empty() {
+        let (start_line, end_line) = if self.cursors[0].is_empty() {
             (self.cursor().line, self.cursor().line)
         } else {
-            let (s, e) = self.sel.ordered();
+            let (s, e) = self.cursors[0].ordered();
             let end = if e.col == 0 && e.line > s.line {
                 e.line - 1
             } else {
@@ -1600,17 +1873,32 @@ impl Editor {
     // -- clipboard ----------------------------------------------------------
 
     fn copy(&mut self) {
-        if self.sel.is_empty() {
+        let has_sel = self.cursors.iter().any(|s| !s.is_empty());
+        if !has_sel {
             return;
         }
-        let (start, end) = self.sel.ordered();
-        let text = self.doc.text_in_range(start, end);
-        let s = String::from_utf8_lossy(&text).to_string();
-        self.clipboard.copy(&s);
+        if self.has_multi_cursor() {
+            // Concatenate all selections, newline-separated
+            let mut parts = Vec::new();
+            for sel in &self.cursors {
+                if !sel.is_empty() {
+                    let (start, end) = sel.ordered();
+                    let text = self.doc.text_in_range(start, end);
+                    parts.push(String::from_utf8_lossy(&text).to_string());
+                }
+            }
+            self.clipboard.copy(&parts.join("\n"));
+        } else {
+            let (start, end) = self.cursors[0].ordered();
+            let text = self.doc.text_in_range(start, end);
+            let s = String::from_utf8_lossy(&text).to_string();
+            self.clipboard.copy(&s);
+        }
     }
 
     fn cut(&mut self) {
-        if self.sel.is_empty() {
+        let has_sel = self.cursors.iter().any(|s| !s.is_empty());
+        if !has_sel {
             return;
         }
         self.copy();
@@ -1626,28 +1914,142 @@ impl Editor {
         if text.is_empty() {
             return;
         }
-        if !self.sel.is_empty() {
+        let has_sel = self.cursors.iter().any(|s| !s.is_empty());
+        if has_sel {
             self.delete_selection();
         }
         self.doc.seal_undo();
-        let pos = self
-            .doc
-            .insert(self.cursor().line, self.cursor().col, text.as_bytes());
-        self.doc.seal_undo();
-        self.set_cursor(pos);
+        if self.has_multi_cursor() {
+            let lines: Vec<&str> = text.lines().collect();
+            let distribute = lines.len() == self.cursors.len();
+            self.doc.begin_undo_group();
+            self.doc.set_undo_cursors_before(self.cursors.clone());
+            for i in (0..self.cursors.len()).rev() {
+                let cur = self.cursors[i].cursor;
+                let paste_bytes = if distribute {
+                    lines[i].as_bytes()
+                } else {
+                    text.as_bytes()
+                };
+                let pos = self.doc.insert(cur.line, cur.col, paste_bytes);
+                self.cursors[i] = Selection::caret(pos);
+            }
+            self.doc.end_undo_group();
+            self.doc.set_undo_cursors_after(self.cursors.clone());
+        } else {
+            let pos = self
+                .doc
+                .insert(self.cursor().line, self.cursor().col, text.as_bytes());
+            self.doc.seal_undo();
+            self.cursors[0] = Selection::caret(pos);
+        }
     }
 
     // -- undo/redo ----------------------------------------------------------
 
     fn undo(&mut self) {
-        if let Some(pos) = self.doc.undo() {
-            self.set_cursor(pos);
+        if let Some(cursors) = self.doc.undo() {
+            self.cursors = cursors;
+            self.desired_cols = vec![None; self.cursors.len()];
         }
     }
 
     fn redo(&mut self) {
-        if let Some(pos) = self.doc.redo() {
-            self.set_cursor(pos);
+        if let Some(cursors) = self.doc.redo() {
+            self.cursors = cursors;
+            self.desired_cols = vec![None; self.cursors.len()];
+        }
+    }
+
+    // -- multi-cursor creation/removal --------------------------------------
+
+    fn add_cursor_at(&mut self, x: u16, y: u16) {
+        let pos = self.screen_to_buffer_pos(x, y);
+        self.cursors.push(Selection::caret(pos));
+        self.desired_cols.push(None);
+        self.sort_and_merge_cursors();
+    }
+
+    fn add_cursor_next_match(&mut self) {
+        // Get the word or selection text from the primary cursor
+        let primary = self.cursors.last().unwrap_or(&self.cursors[0]);
+        let search_text = if !primary.is_empty() {
+            let (start, end) = primary.ordered();
+            self.doc.text_in_range(start, end)
+        } else {
+            // Select word under cursor
+            let pos = primary.cursor;
+            let line_text = self.doc.buf.line_text(pos.line);
+            if line_text.is_empty() {
+                return;
+            }
+            let col = pos.col.min(line_text.len().saturating_sub(1));
+            if col >= line_text.len() || !is_word_char(line_text[col]) {
+                return;
+            }
+            let mut start = col;
+            while start > 0 && is_word_char(line_text[start - 1]) {
+                start -= 1;
+            }
+            let mut end = col;
+            while end < line_text.len() && is_word_char(line_text[end]) {
+                end += 1;
+            }
+            // Select word on primary cursor
+            let last_idx = self.cursors.len() - 1;
+            self.cursors[last_idx] = Selection {
+                anchor: Pos::new(pos.line, start),
+                cursor: Pos::new(pos.line, end),
+            };
+            line_text[start..end].to_vec()
+        };
+
+        if search_text.is_empty() {
+            return;
+        }
+
+        // Search for next occurrence after the last cursor
+        let last_cursor = self.cursors.last().unwrap();
+        let search_after = last_cursor.ordered().1;
+        let contents = self.doc.buf.contents();
+        let search_str = String::from_utf8_lossy(&search_text);
+
+        // Search from search_after to end, then wrap to beginning
+        let start_offset = self
+            .doc
+            .buf
+            .pos_to_offset(search_after.line, search_after.col);
+        let text = String::from_utf8_lossy(&contents);
+
+        let found = text[start_offset..]
+            .find(&*search_str)
+            .map(|i| i + start_offset)
+            .or_else(|| text[..start_offset].find(&*search_str));
+
+        if let Some(byte_offset) = found {
+            let (sl, sc) = self.doc.buf.offset_to_pos(byte_offset);
+            let (el, ec) = self.doc.buf.offset_to_pos(byte_offset + search_text.len());
+            let new_sel = Selection {
+                anchor: Pos::new(sl, sc),
+                cursor: Pos::new(el, ec),
+            };
+            // Don't add if it duplicates an existing cursor
+            if !self
+                .cursors
+                .iter()
+                .any(|c| c.ordered() == new_sel.ordered())
+            {
+                self.cursors.push(new_sel);
+                self.desired_cols.push(None);
+                self.sort_and_merge_cursors();
+            }
+        }
+    }
+
+    fn remove_last_cursor(&mut self) {
+        if self.cursors.len() > 1 {
+            self.cursors.pop();
+            self.desired_cols.pop();
         }
     }
 

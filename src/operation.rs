@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::selection::Pos;
+use crate::selection::{Pos, Selection};
 
 /// A single atomic text change.
 #[derive(Debug, Clone)]
@@ -34,10 +34,10 @@ enum OpKind {
 #[derive(Debug, Clone)]
 pub struct OperationGroup {
     pub ops: Vec<Operation>,
-    /// Cursor position before the first op in this group.
-    pub cursor_before: Pos,
-    /// Cursor position after the last op in this group.
-    pub cursor_after: Pos,
+    /// Cursor state before the first op in this group.
+    pub cursors_before: Vec<Selection>,
+    /// Cursor state after the last op in this group.
+    pub cursors_after: Vec<Selection>,
 }
 
 /// Undo/redo stack with grouping heuristics.
@@ -96,15 +96,31 @@ impl UndoStack {
 
         let group = self.current.get_or_insert_with(|| OperationGroup {
             ops: Vec::new(),
-            cursor_before,
-            cursor_after,
+            cursors_before: vec![Selection::caret(cursor_before)],
+            cursors_after: vec![Selection::caret(cursor_after)],
         });
         group.ops.push(op.clone());
-        group.cursor_after = cursor_after;
+        group.cursors_after = vec![Selection::caret(cursor_after)];
 
         self.last_kind = Some(op.kind());
         self.last_time = Some(Instant::now());
         self.last_cursor = cursor_after;
+    }
+
+    /// Override the cursors_before on the current (or most recent) undo group.
+    pub fn set_cursors_before(&mut self, cursors: Vec<Selection>) {
+        if let Some(ref mut group) = self.current {
+            group.cursors_before = cursors;
+        }
+    }
+
+    /// Override the cursors_after on the current (or most recent) undo group.
+    pub fn set_cursors_after(&mut self, cursors: Vec<Selection>) {
+        if let Some(ref mut group) = self.current {
+            group.cursors_after = cursors;
+        } else if let Some(group) = self.undo.last_mut() {
+            group.cursors_after = cursors;
+        }
     }
 
     fn should_break_group(&self, op: &Operation, cursor_before: Pos) -> bool {
@@ -149,11 +165,11 @@ impl UndoStack {
         }
     }
 
-    /// Undo the last group. Returns the cursor position to restore.
-    pub fn undo(&mut self) -> Option<(Vec<Operation>, Pos)> {
+    /// Undo the last group. Returns the cursor selections to restore.
+    pub fn undo(&mut self) -> Option<(Vec<Operation>, Vec<Selection>)> {
         self.flush_current();
         let group = self.undo.pop()?;
-        let cursor = group.cursor_before;
+        let cursors = group.cursors_before.clone();
 
         // Build reverse operations for redo
         let mut redo_ops = Vec::new();
@@ -163,18 +179,18 @@ impl UndoStack {
 
         self.redo.push(group);
 
-        Some((redo_ops, cursor))
+        Some((redo_ops, cursors))
     }
 
-    /// Redo the last undone group. Returns the cursor position to restore.
-    pub fn redo(&mut self) -> Option<(Vec<Operation>, Pos)> {
+    /// Redo the last undone group. Returns the cursor selections to restore.
+    pub fn redo(&mut self) -> Option<(Vec<Operation>, Vec<Selection>)> {
         let group = self.redo.pop()?;
-        let cursor = group.cursor_after;
+        let cursors = group.cursors_after.clone();
 
         let ops: Vec<Operation> = group.ops.clone();
         self.undo.push(group);
 
-        Some((ops, cursor))
+        Some((ops, cursors))
     }
 }
 
@@ -212,8 +228,8 @@ mod tests {
     fn test_record_and_undo() {
         let mut stack = UndoStack::new();
         stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
-        let (ops, cursor) = stack.undo().unwrap();
-        assert_eq!(cursor, Pos::new(0, 0));
+        let (ops, cursors) = stack.undo().unwrap();
+        assert_eq!(cursors[0].cursor, Pos::new(0, 0));
         assert_eq!(ops.len(), 1);
     }
 
@@ -222,8 +238,8 @@ mod tests {
         let mut stack = UndoStack::new();
         stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
         stack.undo();
-        let (ops, cursor) = stack.redo().unwrap();
-        assert_eq!(cursor, Pos::new(0, 1));
+        let (ops, cursors) = stack.redo().unwrap();
+        assert_eq!(cursors[0].cursor, Pos::new(0, 1));
         assert_eq!(ops.len(), 1);
     }
 
@@ -245,14 +261,14 @@ mod tests {
         stack.record(ins(1, b"b"), Pos::new(0, 1), Pos::new(0, 2));
 
         // Undo should only undo "b"
-        let (ops, cursor) = stack.undo().unwrap();
+        let (ops, cursors) = stack.undo().unwrap();
         assert_eq!(ops.len(), 1);
-        assert_eq!(cursor, Pos::new(0, 1));
+        assert_eq!(cursors[0].cursor, Pos::new(0, 1));
 
         // Undo should undo "a"
-        let (ops, cursor) = stack.undo().unwrap();
+        let (ops, cursors) = stack.undo().unwrap();
         assert_eq!(ops.len(), 1);
-        assert_eq!(cursor, Pos::new(0, 0));
+        assert_eq!(cursors[0].cursor, Pos::new(0, 0));
     }
 
     #[test]
@@ -263,12 +279,12 @@ mod tests {
         stack.record(del(0, b"a"), Pos::new(0, 1), Pos::new(0, 0));
 
         // Undo first undoes the delete
-        let (_, cursor) = stack.undo().unwrap();
-        assert_eq!(cursor, Pos::new(0, 1));
+        let (_, cursors) = stack.undo().unwrap();
+        assert_eq!(cursors[0].cursor, Pos::new(0, 1));
 
         // Then the insert
-        let (_, cursor) = stack.undo().unwrap();
-        assert_eq!(cursor, Pos::new(0, 0));
+        let (_, cursors) = stack.undo().unwrap();
+        assert_eq!(cursors[0].cursor, Pos::new(0, 0));
     }
 
     #[test]

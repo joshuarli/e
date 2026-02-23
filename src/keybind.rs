@@ -34,6 +34,8 @@ pub enum EditorAction {
     ToggleComment,
     DuplicateLine,
     SelectWord,
+    AddCursorNextMatch,
+    RemoveLastCursor,
 }
 
 pub struct KeybindingTable {
@@ -67,6 +69,8 @@ impl KeybindingTable {
         bindings.insert(kc(Key::Ctrl('d')), EditorAction::ToggleComment);
         bindings.insert(kc(Key::Ctrl('j')), EditorAction::DuplicateLine);
         bindings.insert(kc(Key::Ctrl('w')), EditorAction::SelectWord);
+        bindings.insert(kc(Key::Alt('n')), EditorAction::AddCursorNextMatch);
+        bindings.insert(kc(Key::Alt('p')), EditorAction::RemoveLastCursor);
         Self { bindings }
     }
 
@@ -118,6 +122,11 @@ fn parse_key(s: &str) -> Option<Key> {
     {
         return Some(Key::Ctrl(ch.chars().next()?));
     }
+    if let Some(ch) = s.strip_prefix("alt+")
+        && ch.len() == 1
+    {
+        return Some(Key::Alt(ch.chars().next()?));
+    }
     None
 }
 
@@ -142,6 +151,8 @@ fn parse_action(s: &str) -> Option<EditorAction> {
         "togglecomment" => Some(EditorAction::ToggleComment),
         "duplicateline" => Some(EditorAction::DuplicateLine),
         "selectword" => Some(EditorAction::SelectWord),
+        "addcursornextmatch" => Some(EditorAction::AddCursorNextMatch),
+        "removelastcursor" => Some(EditorAction::RemoveLastCursor),
         _ => None,
     }
 }
@@ -268,8 +279,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_key_no_ctrl_prefix() {
-        assert_eq!(parse_key("alt+s"), None);
+    fn test_parse_key_alt() {
+        assert_eq!(parse_key("alt+n"), Some(Key::Alt('n')));
+        assert_eq!(parse_key("alt+p"), Some(Key::Alt('p')));
+    }
+
+    #[test]
+    fn test_parse_key_no_known_prefix() {
         assert_eq!(parse_key("shift+s"), None);
     }
 
@@ -308,6 +324,14 @@ mod tests {
             Some(EditorAction::DuplicateLine)
         );
         assert_eq!(parse_action("selectword"), Some(EditorAction::SelectWord));
+        assert_eq!(
+            parse_action("addcursornextmatch"),
+            Some(EditorAction::AddCursorNextMatch)
+        );
+        assert_eq!(
+            parse_action("removelastcursor"),
+            Some(EditorAction::RemoveLastCursor)
+        );
     }
 
     #[test]

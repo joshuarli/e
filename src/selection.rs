@@ -28,7 +28,7 @@ impl Ord for Pos {
 }
 
 /// A selection: anchor + cursor. When anchor == cursor, there is no selection.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     pub anchor: Pos,
     pub cursor: Pos,
@@ -52,6 +52,39 @@ impl Selection {
             (self.anchor, self.cursor)
         } else {
             (self.cursor, self.anchor)
+        }
+    }
+}
+
+/// Sort selections by start position and merge any that overlap or are adjacent.
+pub fn merge_overlapping(sels: &mut Vec<Selection>) {
+    if sels.len() <= 1 {
+        return;
+    }
+    sels.sort_by(|a, b| a.ordered().0.cmp(&b.ordered().0));
+    let mut i = 0;
+    while i + 1 < sels.len() {
+        let (_, end_a) = sels[i].ordered();
+        let (start_b, end_b) = sels[i + 1].ordered();
+        if start_b <= end_a {
+            // Merge: keep the one with the larger extent
+            let (start_a, _) = sels[i].ordered();
+            let new_end = if end_b > end_a { end_b } else { end_a };
+            // Preserve cursor direction of the later selection
+            if sels[i + 1].cursor <= sels[i + 1].anchor {
+                sels[i] = Selection {
+                    anchor: new_end,
+                    cursor: start_a,
+                };
+            } else {
+                sels[i] = Selection {
+                    anchor: start_a,
+                    cursor: new_end,
+                };
+            }
+            sels.remove(i + 1);
+        } else {
+            i += 1;
         }
     }
 }
@@ -181,6 +214,87 @@ mod tests {
         let (start, end) = sel.ordered();
         assert_eq!(start, Pos::new(2, 3));
         assert_eq!(end, Pos::new(2, 10));
+    }
+
+    // -- merge_overlapping --------------------------------------------------
+
+    #[test]
+    fn test_merge_overlapping_no_overlap() {
+        let mut sels = vec![
+            Selection::caret(Pos::new(0, 0)),
+            Selection::caret(Pos::new(1, 0)),
+        ];
+        merge_overlapping(&mut sels);
+        assert_eq!(sels.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_overlapping_adjacent() {
+        let mut sels = vec![
+            Selection {
+                anchor: Pos::new(0, 0),
+                cursor: Pos::new(0, 5),
+            },
+            Selection {
+                anchor: Pos::new(0, 5),
+                cursor: Pos::new(0, 10),
+            },
+        ];
+        merge_overlapping(&mut sels);
+        assert_eq!(sels.len(), 1);
+        let (s, e) = sels[0].ordered();
+        assert_eq!(s, Pos::new(0, 0));
+        assert_eq!(e, Pos::new(0, 10));
+    }
+
+    #[test]
+    fn test_merge_overlapping_overlap() {
+        let mut sels = vec![
+            Selection {
+                anchor: Pos::new(0, 0),
+                cursor: Pos::new(0, 7),
+            },
+            Selection {
+                anchor: Pos::new(0, 3),
+                cursor: Pos::new(0, 10),
+            },
+        ];
+        merge_overlapping(&mut sels);
+        assert_eq!(sels.len(), 1);
+        let (s, e) = sels[0].ordered();
+        assert_eq!(s, Pos::new(0, 0));
+        assert_eq!(e, Pos::new(0, 10));
+    }
+
+    #[test]
+    fn test_merge_overlapping_carets_same_pos() {
+        let mut sels = vec![
+            Selection::caret(Pos::new(0, 5)),
+            Selection::caret(Pos::new(0, 5)),
+        ];
+        merge_overlapping(&mut sels);
+        assert_eq!(sels.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_overlapping_unsorted() {
+        let mut sels = vec![
+            Selection::caret(Pos::new(2, 0)),
+            Selection::caret(Pos::new(0, 0)),
+            Selection::caret(Pos::new(1, 0)),
+        ];
+        merge_overlapping(&mut sels);
+        assert_eq!(sels.len(), 3);
+        assert_eq!(sels[0].cursor, Pos::new(0, 0));
+        assert_eq!(sels[1].cursor, Pos::new(1, 0));
+        assert_eq!(sels[2].cursor, Pos::new(2, 0));
+    }
+
+    #[test]
+    fn test_merge_overlapping_single() {
+        let mut sels = vec![Selection::caret(Pos::new(0, 0))];
+        merge_overlapping(&mut sels);
+        assert_eq!(sels.len(), 1);
     }
 
     // -- is_word_char -------------------------------------------------------

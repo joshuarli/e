@@ -1,6 +1,6 @@
 use crate::buffer::GapBuffer;
 use crate::operation::{Operation, UndoStack};
-use crate::selection::Pos;
+use crate::selection::{Pos, Selection};
 
 /// Wraps a GapBuffer with undo/redo and dirty tracking.
 pub struct Document {
@@ -80,9 +80,9 @@ impl Document {
         self.undo_stack.end_group();
     }
 
-    /// Undo the last operation group. Returns new cursor position.
-    pub fn undo(&mut self) -> Option<Pos> {
-        let (ops, cursor) = self.undo_stack.undo()?;
+    /// Undo the last operation group. Returns cursor selections to restore.
+    pub fn undo(&mut self) -> Option<Vec<Selection>> {
+        let (ops, cursors) = self.undo_stack.undo()?;
         for op in &ops {
             match op {
                 Operation::Insert { pos, data } => {
@@ -96,12 +96,12 @@ impl Document {
             }
         }
         self.dirty = true;
-        Some(cursor)
+        Some(cursors)
     }
 
-    /// Redo the last undone group. Returns new cursor position.
-    pub fn redo(&mut self) -> Option<Pos> {
-        let (ops, cursor) = self.undo_stack.redo()?;
+    /// Redo the last undone group. Returns cursor selections to restore.
+    pub fn redo(&mut self) -> Option<Vec<Selection>> {
+        let (ops, cursors) = self.undo_stack.redo()?;
         for op in &ops {
             match op {
                 Operation::Insert { pos, data } => {
@@ -113,7 +113,17 @@ impl Document {
             }
         }
         self.dirty = true;
-        Some(cursor)
+        Some(cursors)
+    }
+
+    /// Override the cursors_after on the current undo group.
+    pub fn set_undo_cursors_after(&mut self, cursors: Vec<Selection>) {
+        self.undo_stack.set_cursors_after(cursors);
+    }
+
+    /// Override the cursors_before on the current undo group.
+    pub fn set_undo_cursors_before(&mut self, cursors: Vec<Selection>) {
+        self.undo_stack.set_cursors_before(cursors);
     }
 
     /// Get text in a range (for clipboard, etc.).
@@ -206,8 +216,8 @@ mod tests {
         doc.insert(0, 5, b" world");
         assert_eq!(doc.buf.contents(), b"hello world");
 
-        let pos = doc.undo().unwrap();
-        assert_eq!(pos, Pos::new(0, 5));
+        let cursors = doc.undo().unwrap();
+        assert_eq!(cursors[0].cursor, Pos::new(0, 5));
         assert_eq!(doc.buf.contents(), b"hello");
     }
 
@@ -217,8 +227,8 @@ mod tests {
         doc.delete_range(Pos::new(0, 5), Pos::new(0, 11));
         assert_eq!(doc.buf.contents(), b"hello");
 
-        let pos = doc.undo().unwrap();
-        assert_eq!(pos, Pos::new(0, 11));
+        let cursors = doc.undo().unwrap();
+        assert_eq!(cursors[0].cursor, Pos::new(0, 11));
         assert_eq!(doc.buf.contents(), b"hello world");
     }
 
@@ -229,8 +239,8 @@ mod tests {
         doc.undo();
         assert_eq!(doc.buf.contents(), b"hello");
 
-        let pos = doc.redo().unwrap();
-        assert_eq!(pos, Pos::new(0, 11));
+        let cursors = doc.redo().unwrap();
+        assert_eq!(cursors[0].cursor, Pos::new(0, 11));
         assert_eq!(doc.buf.contents(), b"hello world");
     }
 

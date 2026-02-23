@@ -40,9 +40,9 @@ src/
 - **GapBuffer** (`buffer.rs`): `Vec<u8>` with `gap_start`/`gap_end`. Lazy `line_starts` cache (byte offsets of each line start, rebuilt on access after edits). All text stored as UTF-8 bytes.
 - **Document** (`document.rs`): Owns `GapBuffer` + `UndoStack` + `dirty: bool` + `filename: Option<String>`. All mutations (`insert`, `delete_range`) record undo operations.
 - **Pos** (`selection.rs`): `{ line: usize, col: usize }` — 0-indexed, col is character index not byte offset. Implements `Ord`.
-- **Selection** (`selection.rs`): `{ anchor: Pos, cursor: Pos }`. `anchor == cursor` means no selection. `ordered()` returns `(start, end)`.
-- **UndoStack** (`operation.rs`): Groups operations automatically by: kind change (insert vs delete), word boundary (space/newline), time gap (>1s), cursor jump, or explicit `seal()`. `seal()` immediately flushes the current group for atomic undo of paste/comment operations. `begin_group()`/`end_group()` force all enclosed operations into a single undo step (used by indent/dedent/comment toggle on selections).
-- **Editor** (`editor.rs`): Owns everything. Event loop uses `mpsc` channels — background thread for stdin (or `/dev/tty` when stdin is piped). SIGWINCH polled via atomic flag on 500ms timeout. Main thread does `recv_timeout(500ms)` for status message expiry.
+- **Selection** (`selection.rs`): `{ anchor: Pos, cursor: Pos }`. `anchor == cursor` means no selection. `ordered()` returns `(start, end)`. Derives `PartialEq, Eq`. `merge_overlapping()` sorts and merges adjacent/overlapping selections.
+- **UndoStack** (`operation.rs`): Groups operations automatically by: kind change (insert vs delete), word boundary (space/newline), time gap (>1s), cursor jump, or explicit `seal()`. `seal()` immediately flushes the current group for atomic undo of paste/comment operations. `begin_group()`/`end_group()` force all enclosed operations into a single undo step (used by indent/dedent/comment toggle on selections, multi-cursor edits). Each `OperationGroup` stores `cursors_before`/`cursors_after` as `Vec<Selection>` to restore full multi-cursor state on undo/redo.
+- **Editor** (`editor.rs`): Owns everything. `cursors: Vec<Selection>` (always sorted, len >= 1) with per-cursor `desired_cols`. Event loop uses `mpsc` channels — background thread for stdin (or `/dev/tty` when stdin is piped). SIGWINCH polled via atomic flag on 500ms timeout. Main thread does `recv_timeout(500ms)` for status message expiry.
 
 ## Event Loop
 
@@ -53,11 +53,11 @@ Channel-based (`std::sync::mpsc`). No async runtime.
 
 ## Rendering
 
-All output buffered to a `Vec<u8>`, written to terminal in a single `write_all` per frame. Synchronized output protocol (`\x1b[?2026h`/`\x1b[?2026l`) wraps each frame so supporting terminals (kitty, iTerm2, WezTerm, ghostty, foot) hold rendering until complete; unsupporting terminals ignore the sequences. Lines are overwritten in-place with `\x1b[K` (erase to end of line) after content rather than `\x1b[2K` (erase entire line) before, eliminating clear-then-draw flicker. Scroll at document boundaries short-circuits (no redraw). **Soft-wrap**: long lines wrap at the right edge of the viewport (no horizontal scrolling). A logical line occupying `ceil(display_width / text_cols)` screen rows is rendered as multiple chunks. Line numbers appear only on the first wrapped row; continuation rows get blank gutters. The viewport tracks `(scroll_line, scroll_wrap)` — both which logical line and which wrapped sub-row of that line is at the top of the screen. Cursor screen position uses `col % text_cols` for the column and counts wrapped rows from the scroll position for the row. Mouse clicks walk from the scroll position through wrapped rows to map screen coordinates to buffer positions. Syntax highlighting: per-line HlState cached across frames (keyed by GapBuffer version counter); cache reused during scrolling (zero recomputation), recomputed on edits; per-char HlType mapped from byte highlights; ANSI colors emitted with minimal escape changes on the fast path. Selection/find highlights override syntax colors. Bracket matching: when cursor is on a bracket `()[]{}`, the matching bracket is highlighted with magenta background/black text. Status bar (reverse video) on second-to-last row shows `filename* [Language]` on the left and `e vVERSION` on the right (version from `env!("CARGO_PKG_VERSION")`). Command buffer on last row when active with blinking cursor. Tab completions render above the status bar. Selection rendered as reverse video, find matches as yellow background (current match green). Line numbers in dim text (no separator). Tabs display as dark grey `|` pipe followed by space. Cursor hidden during find navigation mode and when selection is active.
+All output buffered to a `Vec<u8>`, written to terminal in a single `write_all` per frame. Synchronized output protocol (`\x1b[?2026h`/`\x1b[?2026l`) wraps each frame so supporting terminals (kitty, iTerm2, WezTerm, ghostty, foot) hold rendering until complete; unsupporting terminals ignore the sequences. Lines are overwritten in-place with `\x1b[K` (erase to end of line) after content rather than `\x1b[2K` (erase entire line) before, eliminating clear-then-draw flicker. Scroll at document boundaries short-circuits (no redraw). **Soft-wrap**: long lines wrap at the right edge of the viewport (no horizontal scrolling). A logical line occupying `ceil(display_width / text_cols)` screen rows is rendered as multiple chunks. Line numbers appear only on the first wrapped row; continuation rows get blank gutters. The viewport tracks `(scroll_line, scroll_wrap)` — both which logical line and which wrapped sub-row of that line is at the top of the screen. Cursor screen position uses `col % text_cols` for the column and counts wrapped rows from the scroll position for the row. Mouse clicks walk from the scroll position through wrapped rows to map screen coordinates to buffer positions. Syntax highlighting: per-line HlState cached across frames (keyed by GapBuffer version counter); cache reused during scrolling (zero recomputation), recomputed on edits; per-char HlType mapped from byte highlights; ANSI colors emitted with minimal escape changes on the fast path. Selection/find highlights override syntax colors. Bracket matching: when cursor is on a bracket `()[]{}`, the matching bracket is highlighted with magenta background/black text. Status bar (reverse video) on second-to-last row shows `filename* [Language]` on the left and `e vVERSION` on the right (with `NC |` prefix when multi-cursor active) (version from `env!("CARGO_PKG_VERSION")`). Command buffer on last row when active with blinking cursor. Tab completions render above the status bar. Selections rendered as reverse video (multiple selections supported for multi-cursor), extra cursor positions rendered as reverse-video blocks, find matches as yellow background (current match green). Line numbers in dim text (no separator). Tabs display as dark grey `|` pipe followed by space. Cursor hidden during find navigation mode and when selection is active.
 
 ## Keybindings
 
-Configurable via `~/.config/e/keybindings.ini`. Format: `ctrl+key = action`.
+Configurable via `~/.config/e/keybindings.ini`. Format: `ctrl+key = action` or `alt+key = action`.
 
 | Key | Action |
 |---|---|
@@ -85,9 +85,11 @@ Configurable via `~/.config/e/keybindings.ini`. Format: `ctrl+key = action`.
 | `Delete` | Forward delete (non-configurable) |
 | `Left/Right` | Move cursor; snaps to 2-space indent stops in leading whitespace |
 | `Shift+Arrows` | Extend selection (left/right also snap to indent stops) |
-| `Esc` | Clear selection / find highlights |
+| `Alt+n` | Add cursor at next occurrence of word/selection |
+| `Alt+p` | Remove last added cursor |
+| `Esc` | Clear extra cursors (if multi-cursor), else clear selection / find highlights |
 
-Mouse: click to place cursor, drag to select, double-click selects word (`is_word_char`: alphanumeric + underscore), triple-click selects line, scroll wheel scrolls.
+Mouse: click to place cursor, drag to select, double-click selects word (`is_word_char`: alphanumeric + underscore), triple-click selects line, scroll wheel scrolls. Ctrl+Click adds a cursor at click position.
 
 ## Commands
 
@@ -111,7 +113,7 @@ Entered via `^p` command palette. Available commands:
 ## Development Guidelines
 
 - Run `cargo clippy && cargo test` before every commit — zero warnings, all tests pass
-- All modules have inline `#[cfg(test)] mod tests` — 267 tests total
+- All modules have inline `#[cfg(test)] mod tests` — 274 tests total
 - Prefer `&self` over `&mut self` for read-only operations (the line cache uses interior mutability via `Option<Vec<usize>>`)
 - Minimize heap allocations in hot paths (render loop, cursor movement)
 - No `unwrap()` on user-facing I/O — propagate errors or show in status bar
@@ -163,3 +165,4 @@ Entered via `^p` command palette. Available commands:
 - [x] YAML key/value distinction (keys yellow, quoted strings green, anchors/aliases cyan, comments grey)
 - [x] Semver version highlighting (v1.2.3, 0.3.5-beta.1 → cyan, works inside strings, skips comments, all languages)
 - [x] Operator highlighting (`&&`, `||`, `==`, `!=`, `<=`, `>=`, `=>`, `->`, `:=`, `===`, `!==` — per-language sets, yellow)
+- [x] Multiple cursors with simultaneous editing (Ctrl+Click, Alt+n next match, Alt+p remove last, Esc to clear; reverse-iteration edits, multi-cursor undo/redo, clipboard distribute)

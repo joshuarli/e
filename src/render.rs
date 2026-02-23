@@ -82,7 +82,8 @@ impl Renderer {
         status_left: &str,
         status_right: &str,
         command_line: Option<&str>,
-        selection: Option<Selection>,
+        selections: &[Selection],
+        extra_cursors: &[Pos],
         find_matches: Option<&[(Pos, Pos)]>,
         find_current: Option<usize>,
         completions: &[String],
@@ -100,10 +101,7 @@ impl Renderer {
         let text_rows = view.text_rows().saturating_sub(completion_rows);
         let text_cols = view.text_cols(gw);
 
-        let (sel_start, sel_end) = selection
-            .map(|s| s.ordered())
-            .unwrap_or((Pos::zero(), Pos::zero()));
-        let has_sel = selection.is_some_and(|s| !s.is_empty());
+        let has_sel = !selections.is_empty();
 
         // Buffer all output, then write to terminal in one shot to avoid flicker
         let mut frame = Vec::with_capacity(8192);
@@ -180,30 +178,47 @@ impl Renderer {
                 .map(|(_, match_pos)| display_col_for_char_col(&raw_text, match_pos.col))
                 .collect();
 
-            // Per-character highlight info
-            let need_per_char = has_sel && line_idx >= sel_start.line && line_idx <= sel_end.line;
+            // Per-character highlight info: check all selections
+            let sel_ranges_for_line: Vec<(usize, usize)> = if has_sel {
+                selections
+                    .iter()
+                    .filter_map(|sel| {
+                        let (ss, se) = sel.ordered();
+                        if line_idx >= ss.line && line_idx <= se.line {
+                            let s = if line_idx == ss.line {
+                                display_col_for_char_col(&raw_text, ss.col)
+                            } else {
+                                0
+                            };
+                            let e = if line_idx == se.line {
+                                display_col_for_char_col(&raw_text, se.col)
+                            } else {
+                                chars.len()
+                            };
+                            Some((s, e))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let need_per_char = !sel_ranges_for_line.is_empty();
+
+            // Extra cursor display columns for this line
+            let extra_cursor_cols: Vec<usize> = extra_cursors
+                .iter()
+                .filter(|p| p.line == line_idx)
+                .map(|p| display_col_for_char_col(&raw_text, p.col))
+                .collect();
+
             let has_find = find_matches.is_some_and(|m| {
                 m.iter()
                     .any(|(s, e)| line_idx >= s.line && line_idx <= e.line)
             });
             let has_bracket = !bracket_cols.is_empty();
-
-            // Pre-compute selection and find ranges once per logical line
-            let (line_sel_start, line_sel_end) = if need_per_char {
-                let s = if line_idx == sel_start.line {
-                    display_col_for_char_col(&raw_text, sel_start.col)
-                } else {
-                    0
-                };
-                let e = if line_idx == sel_end.line {
-                    display_col_for_char_col(&raw_text, sel_end.col)
-                } else {
-                    chars.len()
-                };
-                (s, e)
-            } else {
-                (0, 0)
-            };
+            let has_extra_cursors = !extra_cursor_cols.is_empty();
 
             let find_ranges: Vec<(usize, usize, bool)> = find_matches
                 .map(|matches| {
@@ -250,12 +265,13 @@ impl Renderer {
                 let chunk_start = wrap * text_cols;
                 let chunk_end = ((wrap + 1) * text_cols).min(chars.len());
 
-                if need_per_char || has_find || has_bracket {
+                if need_per_char || has_find || has_bracket || has_extra_cursors {
                     for (i, ch) in chars.iter().enumerate().take(chunk_end).skip(chunk_start) {
-                        let in_sel = need_per_char && i >= line_sel_start && i < line_sel_end;
+                        let in_sel = sel_ranges_for_line.iter().any(|(s, e)| i >= *s && i < *e);
                         let find_hit = find_ranges.iter().find(|(fs, fe, _)| i >= *fs && i < *fe);
                         let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
                         let is_bracket_match = bracket_cols.contains(&i);
+                        let is_extra_cursor = extra_cursor_cols.contains(&i);
 
                         if in_sel {
                             if is_tab_pipe {
@@ -263,6 +279,8 @@ impl Renderer {
                             } else {
                                 write!(w, "\x1b[7m{}\x1b[0m", ch)?;
                             }
+                        } else if is_extra_cursor {
+                            write!(w, "\x1b[7m{}\x1b[0m", ch)?;
                         } else if let Some((_, _, is_current)) = find_hit {
                             if *is_current {
                                 write!(w, "\x1b[42;30m{}\x1b[0m", ch)?;
@@ -283,6 +301,16 @@ impl Renderer {
                                 write!(w, "{}", ch)?;
                             } else {
                                 write!(w, "{}{}\x1b[0m", code, ch)?;
+                            }
+                        }
+                    }
+                    // If an extra cursor is at end-of-line (past last char), render a block
+                    for &ec in &extra_cursor_cols {
+                        if ec >= chunk_end && ec < (wrap + 1) * text_cols {
+                            // Cursor is at the end of visible content on this wrap row
+                            let spaces_before = ec.saturating_sub(chunk_end);
+                            if spaces_before == 0 {
+                                write!(w, "\x1b[7m \x1b[0m")?;
                             }
                         }
                     }
@@ -608,7 +636,8 @@ mod tests {
             "test.txt",
             "Ln 1, Col 1",
             None,
-            None,
+            &[],
+            &[],
             None,
             None,
             &[],
@@ -642,7 +671,8 @@ mod tests {
             "test.txt",
             "Ln 1, Col 1",
             None,
-            None,
+            &[],
+            &[],
             None,
             None,
             &[],
@@ -675,7 +705,8 @@ mod tests {
             "",
             "",
             Some("find: test"),
-            None,
+            &[],
+            &[],
             None,
             None,
             &[],
@@ -708,7 +739,8 @@ mod tests {
             "",
             "",
             None,
-            None,
+            &[],
+            &[],
             None,
             None,
             &[],
@@ -743,7 +775,8 @@ mod tests {
             "",
             "",
             None,
-            Some(sel),
+            &[sel],
+            &[],
             None,
             None,
             &[],
@@ -775,7 +808,8 @@ mod tests {
             "[No Name]",
             "Ln 1, Col 1",
             None,
-            None,
+            &[],
+            &[],
             None,
             None,
             &[],
