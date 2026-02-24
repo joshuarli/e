@@ -1450,16 +1450,23 @@ impl Editor {
         let indent_bytes: &[u8] = if use_tab { b"\t" } else { b"  " };
         let indent_char_len = if use_tab { 1 } else { 2 };
 
+        // Pre-read line data to avoid O(n²) cache rebuilds
+        let lines: Vec<(Vec<u8>, usize)> = (start_line..=end_line)
+            .map(|i| (self.doc.buf.line_text(i), self.doc.buf.line_start(i)))
+            .collect();
+
+        let cursor_pos = self.cursor();
         self.doc.begin_undo_group();
         let cursor_line = self.cursor().line;
         let mut cursor_added = 0usize;
-        for line_idx in (start_line..=end_line).rev() {
-            let text = self.doc.buf.line_text(line_idx);
+        for (idx, (text, line_offset)) in lines.iter().enumerate().rev() {
             let is_blank = text.iter().all(|&b| b == b' ' || b == b'\t');
             if is_blank {
                 continue;
             }
-            self.doc.insert(line_idx, 0, indent_bytes);
+            self.doc
+                .insert_at_byte(*line_offset, indent_bytes, cursor_pos, cursor_pos);
+            let line_idx = start_line + idx;
             if line_idx == cursor_line {
                 cursor_added = indent_char_len;
             }
@@ -1620,10 +1627,22 @@ impl Editor {
             (s.line, end)
         };
 
-        // Check if all lines are already commented
         let prefix = format!("{} ", comment);
-        let all_commented = (start_line..=end_line).all(|line_idx| {
-            let text = self.doc.buf.line_text(line_idx);
+
+        // Pre-read all line data and byte offsets to avoid O(n²) cache rebuilds.
+        // Each insert/delete invalidates the line-start cache; reading it back
+        // triggers a full rebuild. By collecting everything up front we rebuild
+        // the cache exactly once.
+        let lines: Vec<(Vec<u8>, usize)> = (start_line..=end_line)
+            .map(|i| {
+                let text = self.doc.buf.line_text(i);
+                let offset = self.doc.buf.line_start(i);
+                (text, offset)
+            })
+            .collect();
+
+        // Check if all lines are already commented
+        let all_commented = lines.iter().all(|(text, _)| {
             let trimmed = text.iter().position(|&b| b != b' ' && b != b'\t');
             match trimmed {
                 Some(pos) => text[pos..].starts_with(prefix.as_bytes()),
@@ -1637,40 +1656,32 @@ impl Editor {
             None => all_commented, // toggle
         };
 
+        let cursor_pos = self.cursor();
         self.doc.begin_undo_group();
         if do_uncomment {
             // Uncomment: remove first occurrence of "comment " from each line
-            for line_idx in (start_line..=end_line).rev() {
-                let text = self.doc.buf.line_text(line_idx);
+            for (text, line_offset) in lines.iter().rev() {
                 let indent_pos = text
                     .iter()
                     .position(|&b| b != b' ' && b != b'\t')
                     .unwrap_or(text.len());
                 if text[indent_pos..].starts_with(prefix.as_bytes()) {
-                    let indent_chars = crate::buffer::char_count(&text[..indent_pos]);
-                    let prefix_chars = crate::buffer::char_count(prefix.as_bytes());
-                    self.doc.delete_range(
-                        Pos::new(line_idx, indent_chars),
-                        Pos::new(line_idx, indent_chars + prefix_chars),
+                    self.doc.delete_at_byte(
+                        line_offset + indent_pos,
+                        prefix.len(),
+                        cursor_pos,
+                        cursor_pos,
                     );
                 }
             }
         } else {
             // Comment: find minimum indent, insert comment prefix at that indent
-            let min_indent = (start_line..=end_line)
-                .filter_map(|line_idx| {
-                    let text = self.doc.buf.line_text(line_idx);
-                    text.iter().position(|&b| b != b' ' && b != b'\t') // None for blank lines
-                })
+            let min_indent = lines
+                .iter()
+                .filter_map(|(text, _)| text.iter().position(|&b| b != b' ' && b != b'\t'))
                 .min()
                 .unwrap_or(0);
-            let min_indent_chars = {
-                // Convert byte indent to char indent using first non-blank line
-                let text = self.doc.buf.line_text(start_line);
-                crate::buffer::char_count(&text[..min_indent.min(text.len())])
-            };
-            for line_idx in (start_line..=end_line).rev() {
-                let text = self.doc.buf.line_text(line_idx);
+            for (text, line_offset) in lines.iter().rev() {
                 let is_blank = text.iter().all(|&b| b == b' ' || b == b'\t');
                 if is_blank {
                     continue;
@@ -1683,8 +1694,12 @@ impl Editor {
                 if text[indent_pos..].starts_with(prefix.as_bytes()) {
                     continue;
                 }
-                self.doc
-                    .insert(line_idx, min_indent_chars, prefix.as_bytes());
+                self.doc.insert_at_byte(
+                    line_offset + min_indent,
+                    prefix.as_bytes(),
+                    cursor_pos,
+                    cursor_pos,
+                );
             }
         }
         self.doc.end_undo_group();
@@ -1705,22 +1720,28 @@ impl Editor {
             (s.line, end)
         };
 
+        // Pre-read line data to avoid O(n²) cache rebuilds
+        let lines: Vec<(Vec<u8>, usize)> = (start_line..=end_line)
+            .map(|i| (self.doc.buf.line_text(i), self.doc.buf.line_start(i)))
+            .collect();
+
+        let cursor_pos = self.cursor();
         self.doc.begin_undo_group();
         let cursor_line = self.cursor().line;
         let mut cursor_removed = 0usize;
-        for line_idx in (start_line..=end_line).rev() {
-            let text = self.doc.buf.line_text(line_idx);
+        for (idx, (text, line_offset)) in lines.iter().enumerate().rev() {
             let removed = if text.starts_with(b"\t") {
                 self.doc
-                    .delete_range(Pos::new(line_idx, 0), Pos::new(line_idx, 1));
+                    .delete_at_byte(*line_offset, 1, cursor_pos, cursor_pos);
                 1
             } else if text.starts_with(b"  ") {
                 self.doc
-                    .delete_range(Pos::new(line_idx, 0), Pos::new(line_idx, 2));
+                    .delete_at_byte(*line_offset, 2, cursor_pos, cursor_pos);
                 2
             } else {
                 0
             };
+            let line_idx = start_line + idx;
             if line_idx == cursor_line {
                 cursor_removed = removed;
             }
@@ -4252,6 +4273,25 @@ mod tests {
         assert_eq!(lines[0], "// aaa");
         assert_eq!(lines[1], "// bbb"); // not double-commented
         assert_eq!(lines[2], "// ccc");
+    }
+
+    #[test]
+    fn test_comment_performance_3000_lines() {
+        let text: String = (0..3000)
+            .map(|i| format!("let x{} = {};", i, i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = ed_named(&text, "test.rs");
+        e.select_all();
+        let start = std::time::Instant::now();
+        e.toggle_comment();
+        let elapsed = start.elapsed();
+        assert!(e.test_text().starts_with("// let x0"));
+        assert!(
+            elapsed.as_millis() < 500,
+            "comment on 3000 lines took {:?}",
+            elapsed
+        );
     }
 
     // ========================================================================

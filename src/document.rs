@@ -116,6 +116,49 @@ impl Document {
         Some(cursor)
     }
 
+    /// Insert bytes at a raw byte offset (avoids line-cache lookups).
+    /// `cursor_before`/`cursor_after` are recorded for undo.
+    pub fn insert_at_byte(
+        &mut self,
+        offset: usize,
+        bytes: &[u8],
+        cursor_before: Pos,
+        cursor_after: Pos,
+    ) {
+        self.buf.insert(offset, bytes);
+        self.undo_stack.record(
+            Operation::Insert {
+                pos: offset,
+                data: bytes.to_vec(),
+            },
+            cursor_before,
+            cursor_after,
+        );
+        self.dirty = true;
+    }
+
+    /// Delete bytes at a raw byte offset (avoids line-cache lookups).
+    /// `cursor_before`/`cursor_after` are recorded for undo.
+    pub fn delete_at_byte(
+        &mut self,
+        offset: usize,
+        count: usize,
+        cursor_before: Pos,
+        cursor_after: Pos,
+    ) {
+        let deleted = self.buf.slice(offset, offset + count);
+        self.buf.delete(offset, count);
+        self.undo_stack.record(
+            Operation::Delete {
+                pos: offset,
+                data: deleted,
+            },
+            cursor_before,
+            cursor_after,
+        );
+        self.dirty = true;
+    }
+
     /// Get text in a range (for clipboard, etc.).
     pub fn text_in_range(&mut self, start: Pos, end: Pos) -> Vec<u8> {
         let start_offset = self.buf.pos_to_offset(start.line, start.col);
