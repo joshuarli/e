@@ -1102,6 +1102,62 @@ pub fn find_bracket_match(
     }
 }
 
+fn is_escaped(line: &[u8], idx: usize) -> bool {
+    let mut backslashes = 0;
+    let mut i = idx;
+    while i > 0 {
+        i -= 1;
+        if line[i] == b'\\' {
+            backslashes += 1;
+        } else {
+            break;
+        }
+    }
+    backslashes % 2 == 1
+}
+
+pub fn find_quote_match(
+    pos: Pos,
+    get_line: &mut impl FnMut(usize) -> Vec<u8>,
+    _line_count: usize,
+) -> Option<Pos> {
+    let line = get_line(pos.line);
+    let byte_idx = char_col_to_byte(&line, pos.col)?;
+    if byte_idx >= line.len() {
+        return None;
+    }
+    let ch = line[byte_idx];
+    if ch != b'"' && ch != b'\'' {
+        return None;
+    }
+    if is_escaped(&line, byte_idx) {
+        return None;
+    }
+    // Collect all unescaped positions of this quote char on this line
+    let mut positions = Vec::new();
+    for i in 0..line.len() {
+        if line[i] == ch && !is_escaped(&line, i) {
+            positions.push(i);
+        }
+    }
+    // Pair sequentially: 0↔1, 2↔3, etc.
+    let mut pair_idx = 0;
+    while pair_idx + 1 < positions.len() {
+        let open = positions[pair_idx];
+        let close = positions[pair_idx + 1];
+        if byte_idx == open {
+            let col = byte_to_char_col(&line, close);
+            return Some(Pos::new(pos.line, col));
+        }
+        if byte_idx == close {
+            let col = byte_to_char_col(&line, open);
+            return Some(Pos::new(pos.line, col));
+        }
+        pair_idx += 2;
+    }
+    None
+}
+
 fn char_col_to_byte(line: &[u8], char_col: usize) -> Option<usize> {
     let mut bi = 0;
     let mut ci = 0;
@@ -2342,5 +2398,117 @@ mod tests {
         // Unmatched: if we only pass first line, { has no match
         let result = find_bracket_match(Pos::new(0, open_brace), &mut |i| get(i), 1);
         assert_eq!(result, None);
+    }
+
+    // -- Quote matching -----------------------------------------------------
+
+    #[test]
+    fn test_quote_match_double_basic() {
+        let line = b"\"hello\"";
+        let mut get = |_: usize| line.to_vec();
+        // Cursor on opening " → match closing
+        assert_eq!(
+            find_quote_match(Pos::new(0, 0), &mut get, 1),
+            Some(Pos::new(0, 6))
+        );
+        // Cursor on closing " → match opening
+        assert_eq!(
+            find_quote_match(Pos::new(0, 6), &mut get, 1),
+            Some(Pos::new(0, 0))
+        );
+    }
+
+    #[test]
+    fn test_quote_match_single_basic() {
+        let line = b"'hello'";
+        let mut get = |_: usize| line.to_vec();
+        assert_eq!(
+            find_quote_match(Pos::new(0, 0), &mut get, 1),
+            Some(Pos::new(0, 6))
+        );
+        assert_eq!(
+            find_quote_match(Pos::new(0, 6), &mut get, 1),
+            Some(Pos::new(0, 0))
+        );
+    }
+
+    #[test]
+    fn test_quote_match_escaped_skipped() {
+        // "\"foo\"" — bytes: " \ " f o o \ " " (9 bytes)
+        // Unescaped quotes at byte 0 and 8, escaped at 2 and 7
+        let line = br#""\"foo\"""#;
+        let mut get = |_: usize| line.to_vec();
+        assert_eq!(
+            find_quote_match(Pos::new(0, 0), &mut get, 1),
+            Some(Pos::new(0, 8))
+        );
+        assert_eq!(
+            find_quote_match(Pos::new(0, 8), &mut get, 1),
+            Some(Pos::new(0, 0))
+        );
+    }
+
+    #[test]
+    fn test_quote_match_multiple_pairs() {
+        let line = br#""a" "b""#;
+        let mut get = |_: usize| line.to_vec();
+        // First pair: 0↔2
+        assert_eq!(
+            find_quote_match(Pos::new(0, 0), &mut get, 1),
+            Some(Pos::new(0, 2))
+        );
+        assert_eq!(
+            find_quote_match(Pos::new(0, 2), &mut get, 1),
+            Some(Pos::new(0, 0))
+        );
+        // Second pair: 4↔6
+        assert_eq!(
+            find_quote_match(Pos::new(0, 4), &mut get, 1),
+            Some(Pos::new(0, 6))
+        );
+        assert_eq!(
+            find_quote_match(Pos::new(0, 6), &mut get, 1),
+            Some(Pos::new(0, 4))
+        );
+    }
+
+    #[test]
+    fn test_quote_match_unmatched() {
+        // Odd number of quotes → last one has no pair
+        let line = br#""a" ""#;
+        let mut get = |_: usize| line.to_vec();
+        assert_eq!(find_quote_match(Pos::new(0, 4), &mut get, 1), None);
+    }
+
+    #[test]
+    fn test_quote_match_not_on_quote() {
+        let line = b"hello";
+        let mut get = |_: usize| line.to_vec();
+        assert_eq!(find_quote_match(Pos::new(0, 2), &mut get, 1), None);
+    }
+
+    #[test]
+    fn test_quote_match_escaped_under_cursor() {
+        // Cursor on an escaped quote → no match
+        let line = br#""\""#;
+        let mut get = |_: usize| line.to_vec();
+        // byte 1 is \, byte 2 is escaped "
+        assert_eq!(find_quote_match(Pos::new(0, 2), &mut get, 1), None);
+    }
+
+    #[test]
+    fn test_quote_match_double_backslash() {
+        // \\" — two backslashes then quote; even backslashes = not escaped
+        let line = br##""\\""##;
+        let mut get = |_: usize| line.to_vec();
+        // bytes: " \ \ " — positions 0 and 3 are unescaped quotes
+        assert_eq!(
+            find_quote_match(Pos::new(0, 0), &mut get, 1),
+            Some(Pos::new(0, 3))
+        );
+        assert_eq!(
+            find_quote_match(Pos::new(0, 3), &mut get, 1),
+            Some(Pos::new(0, 0))
+        );
     }
 }

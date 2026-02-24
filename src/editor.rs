@@ -376,7 +376,14 @@ impl Editor {
     fn find_matching_bracket(&mut self) -> Option<(Pos, Pos)> {
         let cursor = self.cursor();
         let line_count = self.doc.buf.line_count();
-        let match_pos = highlight::find_bracket_match(
+        if let Some(match_pos) = highlight::find_bracket_match(
+            cursor,
+            &mut |line_idx| self.doc.buf.line_text(line_idx),
+            line_count,
+        ) {
+            return Some((cursor, match_pos));
+        }
+        let match_pos = highlight::find_quote_match(
             cursor,
             &mut |line_idx| self.doc.buf.line_text(line_idx),
             line_count,

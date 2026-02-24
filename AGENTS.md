@@ -158,6 +158,7 @@ Entered via `^p` command palette. Available commands:
 - [x] Syntax highlighting (15 languages: Rust, Python, Go, TypeScript, JavaScript, Shell, C, TOML, JSON, YAML, Makefile, HTML, CSS, Dockerfile, Markdown)
 - [x] Purple bracket highlighting for `()[]{}` (magenta, not inside strings/comments)
 - [x] Bracket matching (cursor on bracket highlights matching bracket with magenta bg, scans up to 1000 lines)
+- [x] Quote pair highlighting (cursor on `"` or `'` highlights matching quote on same line with magenta bg, skips escaped quotes)
 - [x] Markdown highlighting (headers, bold, italic, fenced code blocks, inline code, blockquotes, lists, horizontal rules, HTML comments)
 - [x] JSON key/value distinction (keys yellow, string values green, brackets purple)
 - [x] YAML key/value distinction (keys yellow, quoted strings green, anchors/aliases cyan, comments grey)
