@@ -32,7 +32,7 @@ src/
   file_io.rs         Read/write files, CRLF→LF normalization, binary detection, trailing whitespace strip, file locking, persistent undo history (single binary file ~/.config/e/undo.bin)
   language.rs        Language detection by file extension (~45 languages), comment syntax lookup
   signal.rs          SIGWINCH handler via libc::sigaction + AtomicBool polling
-  highlight.rs       Syntax highlighting: byte-by-byte highlighter, HlType/HlState types, per-language rules (15 languages), dedicated JSON/YAML/Markdown highlighters, semver detection, bracket matching, operator highlighting
+  highlight.rs       Syntax highlighting: byte-by-byte highlighter, HlType/HlState types, per-language rules (16 languages), dedicated JSON/YAML/Markdown/INI highlighters, semver detection, bracket matching, operator highlighting
 ```
 
 ## Key Data Structures
@@ -157,7 +157,7 @@ Entered via `^p` command palette. Available commands:
 - [x] Duplicate line (`^j`)
 - [x] Forward delete key
 - [x] Select word at cursor (`^w`)
-- [x] Syntax highlighting (15 languages: Rust, Python, Go, TypeScript, JavaScript, Shell, C, TOML, JSON, YAML, Makefile, HTML, CSS, Dockerfile, Markdown)
+- [x] Syntax highlighting (16 languages: Rust, Python, Go, TypeScript, JavaScript, Shell, C, TOML, JSON, YAML, Makefile, HTML, CSS, Dockerfile, Markdown, INI/Config)
 - [x] Purple bracket highlighting for `()[]{}` (magenta, not inside strings/comments)
 - [x] Bracket matching (cursor on bracket highlights matching bracket with magenta bg, scans up to 1000 lines)
 - [x] Quote pair highlighting (cursor on `"` or `'` highlights matching quote on same line with magenta bg, skips escaped quotes)

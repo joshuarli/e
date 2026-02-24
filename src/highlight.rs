@@ -46,6 +46,7 @@ pub struct SyntaxRules {
     pub is_markdown: bool,
     pub is_json: bool,
     pub is_yaml: bool,
+    pub is_ini: bool,
 }
 
 // -- ANSI color codes -------------------------------------------------------
@@ -116,6 +117,8 @@ pub fn highlight_line(line: &[u8], state: HlState, rules: &SyntaxRules) -> (Vec<
         highlight_line_json(line, state)
     } else if rules.is_yaml {
         highlight_line_yaml(line, state)
+    } else if rules.is_ini {
+        highlight_line_ini(line, state)
     } else {
         highlight_line_code(line, state, rules)
     };
@@ -770,6 +773,203 @@ fn highlight_yaml_value(val: &[u8], hl: &mut [HlType]) {
     }
 }
 
+// -- INI/Config highlighting ------------------------------------------------
+
+fn highlight_line_ini(line: &[u8], _state: HlState) -> (Vec<HlType>, HlState) {
+    let len = line.len();
+    let mut hl = vec![HlType::Normal; len];
+
+    if len == 0 {
+        return (hl, HlState::Normal);
+    }
+
+    // Skip leading whitespace
+    let indent = line
+        .iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count();
+    let rest = &line[indent..];
+
+    if rest.is_empty() {
+        return (hl, HlState::Normal);
+    }
+
+    // Comment lines: ; or # at start (after optional whitespace)
+    if rest[0] == b';' || rest[0] == b'#' {
+        for b in &mut hl[indent..] {
+            *b = HlType::Comment;
+        }
+        return (hl, HlState::Normal);
+    }
+
+    // Section headers: [section]
+    if rest[0] == b'[' {
+        if let Some(close) = rest.iter().position(|&b| b == b']') {
+            for b in &mut hl[indent..indent + close + 1] {
+                *b = HlType::Keyword;
+            }
+            // Anything after ] could be an inline comment
+            let after = indent + close + 1;
+            if after < len {
+                highlight_ini_inline_comment(line, &mut hl, after);
+            }
+        }
+        return (hl, HlState::Normal);
+    }
+
+    // Key = value pairs
+    if let Some(eq_pos) = rest.iter().position(|&b| b == b'=') {
+        let abs_eq = indent + eq_pos;
+        // Key (before =)
+        for b in &mut hl[indent..abs_eq] {
+            *b = HlType::Keyword;
+        }
+        // Value (after =)
+        let val_start = abs_eq + 1;
+        if val_start < len {
+            highlight_ini_value(&line[val_start..], &mut hl[val_start..]);
+        }
+    }
+
+    (hl, HlState::Normal)
+}
+
+fn highlight_ini_value(val: &[u8], hl: &mut [HlType]) {
+    let trimmed_start = val.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+    let trimmed = &val[trimmed_start..];
+
+    if trimmed.is_empty() {
+        return;
+    }
+
+    // Find inline comment (unquoted ; or # after whitespace)
+    let comment_start = find_ini_inline_comment(val);
+
+    let value_end = if let Some(cs) = comment_start {
+        // Highlight the comment
+        for b in &mut hl[cs..] {
+            *b = HlType::Comment;
+        }
+        cs
+    } else {
+        val.len()
+    };
+
+    let trimmed_end = value_end.min(trimmed_start + trimmed.len());
+    if trimmed_start >= trimmed_end {
+        return;
+    }
+    let value_slice = &val[trimmed_start..trimmed_end];
+    // Trim trailing whitespace from value for matching
+    let value_trimmed_len = value_slice.len()
+        - value_slice
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+    if value_trimmed_len == 0 {
+        return;
+    }
+    let value_trimmed = &value_slice[..value_trimmed_len];
+
+    // Quoted strings
+    if value_trimmed[0] == b'"' || value_trimmed[0] == b'\'' {
+        let quote = value_trimmed[0];
+        let mut i = 1;
+        while i < value_trimmed.len() {
+            if value_trimmed[i] == b'\\' && i + 1 < value_trimmed.len() {
+                i += 2;
+                continue;
+            }
+            if value_trimmed[i] == quote {
+                i += 1;
+                break;
+            }
+            i += 1;
+        }
+        for b in &mut hl[trimmed_start..trimmed_start + i] {
+            *b = HlType::String;
+        }
+        return;
+    }
+
+    // Boolean types (case-insensitive): true, false, yes, no, on, off
+    for keyword in &[
+        &b"true"[..],
+        &b"false"[..],
+        &b"yes"[..],
+        &b"no"[..],
+        &b"on"[..],
+        &b"off"[..],
+    ] {
+        if value_trimmed.len() == keyword.len() && value_trimmed.eq_ignore_ascii_case(keyword) {
+            for b in &mut hl[trimmed_start..trimmed_start + keyword.len()] {
+                *b = HlType::Type;
+            }
+            return;
+        }
+    }
+
+    // Numbers (integers and floats)
+    if value_trimmed[0] == b'-' || value_trimmed[0].is_ascii_digit() {
+        let mut i = 0;
+        if value_trimmed[i] == b'-' {
+            i += 1;
+        }
+        let num_start = i;
+        while i < value_trimmed.len()
+            && (value_trimmed[i].is_ascii_digit() || value_trimmed[i] == b'.')
+        {
+            i += 1;
+        }
+        if i > num_start && i == value_trimmed.len() {
+            for b in &mut hl[trimmed_start..trimmed_start + i] {
+                *b = HlType::Number;
+            }
+        }
+    }
+}
+
+/// Find an inline comment in an INI value: ; or # preceded by whitespace.
+fn find_ini_inline_comment(val: &[u8]) -> Option<usize> {
+    let mut in_double_quote = false;
+    let mut in_single_quote = false;
+    let mut i = 0;
+    while i < val.len() {
+        if val[i] == b'"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+        } else if val[i] == b'\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+        } else if val[i] == b'\\' && (in_double_quote || in_single_quote) && i + 1 < val.len() {
+            i += 1; // skip escaped char
+        } else if (val[i] == b';' || val[i] == b'#')
+            && !in_double_quote
+            && !in_single_quote
+            && i > 0
+            && val[i - 1].is_ascii_whitespace()
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Highlight inline comment after a section header closing bracket.
+fn highlight_ini_inline_comment(line: &[u8], hl: &mut [HlType], start: usize) {
+    let rest = &line[start..];
+    let ws = rest
+        .iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count();
+    let after_ws = start + ws;
+    if after_ws < line.len() && (line[after_ws] == b';' || line[after_ws] == b'#') {
+        for b in &mut hl[after_ws..] {
+            *b = HlType::Comment;
+        }
+    }
+}
+
 // -- Markdown highlighting --------------------------------------------------
 
 fn highlight_line_markdown(
@@ -1237,6 +1437,7 @@ static RUST_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: false,
     is_yaml: false,
+    is_ini: false,
 };
 
 static PYTHON_STRINGS: &[StringDelim] = &[
@@ -1265,6 +1466,7 @@ static PYTHON_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: false,
     is_yaml: false,
+    is_ini: false,
 };
 
 static GO_STRINGS: &[StringDelim] = &[
@@ -1335,6 +1537,7 @@ static GO_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: false,
     is_yaml: false,
+    is_ini: false,
 };
 
 static TS_STRINGS: &[StringDelim] = &[
@@ -1422,6 +1625,7 @@ static TS_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: false,
     is_yaml: false,
+    is_ini: false,
 };
 
 static JS_STRINGS: &[StringDelim] = &[
@@ -1496,6 +1700,7 @@ static JS_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: false,
     is_yaml: false,
+    is_ini: false,
 };
 
 static BASH_STRINGS: &[StringDelim] = &[
@@ -1518,6 +1723,7 @@ static BASH_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: false,
     is_yaml: false,
+    is_ini: false,
 };
 
 static C_STRINGS: &[StringDelim] = &[
@@ -1544,6 +1750,7 @@ static C_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: false,
     is_yaml: false,
+    is_ini: false,
 };
 
 static TOML_STRINGS: &[StringDelim] = &[
@@ -1564,6 +1771,7 @@ static TOML_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: false,
     is_yaml: false,
+    is_ini: false,
 };
 
 static JSON_STRINGS: &[StringDelim] = &[string_delim!("\"", "\"", false)];
@@ -1579,6 +1787,7 @@ static JSON_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: true,
     is_yaml: false,
+    is_ini: false,
 };
 
 static YAML_STRINGS: &[StringDelim] = &[
@@ -1597,6 +1806,7 @@ static YAML_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: false,
     is_yaml: true,
+    is_ini: false,
 };
 
 static MAKEFILE_STRINGS: &[StringDelim] = &[
@@ -1618,6 +1828,7 @@ static MAKEFILE_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: false,
     is_yaml: false,
+    is_ini: false,
 };
 
 static HTML_STRINGS: &[StringDelim] = &[
@@ -1636,6 +1847,7 @@ static HTML_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: false,
     is_yaml: false,
+    is_ini: false,
 };
 
 static CSS_STRINGS: &[StringDelim] = &[
@@ -1654,6 +1866,7 @@ static CSS_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: false,
     is_yaml: false,
+    is_ini: false,
 };
 
 static DOCKERFILE_STRINGS: &[StringDelim] = &[
@@ -1691,6 +1904,7 @@ static DOCKERFILE_RULES: SyntaxRules = SyntaxRules {
     is_markdown: false,
     is_json: false,
     is_yaml: false,
+    is_ini: false,
 };
 
 static MARKDOWN_RULES: SyntaxRules = SyntaxRules {
@@ -1704,6 +1918,26 @@ static MARKDOWN_RULES: SyntaxRules = SyntaxRules {
     is_markdown: true,
     is_json: false,
     is_yaml: false,
+    is_ini: false,
+};
+
+static INI_STRINGS: &[StringDelim] = &[
+    string_delim!("\"", "\"", false),
+    string_delim!("'", "'", false),
+];
+
+static INI_RULES: SyntaxRules = SyntaxRules {
+    line_comment: ";",
+    block_comment: ("", ""),
+    string_delims: INI_STRINGS,
+    keywords: &[],
+    types: &["true", "false", "yes", "no", "on", "off"],
+    operators: &[],
+    highlight_numbers: true,
+    is_markdown: false,
+    is_json: false,
+    is_yaml: false,
+    is_ini: true,
 };
 
 /// Look up syntax rules for a language name (from `language::Language::name`).
@@ -1724,6 +1958,7 @@ pub fn rules_for_language(name: &str) -> Option<&'static SyntaxRules> {
         "CSS" => Some(&CSS_RULES),
         "Dockerfile" => Some(&DOCKERFILE_RULES),
         "Markdown" => Some(&MARKDOWN_RULES),
+        "Config" => Some(&INI_RULES),
         _ => None,
     }
 }
@@ -1896,6 +2131,7 @@ mod tests {
         assert!(rules_for_language("HTML").is_some());
         assert!(rules_for_language("CSS").is_some());
         assert!(rules_for_language("Dockerfile").is_some());
+        assert!(rules_for_language("Config").is_some());
     }
 
     #[test]
@@ -1906,6 +2142,85 @@ mod tests {
     #[test]
     fn test_rules_for_markdown() {
         assert!(rules_for_language("Markdown").is_some());
+    }
+
+    // -- INI/Config ---------------------------------------------------------
+
+    #[test]
+    fn test_ini_config() {
+        // Section header
+        let hl = hl_types(b"[section]", &INI_RULES);
+        assert_eq!(hl[0], HlType::Keyword); // [
+        assert_eq!(hl[4], HlType::Keyword); // i
+        assert_eq!(hl[8], HlType::Keyword); // ]
+
+        // Key = value
+        let hl = hl_types(b"key = value", &INI_RULES);
+        assert_eq!(hl[0], HlType::Keyword); // k
+        assert_eq!(hl[2], HlType::Keyword); // y
+        assert_eq!(hl[4], HlType::Normal); // =
+        assert_eq!(hl[6], HlType::Normal); // v (unquoted string)
+
+        // Quoted string value
+        let hl = hl_types(b"name = \"hello\"", &INI_RULES);
+        assert_eq!(hl[0], HlType::Keyword); // n
+        assert_eq!(hl[7], HlType::String); // "
+        assert_eq!(hl[12], HlType::String); // o
+        assert_eq!(hl[13], HlType::String); // "
+
+        // Single-quoted string value
+        let hl = hl_types(b"name = 'hello'", &INI_RULES);
+        assert_eq!(hl[7], HlType::String);
+        assert_eq!(hl[13], HlType::String);
+
+        // Semicolon comment
+        let hl = hl_types(b"; this is a comment", &INI_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::Comment));
+
+        // Hash comment
+        let hl = hl_types(b"# this is a comment", &INI_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::Comment));
+
+        // Indented comment
+        let hl = hl_types(b"  ; indented comment", &INI_RULES);
+        assert_eq!(hl[0], HlType::Normal);
+        assert_eq!(hl[2], HlType::Comment);
+        assert_eq!(hl[19], HlType::Comment);
+
+        // Number value
+        let hl = hl_types(b"port = 8080", &INI_RULES);
+        assert_eq!(hl[0], HlType::Keyword); // p
+        assert_eq!(hl[7], HlType::Number); // 8
+        assert_eq!(hl[10], HlType::Number); // 0
+
+        // Boolean type
+        let hl = hl_types(b"enabled = true", &INI_RULES);
+        assert_eq!(hl[0], HlType::Keyword);
+        assert_eq!(hl[10], HlType::Type); // t
+        assert_eq!(hl[13], HlType::Type); // e
+
+        // Case-insensitive boolean
+        let hl = hl_types(b"flag = TRUE", &INI_RULES);
+        assert_eq!(hl[7], HlType::Type);
+
+        let hl = hl_types(b"flag = Yes", &INI_RULES);
+        assert_eq!(hl[7], HlType::Type);
+
+        let hl = hl_types(b"debug = off", &INI_RULES);
+        assert_eq!(hl[8], HlType::Type);
+
+        // Inline comment after value
+        let hl = hl_types(b"key = value ; comment", &INI_RULES);
+        assert_eq!(hl[0], HlType::Keyword);
+        assert_eq!(hl[6], HlType::Normal); // v
+        assert_eq!(hl[12], HlType::Comment); // ;
+        assert_eq!(hl[20], HlType::Comment);
+
+        // Section header with inline comment
+        let hl = hl_types(b"[section] ; comment", &INI_RULES);
+        assert_eq!(hl[0], HlType::Keyword);
+        assert_eq!(hl[8], HlType::Keyword);
+        assert_eq!(hl[10], HlType::Comment);
     }
 
     // -- Python specifics ---------------------------------------------------
