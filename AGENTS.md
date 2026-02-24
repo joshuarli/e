@@ -85,6 +85,8 @@ Configurable via `~/.config/e/keybindings.ini`. Format: `ctrl+key = action`.
 | `Delete` | Forward delete (non-configurable) |
 | `Left/Right` | Move cursor; snaps to 2-space indent stops in leading whitespace |
 | `Shift+Arrows` | Extend selection (left/right also snap to indent stops) |
+| `Ctrl+Shift+Up` | Select from cursor to start of file |
+| `Ctrl+Shift+Down` | Select from cursor to end of file |
 | `Esc` / `^q` | Cancel command bar / clear selection / find highlights |
 
 Mouse: click to place cursor, drag to select, double-click selects word (`is_word_char`: alphanumeric + underscore), triple-click selects line, scroll wheel scrolls.
@@ -164,4 +166,5 @@ Entered via `^p` command palette. Available commands:
 - [x] YAML key/value distinction (keys yellow, quoted strings green, anchors/aliases cyan, comments grey)
 - [x] Semver version highlighting (v1.2.3, 0.3.5-beta.1 → cyan, works inside strings, skips comments, all languages)
 - [x] Operator highlighting (`&&`, `||`, `==`, `!=`, `<=`, `>=`, `=>`, `->`, `:=`, `===`, `!==` — per-language sets, yellow)
+- [x] Select above/below (`Ctrl+Shift+Up/Down` — select from cursor to start/end of file)
 - [x] Persistent undo history (`~/.config/e/undo.bin`) — survives editor restarts, single binary file with length-prefixed entries, validated by file mtime, silently discarded on external modification

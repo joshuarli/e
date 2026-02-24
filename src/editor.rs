@@ -24,6 +24,8 @@ const SCROLL_LINES: usize = 3;
 
 const PASTE_START: &[u8] = &[0x1b, b'[', b'2', b'0', b'0', b'~'];
 const PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
+const CTRL_SHIFT_UP: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'A'];
+const CTRL_SHIFT_DOWN: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'B'];
 
 fn is_paste_start(ev: &Event) -> bool {
     matches!(ev, Event::Unsupported(bytes) if bytes == PASTE_START)
@@ -408,7 +410,15 @@ impl Editor {
                     self.handle_mouse(mouse);
                 }
             }
-            _ => {}
+            Event::Unsupported(bytes) => {
+                if !self.cmd_buf.active {
+                    if bytes == CTRL_SHIFT_UP {
+                        self.select_above();
+                    } else if bytes == CTRL_SHIFT_DOWN {
+                        self.select_below();
+                    }
+                }
+            }
         }
     }
 
@@ -1193,6 +1203,24 @@ impl Editor {
             anchor: Pos::zero(),
             cursor: Pos::new(last_line, last_col),
         };
+    }
+
+    fn select_above(&mut self) {
+        self.sel = Selection {
+            anchor: self.cursor(),
+            cursor: Pos::zero(),
+        };
+        self.desired_col = None;
+    }
+
+    fn select_below(&mut self) {
+        let last_line = self.doc.buf.line_count().saturating_sub(1);
+        let last_col = self.doc.buf.line_char_len(last_line);
+        self.sel = Selection {
+            anchor: self.cursor(),
+            cursor: Pos::new(last_line, last_col),
+        };
+        self.desired_col = None;
     }
 
     // -- movement (no selection) --------------------------------------------
