@@ -83,6 +83,22 @@ impl UndoStack {
         self.flush_current();
     }
 
+    /// Returns references to the undo and redo stacks (for serialization).
+    pub fn stacks(&self) -> (&[OperationGroup], &[OperationGroup]) {
+        (&self.undo, &self.redo)
+    }
+
+    /// Replace both stacks with restored data, resetting all transient state.
+    pub fn restore(&mut self, undo: Vec<OperationGroup>, redo: Vec<OperationGroup>) {
+        self.undo = undo;
+        self.redo = redo;
+        self.current = None;
+        self.last_kind = None;
+        self.last_time = None;
+        self.last_cursor = Pos::zero();
+        self.force_group = false;
+    }
+
     /// Record an operation. Determines whether to extend current group or start new.
     pub fn record(&mut self, op: Operation, cursor_before: Pos, cursor_after: Pos) {
         // Clear redo on new edit
@@ -320,6 +336,79 @@ mod tests {
         // All three should be one group
         let (ops, _) = stack.undo().unwrap();
         assert_eq!(ops.len(), 3);
+    }
+
+    #[test]
+    fn test_stacks_empty() {
+        let stack = UndoStack::new();
+        let (undo, redo) = stack.stacks();
+        assert!(undo.is_empty());
+        assert!(redo.is_empty());
+    }
+
+    #[test]
+    fn test_stacks_returns_committed_groups() {
+        let mut stack = UndoStack::new();
+        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.seal();
+        stack.record(ins(1, b"b"), Pos::new(0, 1), Pos::new(0, 2));
+        stack.seal();
+        let (undo, redo) = stack.stacks();
+        assert_eq!(undo.len(), 2);
+        assert!(redo.is_empty());
+    }
+
+    #[test]
+    fn test_stacks_after_undo() {
+        let mut stack = UndoStack::new();
+        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.seal();
+        stack.record(ins(1, b"b"), Pos::new(0, 1), Pos::new(0, 2));
+        stack.seal();
+        stack.undo();
+        let (undo, redo) = stack.stacks();
+        assert_eq!(undo.len(), 1);
+        assert_eq!(redo.len(), 1);
+    }
+
+    #[test]
+    fn test_restore_replaces_stacks() {
+        let mut stack = UndoStack::new();
+        stack.record(ins(0, b"x"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.seal();
+
+        let undo_groups = vec![OperationGroup {
+            ops: vec![ins(0, b"a")],
+            cursor_before: Pos::new(0, 0),
+            cursor_after: Pos::new(0, 1),
+        }];
+        let redo_groups = vec![OperationGroup {
+            ops: vec![ins(1, b"b")],
+            cursor_before: Pos::new(0, 1),
+            cursor_after: Pos::new(0, 2),
+        }];
+
+        stack.restore(undo_groups, redo_groups);
+        let (undo, redo) = stack.stacks();
+        assert_eq!(undo.len(), 1);
+        assert_eq!(redo.len(), 1);
+    }
+
+    #[test]
+    fn test_restore_resets_transient_state() {
+        let mut stack = UndoStack::new();
+        // Build up transient state
+        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
+        // Don't seal — there's a current group
+
+        stack.restore(Vec::new(), Vec::new());
+
+        // After restore, recording should work cleanly
+        stack.record(ins(0, b"b"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.seal();
+        let (undo, redo) = stack.stacks();
+        assert_eq!(undo.len(), 1);
+        assert!(redo.is_empty());
     }
 
     #[test]

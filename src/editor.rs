@@ -96,8 +96,15 @@ impl Editor {
         let (w, h) = termion::terminal_size().unwrap_or((80, 24));
         let mut keybindings = KeybindingTable::with_defaults();
         keybindings.load_config();
+        let mut doc = Document::new(text, filename);
+        if let Some(ref name) = doc.filename {
+            let path = std::path::Path::new(name);
+            if path.exists() {
+                crate::file_io::load_undo_history(path, &mut doc.undo_stack);
+            }
+        }
         Self {
-            doc: Document::new(text, filename),
+            doc,
             sel: Selection::caret(Pos::zero()),
             desired_col: None,
             view: View::new(w, h),
@@ -407,6 +414,7 @@ impl Editor {
                     self.running = false;
                 }
                 Key::Char('n') | Key::Char('N') => {
+                    self.save_undo_if_named();
                     self.running = false;
                 }
                 _ => {
@@ -532,7 +540,18 @@ impl Editor {
             self.status_time = None; // don't expire this message
             self.quit_pending = true;
         } else {
+            self.save_undo_if_named();
             self.running = false;
+        }
+    }
+
+    fn save_undo_if_named(&mut self) {
+        if let Some(name) = self.doc.filename.clone() {
+            let path = std::path::Path::new(&name);
+            if path.exists() {
+                self.doc.seal_undo();
+                crate::file_io::save_undo_history(path, &self.doc.undo_stack);
+            }
         }
     }
 
@@ -646,7 +665,10 @@ impl Editor {
                 self.doc.filename = Some(name);
                 self.save_file();
             }
-            CommandAction::Quit => self.running = false,
+            CommandAction::Quit => {
+                self.save_undo_if_named();
+                self.running = false;
+            }
             CommandAction::Goto(n) => self.goto_line(n),
             CommandAction::ToggleRuler => {
                 self.ruler_on = !self.ruler_on;
@@ -1732,6 +1754,8 @@ impl Editor {
             match crate::file_io::write_file(path_ref, &self.doc.buf.contents()) {
                 Ok(()) => {
                     self.doc.dirty = false;
+                    self.doc.seal_undo();
+                    crate::file_io::save_undo_history(path_ref, &self.doc.undo_stack);
                     self.set_status(format!("Saved {}", path));
                 }
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
@@ -1833,6 +1857,8 @@ impl Editor {
         match status {
             Ok(s) if s.success() => {
                 self.doc.dirty = false;
+                self.doc.seal_undo();
+                crate::file_io::save_undo_history(path_ref, &self.doc.undo_stack);
                 self.set_status(format!("Saved {} (sudo)", path));
             }
             _ => {

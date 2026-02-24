@@ -2,6 +2,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::operation::{Operation, OperationGroup, UndoStack};
+use crate::selection::Pos;
+
 /// Read a file, converting CRLF → LF. Returns the bytes.
 pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
     let data = fs::read(path)?;
@@ -129,6 +132,233 @@ pub fn is_likely_binary(data: &[u8]) -> bool {
 /// File size in bytes.
 pub fn file_size(path: &Path) -> io::Result<u64> {
     Ok(fs::metadata(path)?.len())
+}
+
+// -- persistent undo history ------------------------------------------------
+
+const UNDO_MAGIC: &[u8; 4] = b"eUND";
+const UNDO_VERSION: u8 = 1;
+const MAX_GROUPS: u32 = 100_000;
+
+/// Directory for undo history files: `~/.config/e/undo/`
+fn undo_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".config/e/undo")
+}
+
+/// Undo history file path for a given source file.
+fn undo_path(path: &Path) -> PathBuf {
+    let abs = resolve_absolute(path);
+    undo_dir().join(format!("{}.undo", encode_path(&abs)))
+}
+
+// Binary encoding helpers
+
+fn write_u8(buf: &mut Vec<u8>, v: u8) {
+    buf.push(v);
+}
+
+fn write_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn write_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn write_i64(buf: &mut Vec<u8>, v: i64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn read_u8(data: &[u8], pos: &mut usize) -> Option<u8> {
+    if *pos >= data.len() {
+        return None;
+    }
+    let v = data[*pos];
+    *pos += 1;
+    Some(v)
+}
+
+fn read_u32(data: &[u8], pos: &mut usize) -> Option<u32> {
+    if *pos + 4 > data.len() {
+        return None;
+    }
+    let v = u32::from_le_bytes(data[*pos..*pos + 4].try_into().ok()?);
+    *pos += 4;
+    Some(v)
+}
+
+fn read_u64(data: &[u8], pos: &mut usize) -> Option<u64> {
+    if *pos + 8 > data.len() {
+        return None;
+    }
+    let v = u64::from_le_bytes(data[*pos..*pos + 8].try_into().ok()?);
+    *pos += 8;
+    Some(v)
+}
+
+fn read_i64(data: &[u8], pos: &mut usize) -> Option<i64> {
+    if *pos + 8 > data.len() {
+        return None;
+    }
+    let v = i64::from_le_bytes(data[*pos..*pos + 8].try_into().ok()?);
+    *pos += 8;
+    Some(v)
+}
+
+fn serialize_group(buf: &mut Vec<u8>, group: &OperationGroup) {
+    write_u32(buf, group.cursor_before.line as u32);
+    write_u32(buf, group.cursor_before.col as u32);
+    write_u32(buf, group.cursor_after.line as u32);
+    write_u32(buf, group.cursor_after.col as u32);
+    write_u32(buf, group.ops.len() as u32);
+    for op in &group.ops {
+        match op {
+            Operation::Insert { pos, data } => {
+                write_u8(buf, 0);
+                write_u64(buf, *pos as u64);
+                write_u32(buf, data.len() as u32);
+                buf.extend_from_slice(data);
+            }
+            Operation::Delete { pos, data } => {
+                write_u8(buf, 1);
+                write_u64(buf, *pos as u64);
+                write_u32(buf, data.len() as u32);
+                buf.extend_from_slice(data);
+            }
+        }
+    }
+}
+
+fn deserialize_group(data: &[u8], pos: &mut usize) -> Option<OperationGroup> {
+    let cb_line = read_u32(data, pos)? as usize;
+    let cb_col = read_u32(data, pos)? as usize;
+    let ca_line = read_u32(data, pos)? as usize;
+    let ca_col = read_u32(data, pos)? as usize;
+    let op_count = read_u32(data, pos)?;
+    if op_count > MAX_GROUPS {
+        return None;
+    }
+    let mut ops = Vec::with_capacity(op_count as usize);
+    for _ in 0..op_count {
+        let kind = read_u8(data, pos)?;
+        let op_pos = read_u64(data, pos)? as usize;
+        let data_len = read_u32(data, pos)? as usize;
+        if *pos + data_len > data.len() {
+            return None;
+        }
+        let op_data = data[*pos..*pos + data_len].to_vec();
+        *pos += data_len;
+        let op = match kind {
+            0 => Operation::Insert {
+                pos: op_pos,
+                data: op_data,
+            },
+            1 => Operation::Delete {
+                pos: op_pos,
+                data: op_data,
+            },
+            _ => return None,
+        };
+        ops.push(op);
+    }
+    Some(OperationGroup {
+        ops,
+        cursor_before: Pos::new(cb_line, cb_col),
+        cursor_after: Pos::new(ca_line, ca_col),
+    })
+}
+
+fn deserialize_groups(data: &[u8], pos: &mut usize) -> Option<Vec<OperationGroup>> {
+    let count = read_u32(data, pos)?;
+    if count > MAX_GROUPS {
+        return None;
+    }
+    let mut groups = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        groups.push(deserialize_group(data, pos)?);
+    }
+    Some(groups)
+}
+
+/// Save undo history to disk. Errors are silently ignored.
+pub fn save_undo_history(file_path: &Path, undo_stack: &UndoStack) {
+    let _ = save_undo_history_inner(file_path, undo_stack);
+}
+
+fn save_undo_history_inner(file_path: &Path, undo_stack: &UndoStack) -> Option<()> {
+    let meta = fs::metadata(file_path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let duration = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+
+    let (undo, redo) = undo_stack.stacks();
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(UNDO_MAGIC);
+    write_u8(&mut buf, UNDO_VERSION);
+    write_i64(&mut buf, duration.as_secs() as i64);
+    write_u32(&mut buf, duration.subsec_nanos());
+
+    write_u32(&mut buf, undo.len() as u32);
+    for group in undo {
+        serialize_group(&mut buf, group);
+    }
+    write_u32(&mut buf, redo.len() as u32);
+    for group in redo {
+        serialize_group(&mut buf, group);
+    }
+
+    let dir = undo_dir();
+    fs::create_dir_all(&dir).ok()?;
+    fs::write(undo_path(file_path), &buf).ok()?;
+    Some(())
+}
+
+/// Load undo history from disk. Errors and mtime mismatches silently ignored.
+pub fn load_undo_history(file_path: &Path, undo_stack: &mut UndoStack) {
+    let _ = load_undo_history_inner(file_path, undo_stack);
+}
+
+fn load_undo_history_inner(file_path: &Path, undo_stack: &mut UndoStack) -> Option<()> {
+    let undo_file = undo_path(file_path);
+    let data = fs::read(&undo_file).ok()?;
+
+    // Magic
+    if data.len() < 5 || &data[0..4] != UNDO_MAGIC {
+        let _ = fs::remove_file(&undo_file);
+        return None;
+    }
+    let mut pos = 4usize;
+
+    // Version
+    let version = read_u8(&data, &mut pos)?;
+    if version != UNDO_VERSION {
+        let _ = fs::remove_file(&undo_file);
+        return None;
+    }
+
+    // Mtime check
+    let stored_secs = read_i64(&data, &mut pos)?;
+    let stored_nanos = read_u32(&data, &mut pos)?;
+
+    let meta = fs::metadata(file_path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let duration = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    if stored_secs != duration.as_secs() as i64 || stored_nanos != duration.subsec_nanos() {
+        let _ = fs::remove_file(&undo_file);
+        return None;
+    }
+
+    // Deserialize stacks
+    let undo = deserialize_groups(&data, &mut pos)?;
+    let redo = deserialize_groups(&data, &mut pos)?;
+
+    undo_stack.restore(undo, redo);
+    Some(())
 }
 
 #[cfg(test)]
@@ -304,6 +534,187 @@ mod tests {
 
         fs::write(&path, b"12345").unwrap();
         assert_eq!(file_size(&path).unwrap(), 5);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- undo history persistence -------------------------------------------
+
+    fn make_test_stack() -> UndoStack {
+        let mut stack = UndoStack::new();
+        stack.record(
+            Operation::Insert {
+                pos: 0,
+                data: b"hello".to_vec(),
+            },
+            Pos::new(0, 0),
+            Pos::new(0, 5),
+        );
+        stack.seal();
+        stack.record(
+            Operation::Delete {
+                pos: 3,
+                data: b"lo".to_vec(),
+            },
+            Pos::new(0, 5),
+            Pos::new(0, 3),
+        );
+        stack.seal();
+        stack
+    }
+
+    #[test]
+    fn test_undo_history_roundtrip() {
+        let dir = std::env::temp_dir().join("e_test_undo_rt");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        fs::write(&path, b"hel").unwrap();
+
+        let stack = make_test_stack();
+        save_undo_history(&path, &stack);
+
+        let mut loaded = UndoStack::new();
+        load_undo_history(&path, &mut loaded);
+        let (undo, redo) = loaded.stacks();
+        assert_eq!(undo.len(), 2);
+        assert!(redo.is_empty());
+
+        // Verify first group
+        assert_eq!(undo[0].cursor_before, Pos::new(0, 0));
+        assert_eq!(undo[0].cursor_after, Pos::new(0, 5));
+        assert_eq!(undo[0].ops.len(), 1);
+
+        // Verify second group
+        assert_eq!(undo[1].cursor_before, Pos::new(0, 5));
+        assert_eq!(undo[1].cursor_after, Pos::new(0, 3));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_undo_history_with_redo() {
+        let dir = std::env::temp_dir().join("e_test_undo_redo");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        fs::write(&path, b"hel").unwrap();
+
+        let mut stack = make_test_stack();
+        stack.undo(); // move one group to redo
+
+        save_undo_history(&path, &stack);
+
+        let mut loaded = UndoStack::new();
+        load_undo_history(&path, &mut loaded);
+        let (undo, redo) = loaded.stacks();
+        assert_eq!(undo.len(), 1);
+        assert_eq!(redo.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_undo_history_mtime_mismatch() {
+        let dir = std::env::temp_dir().join("e_test_undo_mtime");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        fs::write(&path, b"hello").unwrap();
+
+        let stack = make_test_stack();
+        save_undo_history(&path, &stack);
+
+        // Modify the file (changes mtime)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(&path, b"changed").unwrap();
+
+        let mut loaded = UndoStack::new();
+        load_undo_history(&path, &mut loaded);
+        let (undo, redo) = loaded.stacks();
+        assert!(undo.is_empty());
+        assert!(redo.is_empty());
+
+        // Undo file should be deleted
+        assert!(!undo_path(&path).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_undo_history_corrupt_data() {
+        let dir = std::env::temp_dir().join("e_test_undo_corrupt");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        fs::write(&path, b"hello").unwrap();
+
+        // Write garbage to undo file
+        let _ = fs::create_dir_all(undo_dir());
+        fs::write(undo_path(&path), b"garbage data here").unwrap();
+
+        let mut loaded = UndoStack::new();
+        load_undo_history(&path, &mut loaded);
+        let (undo, redo) = loaded.stacks();
+        assert!(undo.is_empty());
+        assert!(redo.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_undo_history_empty_stacks() {
+        let dir = std::env::temp_dir().join("e_test_undo_empty");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        fs::write(&path, b"hello").unwrap();
+
+        let stack = UndoStack::new();
+        save_undo_history(&path, &stack);
+
+        let mut loaded = UndoStack::new();
+        load_undo_history(&path, &mut loaded);
+        let (undo, redo) = loaded.stacks();
+        assert!(undo.is_empty());
+        assert!(redo.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_undo_history_bad_magic() {
+        let dir = std::env::temp_dir().join("e_test_undo_magic");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        fs::write(&path, b"hello").unwrap();
+
+        let _ = fs::create_dir_all(undo_dir());
+        fs::write(undo_path(&path), b"BADMagic").unwrap();
+
+        let mut loaded = UndoStack::new();
+        load_undo_history(&path, &mut loaded);
+        let (undo, redo) = loaded.stacks();
+        assert!(undo.is_empty());
+        assert!(redo.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_undo_history_bad_version() {
+        let dir = std::env::temp_dir().join("e_test_undo_ver");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        fs::write(&path, b"hello").unwrap();
+
+        // Write valid magic but bad version
+        let mut data = Vec::new();
+        data.extend_from_slice(UNDO_MAGIC);
+        data.push(99); // bad version
+        let _ = fs::create_dir_all(undo_dir());
+        fs::write(undo_path(&path), &data).unwrap();
+
+        let mut loaded = UndoStack::new();
+        load_undo_history(&path, &mut loaded);
+        let (undo, redo) = loaded.stacks();
+        assert!(undo.is_empty());
+        assert!(redo.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
