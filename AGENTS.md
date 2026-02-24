@@ -29,7 +29,7 @@ src/
   command.rs         CommandRegistry: HashMap<String, CommandFn>, built-in commands
   command_buffer.rs  Modal mini-editor for command palette, find, goto, save-as prompt, sudo password; tab completion; paste support (newlines stripped)
   clipboard.rs       Platform-detected clipboard: pbcopy/wl-copy/xclip/xsel/internal fallback
-  file_io.rs         Read/write files, CRLF→LF normalization, binary detection, trailing whitespace strip, file locking, persistent undo history (binary format in ~/.config/e/undo/)
+  file_io.rs         Read/write files, CRLF→LF normalization, binary detection, trailing whitespace strip, file locking, persistent undo history (single binary file ~/.config/e/undo.bin)
   language.rs        Language detection by file extension (~45 languages), comment syntax lookup
   signal.rs          SIGWINCH handler via libc::sigaction + AtomicBool polling
   highlight.rs       Syntax highlighting: byte-by-byte highlighter, HlType/HlState types, per-language rules (15 languages), dedicated JSON/YAML/Markdown highlighters, semver detection, bracket matching, operator highlighting
@@ -41,7 +41,7 @@ src/
 - **Document** (`document.rs`): Owns `GapBuffer` + `UndoStack` + `dirty: bool` + `filename: Option<String>`. All mutations (`insert`, `delete_range`) record undo operations.
 - **Pos** (`selection.rs`): `{ line: usize, col: usize }` — 0-indexed, col is character index not byte offset. Implements `Ord`.
 - **Selection** (`selection.rs`): `{ anchor: Pos, cursor: Pos }`. `anchor == cursor` means no selection. `ordered()` returns `(start, end)`.
-- **UndoStack** (`operation.rs`): Groups operations automatically by: kind change (insert vs delete), word boundary (space/newline), time gap (>1s), cursor jump, or explicit `seal()`. `seal()` immediately flushes the current group for atomic undo of paste/comment operations. `begin_group()`/`end_group()` force all enclosed operations into a single undo step (used by indent/dedent/comment toggle on selections). `stacks()`/`restore()` enable serialization for persistent undo. History persisted to `~/.config/e/undo/<encoded_path>.undo` in binary format with mtime validation — stale history (file modified externally) is silently discarded.
+- **UndoStack** (`operation.rs`): Groups operations automatically by: kind change (insert vs delete), word boundary (space/newline), time gap (>1s), cursor jump, or explicit `seal()`. `seal()` immediately flushes the current group for atomic undo of paste/comment operations. `begin_group()`/`end_group()` force all enclosed operations into a single undo step (used by indent/dedent/comment toggle on selections). `stacks()`/`restore()` enable serialization for persistent undo. All histories stored in a single binary file `~/.config/e/undo.bin` with length-prefixed entries and mtime validation — stale history (file modified externally) is silently discarded.
 - **Editor** (`editor.rs`): Owns everything. Event loop uses `mpsc` channels — background thread for stdin (or `/dev/tty` when stdin is piped). SIGWINCH polled via atomic flag on 500ms timeout. Main thread does `recv_timeout(500ms)` for status message expiry.
 
 ## Event Loop
@@ -163,4 +163,4 @@ Entered via `^p` command palette. Available commands:
 - [x] YAML key/value distinction (keys yellow, quoted strings green, anchors/aliases cyan, comments grey)
 - [x] Semver version highlighting (v1.2.3, 0.3.5-beta.1 → cyan, works inside strings, skips comments, all languages)
 - [x] Operator highlighting (`&&`, `||`, `==`, `!=`, `<=`, `>=`, `=>`, `->`, `:=`, `===`, `!==` — per-language sets, yellow)
-- [x] Persistent undo history (`~/.config/e/undo/`) — survives editor restarts, validated by file mtime, binary format, silently discarded on external modification
+- [x] Persistent undo history (`~/.config/e/undo.bin`) — survives editor restarts, single binary file with length-prefixed entries, validated by file mtime, silently discarded on external modification
