@@ -151,6 +151,28 @@ fn undo_db_path() -> PathBuf {
     PathBuf::from(home).join(".config/e/undo.bin")
 }
 
+/// Acquire an exclusive flock on an open file. Returns false if it fails.
+fn flock_exclusive(file: &fs::File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) == 0 }
+}
+
+/// Acquire a shared flock on an open file.
+fn flock_shared(file: &fs::File) {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_SH);
+    }
+}
+
+/// Release flock on an open file.
+fn flock_unlock(file: &fs::File) {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+}
+
 // Binary encoding helpers
 
 fn write_u8(buf: &mut Vec<u8>, v: u8) {
@@ -280,18 +302,41 @@ fn deserialize_groups(data: &[u8], pos: &mut usize) -> Option<Vec<OperationGroup
     Some(groups)
 }
 
-/// Peek at the path field at the start of an entry body (without advancing pos past it).
-fn entry_path_bytes(data: &[u8], entry_start: usize) -> Option<&[u8]> {
+/// Peek at the path and mtime fields at the start of an entry body.
+/// Returns `(path_bytes, mtime_secs, mtime_nanos)`.
+fn entry_header(data: &[u8], entry_start: usize) -> Option<(&[u8], i64, u32)> {
     let mut p = entry_start;
     let path_len = read_u32(data, &mut p)? as usize;
     if p + path_len > data.len() {
         return None;
     }
-    Some(&data[p..p + path_len])
+    let path = &data[p..p + path_len];
+    p += path_len;
+    let secs = read_i64(data, &mut p)?;
+    let nanos = read_u32(data, &mut p)?;
+    Some((path, secs, nanos))
+}
+
+/// Check if an entry's mtime still matches the file on disk.
+fn entry_mtime_valid(path: &[u8], stored_secs: i64, stored_nanos: u32) -> bool {
+    let path_str = std::str::from_utf8(path).ok();
+    let Some(path_str) = path_str else {
+        return false;
+    };
+    let Ok(meta) = fs::metadata(path_str) else {
+        return false; // file deleted
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    let duration = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    stored_secs == duration.as_secs() as i64 && stored_nanos == duration.subsec_nanos()
 }
 
 /// Scan entries in a db blob, collecting raw byte ranges of entries whose path
-/// does NOT match `exclude_path`. Returns `(kept_entry_bytes, kept_count)`.
+/// does NOT match `exclude_path` and whose mtime is still valid.
 fn collect_kept_entries<'a>(data: &'a [u8], exclude_path: &[u8]) -> (Vec<&'a [u8]>, u32) {
     let mut kept = Vec::new();
     let header_len = 4 + 1 + 4; // magic + version + entry_count
@@ -313,7 +358,10 @@ fn collect_kept_entries<'a>(data: &'a [u8], exclude_path: &[u8]) -> (Vec<&'a [u8
         }
         let entry_body = &data[pos..pos + entry_len];
         pos += entry_len;
-        if entry_path_bytes(data, pos - entry_len).is_some_and(|p| p != exclude_path) {
+        if let Some((path, secs, nanos)) = entry_header(data, pos - entry_len)
+            && path != exclude_path
+            && entry_mtime_valid(path, secs, nanos)
+        {
             kept.push(entry_body);
         }
     }
@@ -353,7 +401,22 @@ fn save_undo_history_to(db_path: &Path, file_path: &Path, undo_stack: &UndoStack
         serialize_group(&mut entry, group);
     }
 
-    // Read existing db, keep entries for other paths (as raw bytes)
+    // Ensure parent dir exists, open db file, lock it
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent).ok()?;
+    }
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(db_path)
+        .ok()?;
+    if !flock_exclusive(&lock_file) {
+        return None;
+    }
+
+    // Read existing db under lock, keep fresh entries for other paths
     let existing = fs::read(db_path).unwrap_or_default();
     let (kept, kept_count) = collect_kept_entries(&existing, path_bytes);
 
@@ -369,10 +432,8 @@ fn save_undo_history_to(db_path: &Path, file_path: &Path, undo_stack: &UndoStack
     write_u32(&mut buf, entry.len() as u32);
     buf.extend_from_slice(&entry);
 
-    if let Some(parent) = db_path.parent() {
-        fs::create_dir_all(parent).ok()?;
-    }
     fs::write(db_path, &buf).ok()?;
+    flock_unlock(&lock_file);
     Some(())
 }
 
@@ -390,6 +451,9 @@ fn load_undo_history_from(
     let abs_str = abs_path.to_string_lossy();
     let target_path = abs_str.as_bytes();
 
+    // Shared lock to prevent reading a half-written file
+    let lock_file = fs::File::open(db_path).ok()?;
+    flock_shared(&lock_file);
     let data = fs::read(db_path).ok()?;
     if data.len() < 9 || &data[0..4] != UNDO_MAGIC {
         return None;
@@ -856,6 +920,76 @@ mod tests {
         let mut loaded = UndoStack::new();
         load_undo_history_from(&db, &path, &mut loaded);
         assert_eq!(loaded.stacks().0.len(), 1); // new stack, not old
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_undo_history_prunes_stale_entries() {
+        let dir = std::env::temp_dir().join("e_test_undo_prune");
+        let _ = fs::create_dir_all(&dir);
+        let path_a = dir.join("a.txt");
+        let path_b = dir.join("b.txt");
+        let db = dir.join("undo.bin");
+        fs::write(&path_a, b"aaa").unwrap();
+        fs::write(&path_b, b"bbb").unwrap();
+
+        // Save undo for both files
+        let stack = make_test_stack();
+        save_undo_history_to(&db, &path_a, &stack);
+        save_undo_history_to(&db, &path_b, &stack);
+        let size_before = fs::metadata(&db).unwrap().len();
+
+        // Externally modify file_a (invalidates its mtime)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(&path_a, b"modified").unwrap();
+
+        // Save file_b again — should prune file_a's stale entry
+        save_undo_history_to(&db, &path_b, &stack);
+        let size_after = fs::metadata(&db).unwrap().len();
+        assert!(
+            size_after < size_before,
+            "db should shrink after pruning stale entry"
+        );
+
+        // file_a's entry should be gone
+        let mut loaded = UndoStack::new();
+        load_undo_history_from(&db, &path_a, &mut loaded);
+        assert!(loaded.stacks().0.is_empty());
+
+        // file_b's entry should still work
+        let mut loaded_b = UndoStack::new();
+        load_undo_history_from(&db, &path_b, &mut loaded_b);
+        assert_eq!(loaded_b.stacks().0.len(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_undo_history_prunes_deleted_file() {
+        let dir = std::env::temp_dir().join("e_test_undo_deleted");
+        let _ = fs::create_dir_all(&dir);
+        let path_a = dir.join("a.txt");
+        let path_b = dir.join("b.txt");
+        let db = dir.join("undo.bin");
+        fs::write(&path_a, b"aaa").unwrap();
+        fs::write(&path_b, b"bbb").unwrap();
+
+        let stack = make_test_stack();
+        save_undo_history_to(&db, &path_a, &stack);
+        save_undo_history_to(&db, &path_b, &stack);
+
+        // Delete file_a
+        fs::remove_file(&path_a).unwrap();
+
+        // Saving file_b should prune the deleted file_a entry
+        save_undo_history_to(&db, &path_b, &stack);
+
+        // Re-create file_a — its old undo entry should be gone
+        fs::write(&path_a, b"aaa").unwrap();
+        let mut loaded = UndoStack::new();
+        load_undo_history_from(&db, &path_a, &mut loaded);
+        assert!(loaded.stacks().0.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
