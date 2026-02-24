@@ -1657,6 +1657,14 @@ impl Editor {
                 if is_blank {
                     continue;
                 }
+                // Skip lines that are already commented
+                let indent_pos = text
+                    .iter()
+                    .position(|&b| b != b' ' && b != b'\t')
+                    .unwrap_or(text.len());
+                if text[indent_pos..].starts_with(prefix.as_bytes()) {
+                    continue;
+                }
                 self.doc
                     .insert(line_idx, min_indent_chars, prefix.as_bytes());
             }
@@ -4171,6 +4179,21 @@ mod tests {
         // The blank line should stay blank (not get "// " prefix)
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[1], "");
+    }
+
+    #[test]
+    fn test_toggle_comment_skips_already_commented() {
+        let mut e = ed_named("aaa\n// bbb\nccc\n", "test.rs");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(2, 3),
+        };
+        e.toggle_comment();
+        let text = e.test_text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "// aaa");
+        assert_eq!(lines[1], "// bbb"); // not double-commented
+        assert_eq!(lines[2], "// ccc");
     }
 
     // ========================================================================

@@ -151,7 +151,7 @@ Entered via `^p` command palette. Available commands:
 - [x] Timed status messages
 - [x] Toggle ruler (`^r`)
 - [x] Language detection (~45 languages by file extension)
-- [x] Comment toggle (`^d` / `comment` command, language-aware)
+- [x] Comment toggle (`^d` / `command` command, language-aware, skips already-commented lines to avoid double-commenting)
 - [x] Tab completion in command palette
 - [x] Tab display as dark grey pipes
 - [x] Find navigation mode (jumps to first match as you type, up/down browse matches, "match X of Y", current match green, centers viewport on match, exits to selection)
