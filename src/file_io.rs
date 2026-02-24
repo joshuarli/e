@@ -134,6 +134,11 @@ pub fn file_size(path: &Path) -> io::Result<u64> {
     Ok(fs::metadata(path)?.len())
 }
 
+/// File modification time, or None if unavailable.
+pub fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
+}
+
 // -- persistent undo history ------------------------------------------------
 //
 // All undo histories stored in a single file: ~/.config/e/undo.bin
@@ -1040,6 +1045,22 @@ mod tests {
         let s = lp.to_string_lossy();
         assert!(s.ends_with(".elock"));
         assert!(s.contains("buffers"));
+    }
+
+    #[test]
+    fn test_file_mtime_exists() {
+        let dir = std::env::temp_dir().join("e_test_mtime_exists");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        fs::write(&path, b"hello").unwrap();
+        assert!(file_mtime(&path).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_file_mtime_nonexistent() {
+        let path = std::path::Path::new("/tmp/e_nonexistent_file_mtime_test.txt");
+        assert!(file_mtime(path).is_none());
     }
 
     #[test]

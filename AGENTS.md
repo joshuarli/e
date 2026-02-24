@@ -176,3 +176,4 @@ Entered via `^p` command palette. Available commands:
 - [x] Operator highlighting (`&&`, `||`, `==`, `!=`, `<=`, `>=`, `=>`, `->`, `:=`, `===`, `!==` — per-language sets, yellow)
 - [x] Select above/below (`Ctrl+Shift+Up/Down` — select from cursor to start/end of file)
 - [x] Persistent undo history (`~/.config/e/undo.bin`) — survives editor restarts, single binary file with length-prefixed entries, validated by file mtime, silently discarded on external modification
+- [x] External file change detection via terminal focus events (`\x1b[?1004h`) — one `stat()` per focus-in, zero polling overhead, prompts reload (y/n), clamps cursor on reload

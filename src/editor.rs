@@ -26,6 +26,7 @@ const PASTE_START: &[u8] = &[0x1b, b'[', b'2', b'0', b'0', b'~'];
 const PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
 const CTRL_SHIFT_UP: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'A'];
 const CTRL_SHIFT_DOWN: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'B'];
+const FOCUS_IN: &[u8] = &[0x1b, b'[', b'I'];
 
 fn is_paste_start(ev: &Event) -> bool {
     matches!(ev, Event::Unsupported(bytes) if bytes == PASTE_START)
@@ -84,6 +85,10 @@ pub struct Editor {
     sudo_save_tmp: Option<String>,
     /// True when stdin was a pipe (e.g. `git show | e`).
     piped_stdin: bool,
+    /// Cached file mtime for external modification detection.
+    file_mtime: Option<std::time::SystemTime>,
+    /// Waiting for y/n response to reload prompt.
+    reload_pending: bool,
 }
 
 enum EditorEvent {
@@ -99,6 +104,10 @@ impl Editor {
         let mut keybindings = KeybindingTable::with_defaults();
         keybindings.load_config();
         let mut doc = Document::new(text, filename);
+        let file_mtime = doc
+            .filename
+            .as_ref()
+            .and_then(|name| crate::file_io::file_mtime(std::path::Path::new(name)));
         if let Some(ref name) = doc.filename {
             let path = std::path::Path::new(name);
             if path.exists() {
@@ -130,13 +139,18 @@ impl Editor {
             find_active: false,
             sudo_save_tmp: None,
             piped_stdin,
+            file_mtime,
+            reload_pending: false,
         }
     }
 
     pub fn run(&mut self) -> io::Result<()> {
         let mut stdout = stdout().into_raw_mode()?.into_alternate_screen()?;
 
-        write!(stdout, "\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h")?;
+        write!(
+            stdout,
+            "\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1004h"
+        )?;
         stdout.flush()?;
 
         let (tx, rx) = mpsc::channel::<EditorEvent>();
@@ -226,7 +240,10 @@ impl Editor {
             }
         }
 
-        write!(stdout, "\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l")?;
+        write!(
+            stdout,
+            "\x1b[?1004l\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l"
+        )?;
         stdout.flush()?;
         Ok(())
     }
@@ -411,7 +428,9 @@ impl Editor {
                 }
             }
             Event::Unsupported(bytes) => {
-                if !self.cmd_buf.active {
+                if bytes == FOCUS_IN {
+                    self.check_external_modification();
+                } else if !self.cmd_buf.active {
                     if bytes == CTRL_SHIFT_UP {
                         self.select_above();
                     } else if bytes == CTRL_SHIFT_DOWN {
@@ -439,6 +458,15 @@ impl Editor {
                     self.status_msg.clear();
                     self.status_time = None;
                 }
+            }
+            return;
+        }
+
+        // Handle reload confirmation
+        if self.reload_pending {
+            match key {
+                Key::Char('y') | Key::Char('Y') => self.reload_file(),
+                _ => self.dismiss_reload(),
             }
             return;
         }
@@ -1762,6 +1790,67 @@ impl Editor {
         }
     }
 
+    fn check_external_modification(&mut self) {
+        if self.reload_pending || self.cmd_buf.active || self.quit_pending {
+            return;
+        }
+        let Some(ref name) = self.doc.filename else {
+            return;
+        };
+        let path = std::path::Path::new(name);
+        let disk_mtime = crate::file_io::file_mtime(path);
+        if disk_mtime != self.file_mtime && disk_mtime.is_some() {
+            let short = path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| name.clone());
+            self.status_msg = format!("{} changed on disk. Reload? (y/n)", short);
+            self.status_time = None;
+            self.reload_pending = true;
+        }
+    }
+
+    fn reload_file(&mut self) {
+        let Some(name) = self.doc.filename.clone() else {
+            return;
+        };
+        let read_result = crate::file_io::read_file(std::path::Path::new(&name));
+        match read_result {
+            Ok(data) => {
+                let path = std::path::Path::new(&name);
+                self.file_mtime = crate::file_io::file_mtime(path);
+                self.doc = Document::new(data, Some(name));
+                // Clamp cursor to valid position in new buffer
+                let lc = self.doc.buf.line_count();
+                if self.sel.cursor.line >= lc {
+                    let last = lc.saturating_sub(1);
+                    self.sel = Selection::caret(Pos::new(last, self.doc.buf.line_char_len(last)));
+                } else {
+                    let len = self.doc.buf.line_char_len(self.sel.cursor.line);
+                    if self.sel.cursor.col > len {
+                        self.sel.cursor.col = len;
+                    }
+                    self.sel.anchor = self.sel.cursor;
+                }
+                self.desired_col = None;
+                self.find_matches.clear();
+                self.renderer.force_full_redraw();
+                self.set_status("Reloaded".to_string());
+            }
+            Err(e) => self.set_status(format!("Reload failed: {}", e)),
+        }
+        self.reload_pending = false;
+    }
+
+    fn dismiss_reload(&mut self) {
+        if let Some(ref name) = self.doc.filename {
+            self.file_mtime = crate::file_io::file_mtime(std::path::Path::new(name));
+        }
+        self.reload_pending = false;
+        self.status_msg.clear();
+        self.status_time = None;
+    }
+
     fn save_file(&mut self) {
         if self.doc.filename.is_some() {
             self.strip_trailing_whitespace();
@@ -1790,6 +1879,7 @@ impl Editor {
                 Ok(()) => {
                     self.doc.dirty = false;
                     self.doc.seal_undo();
+                    self.file_mtime = crate::file_io::file_mtime(path_ref);
                     crate::file_io::save_undo_history(path_ref, &self.doc.undo_stack);
                     self.set_status(format!("Saved {}", path));
                 }
@@ -1898,6 +1988,7 @@ impl Editor {
             Ok(s) if s.success() => {
                 self.doc.dirty = false;
                 self.doc.seal_undo();
+                self.file_mtime = crate::file_io::file_mtime(path_ref);
                 crate::file_io::save_undo_history(path_ref, &self.doc.undo_stack);
                 self.set_status(format!("Saved {} (sudo)", path));
             }
@@ -1948,6 +2039,8 @@ mod tests {
             find_active: false,
             sudo_save_tmp: None,
             piped_stdin: false,
+            file_mtime: None,
+            reload_pending: false,
         }
     }
 
@@ -4242,5 +4335,148 @@ mod tests {
         e.handle_cmd_result(mode, result);
         // "goto" and "gotoline" both start with "goto"
         // Depending on commands available, this should complete to at least "goto"
+    }
+
+    // ========================================================================
+    // External file change detection
+    // ========================================================================
+
+    #[test]
+    fn test_check_external_modification_detects_change() {
+        let dir = std::env::temp_dir().join("e_test_ext_mod");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        std::fs::write(&path, b"original").unwrap();
+
+        let mut e = ed_named("original", path.to_str().unwrap());
+        e.file_mtime = crate::file_io::file_mtime(&path);
+        assert!(!e.reload_pending);
+
+        // Modify file externally
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, b"changed").unwrap();
+
+        e.check_external_modification();
+        assert!(e.reload_pending);
+        assert!(e.status_msg.contains("changed on disk"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reload_file_replaces_buffer() {
+        let dir = std::env::temp_dir().join("e_test_reload_buf");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        std::fs::write(&path, b"original\n").unwrap();
+
+        let mut e = ed_named("original\n", path.to_str().unwrap());
+        e.file_mtime = crate::file_io::file_mtime(&path);
+
+        // Modify file externally
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, b"new content\n").unwrap();
+
+        e.reload_pending = true;
+        e.reload_file();
+        assert!(!e.reload_pending);
+        assert!(e.test_text().contains("new content"));
+        assert!(e.status_msg.contains("Reloaded"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_dismiss_reload_updates_mtime() {
+        let dir = std::env::temp_dir().join("e_test_dismiss");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        std::fs::write(&path, b"original").unwrap();
+
+        let mut e = ed_named("original", path.to_str().unwrap());
+        e.file_mtime = crate::file_io::file_mtime(&path);
+
+        // Modify file externally
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, b"changed").unwrap();
+        let new_mtime = crate::file_io::file_mtime(&path);
+
+        e.reload_pending = true;
+        e.status_msg = "test.txt changed on disk. Reload? (y/n)".to_string();
+        e.dismiss_reload();
+        assert!(!e.reload_pending);
+        assert!(e.status_msg.is_empty());
+        assert_eq!(e.file_mtime, new_mtime);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reload_clamps_cursor() {
+        let dir = std::env::temp_dir().join("e_test_reload_clamp");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        std::fs::write(&path, b"line1\nline2\nline3\n").unwrap();
+
+        let mut e = ed_named("line1\nline2\nline3\n", path.to_str().unwrap());
+        e.file_mtime = crate::file_io::file_mtime(&path);
+        // Put cursor on line 2
+        e.sel = Selection::caret(Pos::new(2, 3));
+
+        // Replace with shorter file
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, b"short\n").unwrap();
+
+        e.reload_pending = true;
+        e.reload_file();
+        // Cursor should be clamped to last line
+        assert!(e.sel.cursor.line < e.doc.buf.line_count());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_no_reload_for_unnamed() {
+        let mut e = ed("hello");
+        e.check_external_modification();
+        assert!(!e.reload_pending);
+        assert!(e.status_msg.is_empty());
+    }
+
+    #[test]
+    fn test_focus_in_event() {
+        let dir = std::env::temp_dir().join("e_test_focus_in");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        std::fs::write(&path, b"original").unwrap();
+
+        let mut e = ed_named("original", path.to_str().unwrap());
+        e.file_mtime = crate::file_io::file_mtime(&path);
+
+        // Modify file externally
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, b"changed").unwrap();
+
+        // Send focus-in event
+        e.handle_event(Event::Unsupported(FOCUS_IN.to_vec()));
+        assert!(e.reload_pending);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_save_updates_mtime() {
+        let dir = std::env::temp_dir().join("e_test_save_mtime");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        std::fs::write(&path, b"hello\n").unwrap();
+
+        let mut e = ed_named("hello\n", path.to_str().unwrap());
+        assert!(e.file_mtime.is_none()); // ed_named doesn't set mtime
+
+        e.save_file();
+        assert!(e.file_mtime.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
