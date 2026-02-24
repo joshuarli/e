@@ -377,4 +377,66 @@ mod tests {
             CommandBufferResult::Continue
         ));
     }
+
+    #[test]
+    fn test_sudo_save_display_masked() {
+        let mut cb = CommandBuffer::new();
+        cb.open(CommandBufferMode::SudoSave, "password: ", "");
+        cb.handle_key(Key::Char('s'));
+        cb.handle_key(Key::Char('e'));
+        cb.handle_key(Key::Char('c'));
+        assert_eq!(cb.display_line(), "password: ***");
+    }
+
+    #[test]
+    fn test_ctrl_q_cancels() {
+        let mut cb = CommandBuffer::new();
+        cb.open(CommandBufferMode::Command, "> ", "test");
+        assert!(matches!(
+            cb.handle_key(Key::Ctrl('q')),
+            CommandBufferResult::Cancel
+        ));
+    }
+
+    #[test]
+    fn test_insert_str() {
+        let mut cb = CommandBuffer::new();
+        cb.open(CommandBufferMode::Command, "> ", "");
+        match cb.insert_str("hello\nworld") {
+            CommandBufferResult::Changed(s) => assert_eq!(s, "helloworld"), // newlines filtered
+            _ => panic!("expected Changed"),
+        }
+    }
+
+    #[test]
+    fn test_tab_requests_completion() {
+        let mut cb = CommandBuffer::new();
+        cb.open(CommandBufferMode::Command, "> ", "sav");
+        cb.completions = vec!["save".to_string()];
+        match cb.handle_key(Key::Char('\t')) {
+            CommandBufferResult::TabComplete => {}
+            _ => panic!("expected TabComplete"),
+        }
+        // Tab clears completions
+        assert!(cb.completions.is_empty());
+    }
+
+    #[test]
+    fn test_history_down_no_idx_noop() {
+        let mut cb = CommandBuffer::new();
+        cb.history = vec!["first".to_string()];
+        cb.open(CommandBufferMode::Command, "> ", "");
+        // Down without having navigated up should do nothing
+        cb.handle_key(Key::Down);
+        assert_eq!(cb.input, "");
+    }
+
+    #[test]
+    fn test_close_clears_completions() {
+        let mut cb = CommandBuffer::new();
+        cb.open(CommandBufferMode::Command, "> ", "test");
+        cb.completions = vec!["comp1".to_string()];
+        cb.close();
+        assert!(cb.completions.is_empty());
+    }
 }

@@ -102,3 +102,51 @@ fn read_from_command(cmd: &str, args: &[&str]) -> String {
         Err(_) => String::new(),
     }
 }
+
+#[cfg(test)]
+impl Clipboard {
+    pub(crate) fn internal_only() -> Self {
+        Self {
+            backend: ClipboardBackend::Internal,
+            internal: String::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_internal_copy_paste() {
+        let mut clip = Clipboard::internal_only();
+        clip.copy("hello world");
+        assert_eq!(clip.paste(), "hello world");
+    }
+
+    #[test]
+    fn test_internal_overwrite() {
+        let mut clip = Clipboard::internal_only();
+        clip.copy("first");
+        clip.copy("second");
+        assert_eq!(clip.paste(), "second");
+    }
+
+    #[test]
+    fn test_internal_empty() {
+        let clip = Clipboard::internal_only();
+        assert_eq!(clip.paste(), "");
+    }
+
+    #[test]
+    fn test_detect_does_not_panic() {
+        let _clip = Clipboard::detect();
+    }
+
+    #[test]
+    fn test_internal_multiline() {
+        let mut clip = Clipboard::internal_only();
+        clip.copy("line1\nline2\nline3");
+        assert_eq!(clip.paste(), "line1\nline2\nline3");
+    }
+}

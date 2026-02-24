@@ -2826,4 +2826,206 @@ mod tests {
             Some(Pos::new(0, 0))
         );
     }
+
+    // -- INI section edge cases -----------------------------------------------
+
+    #[test]
+    fn test_ini_empty_value() {
+        let hl = hl_types(b"key =", &INI_RULES);
+        assert_range(&hl, 0..3, HlType::Keyword, "ini key");
+    }
+
+    #[test]
+    fn test_ini_no_equals() {
+        let hl = hl_types(b"just text", &INI_RULES);
+        // Without = sign, this isn't a key=value pair
+        assert!(hl.iter().all(|&h| h != HlType::Keyword));
+    }
+
+    // -- YAML edge cases ------------------------------------------------------
+
+    #[test]
+    fn test_yaml_multiline_string() {
+        let lines: &[&[u8]] = &[b"description: |", b"  multi line", b"  text here"];
+        let hls = hl_multiline(lines, &YAML_RULES);
+        assert_range(&hls[0], 0..11, HlType::Keyword, "description key");
+    }
+
+    #[test]
+    fn test_yaml_empty_value() {
+        let hl = hl_types(b"key:", &YAML_RULES);
+        assert_range(&hl, 0..3, HlType::Keyword, "yaml key");
+    }
+
+    // -- Markdown edge cases --------------------------------------------------
+
+    #[test]
+    fn test_markdown_fenced_code_block_with_language() {
+        let lines: &[&[u8]] = &[b"```rust", b"fn main() {}", b"```"];
+        let hls = hl_multiline(lines, &MARKDOWN_RULES);
+        assert!(
+            hls[0].iter().all(|&h| h == HlType::String),
+            "fence open with lang"
+        );
+        assert!(
+            hls[1].iter().all(|&h| h == HlType::String),
+            "fenced content"
+        );
+        assert!(hls[2].iter().all(|&h| h == HlType::String), "fence close");
+    }
+
+    #[test]
+    fn test_markdown_blockquote() {
+        let hl = hl_types(b"> quoted text", &MARKDOWN_RULES);
+        // Blockquote marker should be highlighted as Comment
+        assert_eq!(hl[0], HlType::Comment);
+    }
+
+    // -- rules_for_language ---------------------------------------------------
+
+    #[test]
+    fn test_rules_for_language_known() {
+        assert!(rules_for_language("Rust").is_some());
+        assert!(rules_for_language("Python").is_some());
+        assert!(rules_for_language("Config").is_some());
+    }
+
+    #[test]
+    fn test_rules_for_language_unknown() {
+        assert!(rules_for_language("Brainfuck").is_none());
+    }
+
+    // -- byte_hl_to_char_hl with multi-byte chars -----------------------------
+
+    #[test]
+    fn test_byte_hl_to_char_hl_multibyte() {
+        // "é" is 2 bytes → 1 char highlight
+        let text = "é".as_bytes();
+        let byte_hl = vec![HlType::String; text.len()];
+        let char_hl = byte_hl_to_char_hl(text, &byte_hl);
+        assert_eq!(char_hl.len(), 1);
+        assert_eq!(char_hl[0], HlType::String);
+    }
+
+    // -- Coverage gap: ansi_code for all HlType variants (lines 61-65) --------
+
+    #[test]
+    fn test_ansi_code_all_variants() {
+        assert_eq!(HlType::Normal.ansi_code(), "");
+        assert!(!HlType::Comment.ansi_code().is_empty());
+        assert!(!HlType::Keyword.ansi_code().is_empty());
+        assert!(!HlType::Type.ansi_code().is_empty());
+        assert!(!HlType::String.ansi_code().is_empty());
+        assert!(!HlType::Number.ansi_code().is_empty());
+        assert!(!HlType::Bracket.ansi_code().is_empty());
+        assert!(!HlType::Operator.ansi_code().is_empty());
+    }
+
+    // -- Coverage gap: multiline string continuation (lines 166-169, 184-185) --
+
+    #[test]
+    fn test_multiline_string_continuation() {
+        let rules = rules_for_language("Python").unwrap();
+        // Start a triple-quoted string that doesn't close
+        let line1 = b"x = \"\"\"hello";
+        let (_hl1, state1) = highlight_line(line1, HlState::Normal, rules);
+        assert!(matches!(state1, HlState::MultiLineString(_)));
+        // Continuation line with escape
+        let line2 = b"world \\n more";
+        let (hl2, state2) = highlight_line(line2, state1, rules);
+        // All characters should be string
+        assert_eq!(hl2[0], HlType::String);
+        assert!(matches!(state2, HlState::MultiLineString(_)));
+        // Closing line
+        let line3 = b"end\"\"\"";
+        let (_hl3, state3) = highlight_line(line3, state2, rules);
+        assert_eq!(state3, HlState::Normal);
+    }
+
+    // -- Coverage gap: unclosed non-multiline string (line 266) ---------------
+
+    #[test]
+    fn test_unclosed_string_single_line() {
+        let rules = rules_for_language("Rust").unwrap();
+        let line = b"let s = \"unterminated";
+        let (hl, state) = highlight_line(line, HlState::Normal, rules);
+        // The string characters should be highlighted as String
+        assert_eq!(hl[8], HlType::String); // opening quote
+        assert_eq!(state, HlState::Normal);
+    }
+
+    // -- Coverage gap: float starting with dot (line 330) ---------------------
+
+    #[test]
+    fn test_number_starting_with_dot() {
+        let rules = rules_for_language("Rust").unwrap();
+        let line = b"let x = .5;";
+        let (hl, _) = highlight_line(line, HlState::Normal, rules);
+        assert_eq!(hl[8], HlType::Number); // .
+        assert_eq!(hl[9], HlType::Number); // 5
+    }
+
+    // -- Coverage gap: semver pre-release (lines 433-436) ---------------------
+
+    #[test]
+    fn test_semver_pre_release() {
+        let rules = rules_for_language("TOML").unwrap();
+        let line = b"version = \"1.2.3-beta.1\"";
+        let (hl, _) = highlight_line(line, HlState::Normal, rules);
+        // The version inside quotes should be Type (cyan/semver)
+        assert_eq!(hl[11], HlType::Type); // '1' of version
+    }
+
+    // -- Coverage gap: YAML anchor/alias (lines 621-629) ----------------------
+
+    #[test]
+    fn test_yaml_anchor() {
+        let line = b"&my_anchor";
+        let mut hl = vec![HlType::Normal; line.len()];
+        highlight_yaml_content(line, &mut hl);
+        assert_eq!(hl[0], HlType::Type); // '&'
+        assert_eq!(hl[1], HlType::Type); // 'm'
+    }
+
+    #[test]
+    fn test_yaml_alias() {
+        let line = b"*my_alias";
+        let mut hl = vec![HlType::Normal; line.len()];
+        highlight_yaml_content(line, &mut hl);
+        assert_eq!(hl[0], HlType::Type);
+    }
+
+    // -- Coverage gap: YAML list item with key:value (lines 655-661) ----------
+
+    #[test]
+    fn test_yaml_list_item_with_key() {
+        let line = b"- name: value";
+        let mut hl = vec![HlType::Normal; line.len()];
+        highlight_yaml_content(line, &mut hl);
+        assert_eq!(hl[2], HlType::Keyword); // 'n' of name
+        assert_eq!(hl[5], HlType::Keyword); // 'e' of name
+    }
+
+    // -- Coverage gap: YAML negative number (lines 744-745) -------------------
+
+    #[test]
+    fn test_yaml_negative_number() {
+        let line = b"  -42";
+        let mut hl = vec![HlType::Normal; line.len()];
+        highlight_yaml_value(line, &mut hl);
+        assert_eq!(hl[2], HlType::Number); // '-'
+        assert_eq!(hl[3], HlType::Number); // '4'
+    }
+
+    // -- Coverage gap: find_yaml_colon with quoted colon (lines 675-680) ------
+
+    #[test]
+    fn test_yaml_colon_in_quotes() {
+        let line = b"\"key:with:colons\": value";
+        let mut hl = vec![HlType::Normal; line.len()];
+        highlight_yaml_content(line, &mut hl);
+        // The colon inside quotes should not split key/value
+        // The actual key ends at the colon after the closing quote
+        assert_eq!(hl[0], HlType::Keyword);
+    }
 }

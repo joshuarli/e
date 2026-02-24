@@ -315,4 +315,25 @@ mod tests {
         let text = doc.text_in_range(Pos::new(0, 3), Pos::new(0, 3));
         assert_eq!(text, b"");
     }
+
+    #[test]
+    fn test_begin_end_undo_group() {
+        let mut doc = Document::new(b"hello".to_vec(), None);
+        doc.begin_undo_group();
+        doc.insert(0, 0, b"// ");
+        doc.insert(0, 8, b"\n");
+        doc.end_undo_group();
+
+        assert_eq!(doc.buf.contents(), b"// hello\n");
+        // Undo should revert both ops at once
+        doc.undo();
+        assert_eq!(doc.buf.contents(), b"hello");
+    }
+
+    #[test]
+    fn test_text_in_range_full_document() {
+        let mut doc = Document::new(b"hello\nworld".to_vec(), None);
+        let text = doc.text_in_range(Pos::new(0, 0), Pos::new(1, 5));
+        assert_eq!(text, b"hello\nworld");
+    }
 }

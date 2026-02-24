@@ -445,6 +445,118 @@ mod tests {
         assert_eq!(result, Some((21, 4)));
     }
 
+    // -- center_on_line -------------------------------------------------------
+
+    #[test]
+    fn test_center_on_line_middle() {
+        let mut v = View::new(80, 24);
+        let mut widths = |_: usize| -> usize { 10 }; // short lines
+        v.center_on_line(50, &mut widths, 4);
+        // scroll_line should be roughly 50 - 11 = 39
+        assert!(v.scroll_line <= 50);
+        assert!(v.scroll_line + v.text_rows() > 50);
+    }
+
+    #[test]
+    fn test_center_on_line_near_start() {
+        let mut v = View::new(80, 24);
+        let mut widths = |_: usize| -> usize { 10 };
+        v.center_on_line(3, &mut widths, 4);
+        assert_eq!(v.scroll_line, 0);
+    }
+
+    #[test]
+    fn test_center_on_line_zero_rows() {
+        let mut v = View::new(80, 2); // text_rows = 0
+        let mut widths = |_: usize| -> usize { 10 };
+        v.center_on_line(10, &mut widths, 4);
+        assert_eq!(v.scroll_line, 0);
+    }
+
+    #[test]
+    fn test_center_on_line_zero_text_cols() {
+        let mut v = View::new(4, 24); // text_cols = 0 with gutter 4
+        let mut widths = |_: usize| -> usize { 10 };
+        v.center_on_line(10, &mut widths, 4);
+        assert_eq!(v.scroll_line, 0);
+    }
+
+    #[test]
+    fn test_center_on_line_wrapped_target() {
+        // Target line is very wide → wraps, center_on_line should still work
+        let mut v = View::new(14, 7); // text_rows=5, text_cols=10
+        let mut widths = |line: usize| -> usize { if line == 50 { 100 } else { 10 } };
+        v.center_on_line(50, &mut widths, 4);
+        assert!(v.scroll_line <= 50);
+    }
+
+    // -- scroll_forward -------------------------------------------------------
+
+    #[test]
+    fn test_scroll_forward_multi_line() {
+        let mut v = View::new(80, 24);
+        let mut widths = |_: usize| -> usize { 10 };
+        v.scroll_forward(3, 76, &mut widths);
+        assert_eq!(v.scroll_line, 3);
+        assert_eq!(v.scroll_wrap, 0);
+    }
+
+    #[test]
+    fn test_scroll_forward_wrapping() {
+        let mut v = View::new(14, 24); // text_cols = 10
+        // Line 0 has 25 display cols → 3 wraps
+        let mut widths = |_: usize| -> usize { 25 };
+        v.scroll_forward(2, 10, &mut widths);
+        assert_eq!(v.scroll_line, 0);
+        assert_eq!(v.scroll_wrap, 2);
+    }
+
+    // -- buffer_to_screen edge cases -----------------------------------------
+
+    #[test]
+    fn test_buffer_to_screen_zero_text_cols() {
+        let v = View::new(4, 24); // text_cols = 0 with gutter 4
+        assert_eq!(v.buffer_to_screen(0, 0, 4, &mut trivial_width), None);
+    }
+
+    #[test]
+    fn test_buffer_to_screen_scroll_wrap_above() {
+        let mut v = View::new(14, 24); // text_cols=10
+        v.scroll_line = 0;
+        v.scroll_wrap = 2; // scrolled past first 2 wrap rows
+        // Col 5 is on wrap 0, which is before scroll_wrap → should return None
+        assert_eq!(v.buffer_to_screen(0, 5, 4, &mut |_| 30), None);
+    }
+
+    #[test]
+    fn test_buffer_to_screen_col_beyond_width() {
+        let v = View::new(10, 24); // width = 10, text_cols = 6 with gutter 4
+        // col 8 → wrap 1, screen_col = 8%6 + 4 = 6, within width 10
+        let result = v.buffer_to_screen(0, 8, 4, &mut trivial_width);
+        assert_eq!(result, Some((1, 6)));
+        // screen_col = col % text_cols + gutter_width. If that >= width, returns None
+        // With text_cols=6, the max screen_col is 4+5=9 < 10, so it never exceeds.
+        // Test a case where col would land out of viewport rows instead
+        let v_small = View::new(10, 4); // text_rows = 2
+        let result = v_small.buffer_to_screen(0, 20, 4, &mut trivial_width);
+        // wrap 20/6 = 3, screen_row = 3 >= text_rows(2) → None
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_center_on_line_partial_wrap() {
+        // Triggers the partial wrap branch (lines 158-161) in center_on_line
+        let mut v = View::new(14, 14); // text_rows=12, text_cols=10 (with gutter 4)
+        // half = 6, target = 5 with width 10 → 1 wrap → remaining = 5
+        // Lines 4..1 each have 1 wrap → remaining = 1
+        // Line 0 has 100 display cols → 10 wraps. w=10 > remaining=1 → partial
+        let mut widths = |line: usize| -> usize { if line == 0 { 100 } else { 10 } };
+        v.center_on_line(5, &mut widths, 4);
+        // start_line should be 0 with start_wrap = 10 - 1 = 9
+        assert_eq!(v.scroll_line, 0);
+        assert_eq!(v.scroll_wrap, 9);
+    }
+
     #[test]
     fn test_buffer_to_screen_wrapped() {
         // Line 0 is 20 chars wide, text_cols=10 → 2 wrapped rows

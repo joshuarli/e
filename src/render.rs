@@ -760,6 +760,243 @@ mod tests {
     }
 
     #[test]
+    fn test_render_with_find_matches() {
+        let mut r = Renderer::new();
+        let mut buf = GapBuffer::from_text(b"hello world hello");
+        let view = View::new(80, 24);
+        let mut output = Vec::new();
+        let matches = [
+            (Pos::new(0, 0), Pos::new(0, 5)),
+            (Pos::new(0, 12), Pos::new(0, 17)),
+        ];
+
+        r.render(
+            &mut output,
+            &mut buf,
+            &view,
+            0,
+            0,
+            true,
+            "",
+            "",
+            None,
+            None,
+            Some(&matches),
+            Some(0),
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let s = String::from_utf8_lossy(&output);
+        // Current match (idx 0) → green bg \x1b[42;30m, other → yellow bg \x1b[43;30m
+        assert!(s.contains("\x1b[42;30m"));
+        assert!(s.contains("\x1b[43;30m"));
+    }
+
+    #[test]
+    fn test_render_with_bracket_pair() {
+        let mut r = Renderer::new();
+        let mut buf = GapBuffer::from_text(b"(hello)");
+        let view = View::new(80, 24);
+        let mut output = Vec::new();
+
+        r.render(
+            &mut output,
+            &mut buf,
+            &view,
+            0,
+            0,
+            true,
+            "",
+            "",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            Some((Pos::new(0, 0), Pos::new(0, 6))),
+        )
+        .unwrap();
+
+        let s = String::from_utf8_lossy(&output);
+        // Bracket match → magenta bg \x1b[45;30m
+        assert!(s.contains("\x1b[45;30m"));
+    }
+
+    #[test]
+    fn test_render_with_completions() {
+        let mut r = Renderer::new();
+        let mut buf = GapBuffer::from_text(b"hello");
+        let view = View::new(80, 24);
+        let mut output = Vec::new();
+        let comps = vec!["save".to_string(), "quit".to_string()];
+
+        r.render(
+            &mut output,
+            &mut buf,
+            &view,
+            0,
+            0,
+            true,
+            "",
+            "",
+            None,
+            None,
+            None,
+            None,
+            &comps,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let s = String::from_utf8_lossy(&output);
+        assert!(s.contains("save"));
+        assert!(s.contains("quit"));
+    }
+
+    #[test]
+    fn test_render_with_cmd_cursor() {
+        let mut r = Renderer::new();
+        let mut buf = GapBuffer::from_text(b"hello");
+        let view = View::new(80, 24);
+        let mut output = Vec::new();
+
+        r.render(
+            &mut output,
+            &mut buf,
+            &view,
+            0,
+            0,
+            true,
+            "",
+            "",
+            Some("find: test"),
+            None,
+            None,
+            None,
+            &[],
+            Some(10),
+            false,
+            None,
+        )
+        .unwrap();
+
+        let s = String::from_utf8_lossy(&output);
+        // Cursor shown in command line area
+        assert!(s.contains("\x1b[?25h"));
+    }
+
+    #[test]
+    fn test_render_find_active_hides_cursor() {
+        let mut r = Renderer::new();
+        let mut buf = GapBuffer::from_text(b"hello");
+        let view = View::new(80, 24);
+        let mut output = Vec::new();
+
+        r.render(
+            &mut output,
+            &mut buf,
+            &view,
+            0,
+            0,
+            true,
+            "",
+            "",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+
+        // find_active=true should hide cursor
+        let s = String::from_utf8_lossy(&output);
+        assert!(s.contains("\x1b[?25l"));
+        // And NOT contain show cursor at the end positioning
+        // (the only ?25h should not appear because find_active is true)
+    }
+
+    #[test]
+    fn test_render_syntax_cache_invalidation() {
+        let mut r = Renderer::new();
+        let rules = crate::highlight::rules_for_language("Rust");
+        r.set_syntax(rules);
+
+        let mut buf = GapBuffer::from_text(b"fn main() {}");
+        let view = View::new(80, 24);
+        let mut output = Vec::new();
+
+        r.render(
+            &mut output,
+            &mut buf,
+            &view,
+            0,
+            0,
+            true,
+            "",
+            "",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        // Modify buffer (version changes) and render again
+        buf.insert(0, b"// ");
+        output.clear();
+        r.render(
+            &mut output,
+            &mut buf,
+            &view,
+            0,
+            0,
+            true,
+            "",
+            "",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        // Should contain comment coloring (grey = \x1b[90m)
+        let s = String::from_utf8_lossy(&output);
+        assert!(s.contains("\x1b[90m"));
+    }
+
+    #[test]
+    fn test_set_syntax_changes_rules() {
+        let mut r = Renderer::new();
+        assert!(r.syntax.is_none());
+        let rules = crate::highlight::rules_for_language("Rust");
+        r.set_syntax(rules);
+        assert!(r.syntax.is_some());
+        r.set_syntax(None);
+        assert!(r.syntax.is_none());
+    }
+
+    #[test]
     fn test_render_empty_buffer() {
         let mut r = Renderer::new();
         let mut buf = GapBuffer::new();

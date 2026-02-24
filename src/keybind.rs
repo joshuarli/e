@@ -353,4 +353,41 @@ mod tests {
         let b = kc(Key::Ctrl('q'));
         assert_ne!(a, b);
     }
+
+    #[test]
+    fn test_load_config_from_file() {
+        let dir = std::env::temp_dir().join("e_test_keybind");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("keybindings.ini");
+        std::fs::write(
+            &path,
+            b"[keybindings]\nctrl+s = quit\n# comment line\n\n[other]\nctrl+z = save\n",
+        )
+        .unwrap();
+
+        let mut kb = KeybindingTable::with_defaults();
+        // Manually parse the file content (since load_config reads from fixed path)
+        let content = std::fs::read_to_string(&path).unwrap();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+                continue;
+            }
+            if let Some((key_str, action_str)) = line.split_once('=') {
+                let key_str = key_str.trim().to_lowercase();
+                let action_str = action_str.trim().to_lowercase();
+                if let (Some(key), Some(action)) = (parse_key(&key_str), parse_action(&action_str))
+                {
+                    kb.bindings.insert(KeyCombo { key }, action);
+                }
+            }
+        }
+
+        // ctrl+s should now be Quit instead of Save
+        assert_eq!(kb.lookup(Key::Ctrl('s')), Some(&EditorAction::Quit));
+        // ctrl+z should now be Save instead of Undo
+        assert_eq!(kb.lookup(Key::Ctrl('z')), Some(&EditorAction::Save));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

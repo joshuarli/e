@@ -995,6 +995,113 @@ mod tests {
     }
 
     #[test]
+    fn test_acquire_release_lock() {
+        let dir = std::env::temp_dir().join("e_test_lock");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        fs::write(&path, b"hello").unwrap();
+
+        // Acquire should succeed
+        assert!(acquire_lock(&path).is_ok());
+        // Second acquire should fail (lock exists)
+        assert!(acquire_lock(&path).is_err());
+        // Release and try again
+        release_lock(&path);
+        assert!(acquire_lock(&path).is_ok());
+        release_lock(&path);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_clean_for_write() {
+        let result = clean_for_write(b"hello   \nworld  ");
+        assert_eq!(result, b"hello\nworld\n");
+    }
+
+    #[test]
+    fn test_clean_for_write_empty() {
+        let result = clean_for_write(b"");
+        assert_eq!(result, b"\n");
+    }
+
+    #[test]
+    fn test_encode_path() {
+        let path = std::path::Path::new("/tmp/test/file.txt");
+        let encoded = encode_path(path);
+        assert!(encoded.contains("%2F"));
+        assert!(!encoded.contains('/'));
+    }
+
+    #[test]
+    fn test_lock_path_contains_elock() {
+        let path = std::path::Path::new("/tmp/test.txt");
+        let lp = lock_path(path);
+        let s = lp.to_string_lossy();
+        assert!(s.ends_with(".elock"));
+        assert!(s.contains("buffers"));
+    }
+
+    #[test]
+    fn test_encode_path_percent() {
+        let path = Path::new("/tmp/test%file");
+        let encoded = encode_path(path);
+        assert!(encoded.contains("%25"));
+    }
+
+    #[test]
+    fn test_resolve_absolute_new_file() {
+        // resolve_absolute for a file that doesn't exist yet
+        let dir = std::env::temp_dir().join("e_test_resolve");
+        let _ = fs::create_dir_all(&dir);
+        let new_file = dir.join("brand_new.txt");
+        let result = resolve_absolute(&new_file);
+        assert!(result.is_absolute());
+        assert!(result.to_string_lossy().contains("brand_new.txt"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_helpers_truncated() {
+        // Test read functions with truncated data
+        let empty: &[u8] = &[];
+        let mut pos = 0;
+        assert!(read_u8(empty, &mut pos).is_none());
+        assert!(read_u32(empty, &mut pos).is_none());
+        assert!(read_u64(empty, &mut pos).is_none());
+        assert!(read_i64(empty, &mut pos).is_none());
+    }
+
+    #[test]
+    fn test_deserialize_corrupt_data() {
+        // Craft a minimal valid-looking undo db entry that's truncated
+        let mut data = Vec::new();
+        // Path length + path
+        write_u32(&mut data, 4);
+        data.extend_from_slice(b"test");
+        // mtime secs + nanos
+        write_i64(&mut data, 0);
+        write_u32(&mut data, 0);
+        // Undo group count
+        write_u32(&mut data, 1);
+        // Truncated here — group data missing
+        let mut pos = 0;
+        let result = deserialize_groups(&data[data.len() - 4..], &mut pos);
+        // Should get Some with 1 group, but group deserialization will fail
+        // Just verify it doesn't panic
+        let _ = result;
+    }
+
+    #[test]
+    fn test_entry_header_truncated() {
+        let data = [0u8; 4]; // Just a path length, no actual path
+        let result = entry_header(&data, 0);
+        // path_len = 0, then needs at least i64 + u32 = 12 more bytes → should fail
+        // Actually path_len from [0,0,0,0] is 0, so path is empty, then secs read fails
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn test_undo_history_no_db_file() {
         let dir = std::env::temp_dir().join("e_test_undo_nodb");
         let _ = fs::create_dir_all(&dir);

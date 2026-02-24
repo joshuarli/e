@@ -110,10 +110,18 @@ Entered via `^p` command palette. Available commands:
 - `just release` — optimized release build (~313KB), requires nightly + rust-src
 - `just install` — release build + copy to `/usr/local/bin/e`
 
+## Testing
+
+- Run tests: `cargo clippy && cargo test`
+- Coverage: `cargo tarpaulin`
+- Philosophy: prefer integration-style scenario tests over tiny unit tests — each test exercises a workflow or scenario covering multiple methods
+- All modules have inline `#[cfg(test)] mod tests`
+- Test helper pattern for editor.rs: `ed("text")` / `ed_named("text", "file.rs")` creates an 80x24 Editor with internal-only clipboard, no disk I/O, default keybindings
+- Use `std::env::temp_dir()` for any tests that need file I/O — clean up with `remove_dir_all`
+
 ## Development Guidelines
 
 - Run `cargo clippy && cargo test` before every commit — zero warnings, all tests pass
-- All modules have inline `#[cfg(test)] mod tests` — 267 tests total
 - Prefer `&self` over `&mut self` for read-only operations (the line cache uses interior mutability via `Option<Vec<usize>>`)
 - Minimize heap allocations in hot paths (render loop, cursor movement)
 - No `unwrap()` on user-facing I/O — propagate errors or show in status bar

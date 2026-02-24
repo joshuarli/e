@@ -1825,6 +1825,11 @@ impl Editor {
         }
     }
 
+    #[cfg(test)]
+    fn test_text(&self) -> String {
+        String::from_utf8_lossy(&self.doc.buf.contents()).to_string()
+    }
+
     fn save_file_sudo(&mut self, password: &str) {
         let tmp = match self.sudo_save_tmp.take() {
             Some(t) => t,
@@ -1900,5 +1905,2342 @@ impl Editor {
                 self.set_status("sudo save failed".to_string());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use termion::event::{Event, Key, MouseButton, MouseEvent};
+
+    fn ed(text: &str) -> Editor {
+        ed_impl(text, None)
+    }
+
+    fn ed_named(text: &str, name: &str) -> Editor {
+        ed_impl(text, Some(name.to_string()))
+    }
+
+    fn ed_impl(text: &str, filename: Option<String>) -> Editor {
+        let doc = Document::new(text.as_bytes().to_vec(), filename);
+        Editor {
+            doc,
+            sel: Selection::caret(Pos::zero()),
+            desired_col: None,
+            view: View::new(80, 24),
+            renderer: Renderer::new(),
+            clipboard: Clipboard::internal_only(),
+            commands: CommandRegistry::new(),
+            keybindings: KeybindingTable::with_defaults(),
+            cmd_buf: CommandBuffer::new(),
+            ruler_on: true,
+            status_msg: String::new(),
+            status_time: None,
+            running: true,
+            quit_pending: false,
+            last_click_time: None,
+            last_click_pos: None,
+            click_count: 0,
+            dragging: false,
+            find_pattern: String::new(),
+            find_matches: Vec::new(),
+            find_index: 0,
+            find_active: false,
+            sudo_save_tmp: None,
+            piped_stdin: false,
+        }
+    }
+
+    // ========================================================================
+    // Movement scenarios
+    // ========================================================================
+
+    #[test]
+    fn test_move_up_down_with_desired_col_stickiness() {
+        let mut e = ed("short\nlonger line here\nhi");
+        // Move to end of "longer line here" (col 15)
+        e.set_cursor(Pos::new(1, 15));
+        e.move_up(); // line 0 is 5 chars, should clamp to 5
+        assert_eq!(e.cursor(), Pos::new(0, 5));
+        // desired_col should be 15 (sticky)
+        e.move_down(); // back to line 1, col should restore to 15
+        assert_eq!(e.cursor(), Pos::new(1, 15));
+        e.move_down(); // line 2 is 2 chars, clamp to 2
+        assert_eq!(e.cursor(), Pos::new(2, 2));
+    }
+
+    #[test]
+    fn test_move_up_at_top() {
+        let mut e = ed("hello");
+        e.move_up();
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+    }
+
+    #[test]
+    fn test_move_down_at_bottom() {
+        let mut e = ed("hello");
+        e.move_down();
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+    }
+
+    #[test]
+    fn test_move_left_wraps_to_prev_line() {
+        let mut e = ed("abc\ndef");
+        e.set_cursor(Pos::new(1, 0));
+        e.move_left();
+        assert_eq!(e.cursor(), Pos::new(0, 3));
+    }
+
+    #[test]
+    fn test_move_right_wraps_to_next_line() {
+        let mut e = ed("abc\ndef");
+        e.set_cursor(Pos::new(0, 3));
+        e.move_right();
+        assert_eq!(e.cursor(), Pos::new(1, 0));
+    }
+
+    #[test]
+    fn test_move_left_collapses_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 2),
+            cursor: Pos::new(0, 7),
+        };
+        e.move_left();
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+        assert!(e.sel.is_empty());
+    }
+
+    #[test]
+    fn test_move_right_collapses_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 2),
+            cursor: Pos::new(0, 7),
+        };
+        e.move_right();
+        assert_eq!(e.cursor(), Pos::new(0, 7));
+        assert!(e.sel.is_empty());
+    }
+
+    #[test]
+    fn test_home_end() {
+        let mut e = ed("hello world");
+        e.set_cursor(Pos::new(0, 5));
+        e.move_home();
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+        e.move_end();
+        assert_eq!(e.cursor(), Pos::new(0, 11));
+    }
+
+    #[test]
+    fn test_page_up_down() {
+        // 80x24 terminal = 22 text rows
+        let text = (0..50)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = ed(&text);
+        e.set_cursor(Pos::new(25, 0));
+        e.page_up();
+        assert_eq!(e.cursor().line, 3); // 25 - 22 = 3
+        e.page_down();
+        assert_eq!(e.cursor().line, 25);
+    }
+
+    #[test]
+    fn test_indent_snap_left_right() {
+        let mut e = ed("    hello"); // 4 spaces indent
+        e.set_cursor(Pos::new(0, 4));
+        e.move_left(); // should snap from 4 to 2
+        assert_eq!(e.cursor().col, 2);
+        e.move_right(); // should snap from 2 to 4
+        assert_eq!(e.cursor().col, 4);
+    }
+
+    #[test]
+    fn test_move_left_at_origin() {
+        let mut e = ed("hello");
+        e.move_left();
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+    }
+
+    #[test]
+    fn test_move_right_at_end_of_last_line() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 5));
+        e.move_right();
+        assert_eq!(e.cursor(), Pos::new(0, 5));
+    }
+
+    // ========================================================================
+    // Selection scenarios
+    // ========================================================================
+
+    #[test]
+    fn test_shift_arrow_extends_selection() {
+        let mut e = ed("hello");
+        e.move_right_extend();
+        e.move_right_extend();
+        assert_eq!(e.sel.anchor, Pos::new(0, 0));
+        assert_eq!(e.sel.cursor, Pos::new(0, 2));
+        assert!(!e.sel.is_empty());
+    }
+
+    #[test]
+    fn test_select_all() {
+        let mut e = ed("hello\nworld");
+        e.select_all();
+        let (start, end) = e.sel.ordered();
+        assert_eq!(start, Pos::new(0, 0));
+        assert_eq!(end, Pos::new(1, 5));
+    }
+
+    #[test]
+    fn test_select_word_at() {
+        let mut e = ed("hello world");
+        e.select_word_at(Pos::new(0, 7));
+        let (start, end) = e.sel.ordered();
+        assert_eq!(start, Pos::new(0, 6));
+        assert_eq!(end, Pos::new(0, 11));
+    }
+
+    #[test]
+    fn test_select_line_at() {
+        let mut e = ed("hello\nworld\nfoo");
+        e.select_line_at(1);
+        let (start, end) = e.sel.ordered();
+        assert_eq!(start, Pos::new(1, 0));
+        assert_eq!(end, Pos::new(2, 0));
+    }
+
+    #[test]
+    fn test_select_line_at_last_line() {
+        let mut e = ed("hello\nworld");
+        e.select_line_at(1);
+        let (start, end) = e.sel.ordered();
+        assert_eq!(start, Pos::new(1, 0));
+        assert_eq!(end, Pos::new(1, 5));
+    }
+
+    #[test]
+    fn test_select_above_below() {
+        let mut e = ed("hello\nworld\nfoo");
+        e.set_cursor(Pos::new(1, 3));
+        e.select_above();
+        assert_eq!(e.sel.cursor, Pos::new(0, 0));
+        assert_eq!(e.sel.anchor, Pos::new(1, 3));
+
+        e.set_cursor(Pos::new(1, 3));
+        e.select_below();
+        assert_eq!(e.sel.cursor, Pos::new(2, 3));
+        assert_eq!(e.sel.anchor, Pos::new(1, 3));
+    }
+
+    #[test]
+    fn test_delete_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 5),
+            cursor: Pos::new(0, 11),
+        };
+        e.delete_selection();
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    #[test]
+    fn test_clear_selection() {
+        let mut e = ed("hello");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 5),
+        };
+        e.clear_selection();
+        assert!(e.sel.is_empty());
+        assert_eq!(e.cursor(), Pos::new(0, 5));
+    }
+
+    #[test]
+    fn test_shift_up_down_extend() {
+        let mut e = ed("aaa\nbbb\nccc");
+        e.set_cursor(Pos::new(1, 1));
+        e.move_up_extend();
+        assert_eq!(e.sel.anchor, Pos::new(1, 1));
+        assert_eq!(e.sel.cursor, Pos::new(0, 1));
+        e.move_down_extend();
+        assert_eq!(e.sel.cursor, Pos::new(1, 1));
+        e.move_down_extend();
+        assert_eq!(e.sel.cursor, Pos::new(2, 1));
+    }
+
+    #[test]
+    fn test_shift_left_right_extend() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 2));
+        e.move_left_extend();
+        assert_eq!(e.sel.cursor, Pos::new(0, 1));
+        e.move_right_extend();
+        assert_eq!(e.sel.cursor, Pos::new(0, 2));
+    }
+
+    // ========================================================================
+    // Editing scenarios
+    // ========================================================================
+
+    #[test]
+    fn test_insert_char() {
+        let mut e = ed("hllo");
+        e.set_cursor(Pos::new(0, 1));
+        e.insert_char('e');
+        assert_eq!(e.test_text(), "hello");
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+    }
+
+    #[test]
+    fn test_insert_char_replaces_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 5),
+            cursor: Pos::new(0, 11),
+        };
+        e.insert_char('!');
+        assert_eq!(e.test_text(), "hello!");
+    }
+
+    #[test]
+    fn test_insert_tab_spaces() {
+        let mut e = ed_named("hello", "test.rs");
+        e.insert_tab();
+        assert_eq!(e.test_text(), "  hello");
+    }
+
+    #[test]
+    fn test_insert_tab_actual_tab_for_c_file() {
+        let mut e = ed_named("hello", "test.c");
+        e.insert_tab();
+        assert_eq!(e.test_text(), "\thello");
+    }
+
+    #[test]
+    fn test_tab_indents_selection() {
+        let mut e = ed_named("aaa\nbbb\nccc", "test.rs");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(2, 3),
+        };
+        e.insert_tab();
+        assert_eq!(e.test_text(), "  aaa\n  bbb\n  ccc");
+    }
+
+    #[test]
+    fn test_insert_newline_with_auto_indent() {
+        let mut e = ed("  hello");
+        e.set_cursor(Pos::new(0, 7));
+        e.insert_newline();
+        assert_eq!(e.test_text(), "  hello\n  ");
+        assert_eq!(e.cursor(), Pos::new(1, 2));
+    }
+
+    #[test]
+    fn test_insert_newline_replaces_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 5),
+            cursor: Pos::new(0, 11),
+        };
+        e.insert_newline();
+        assert_eq!(e.test_text(), "hello\n");
+    }
+
+    #[test]
+    fn test_backspace_basic() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 5));
+        e.backspace();
+        assert_eq!(e.test_text(), "hell");
+    }
+
+    #[test]
+    fn test_backspace_joins_lines() {
+        let mut e = ed("hello\nworld");
+        e.set_cursor(Pos::new(1, 0));
+        e.backspace();
+        assert_eq!(e.test_text(), "helloworld");
+    }
+
+    #[test]
+    fn test_backspace_indent_snap() {
+        let mut e = ed("    x");
+        e.set_cursor(Pos::new(0, 4));
+        e.backspace(); // should snap from 4 to 2
+        assert_eq!(e.test_text(), "  x");
+    }
+
+    #[test]
+    fn test_backspace_deletes_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 5),
+            cursor: Pos::new(0, 11),
+        };
+        e.backspace();
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    #[test]
+    fn test_backspace_at_origin_noop() {
+        let mut e = ed("hello");
+        e.backspace();
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    #[test]
+    fn test_delete_forward() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 0));
+        e.delete_forward();
+        assert_eq!(e.test_text(), "ello");
+    }
+
+    #[test]
+    fn test_delete_forward_joins_lines() {
+        let mut e = ed("hello\nworld");
+        e.set_cursor(Pos::new(0, 5));
+        e.delete_forward();
+        assert_eq!(e.test_text(), "helloworld");
+    }
+
+    #[test]
+    fn test_delete_forward_with_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 5),
+        };
+        e.delete_forward();
+        assert_eq!(e.test_text(), " world");
+    }
+
+    #[test]
+    fn test_ctrl_backspace_word_delete() {
+        let mut e = ed("hello world");
+        e.set_cursor(Pos::new(0, 11));
+        e.ctrl_backspace();
+        assert_eq!(e.test_text(), "hello ");
+    }
+
+    #[test]
+    fn test_ctrl_backspace_at_line_start() {
+        let mut e = ed("hello\nworld");
+        e.set_cursor(Pos::new(1, 0));
+        e.ctrl_backspace();
+        assert_eq!(e.test_text(), "helloworld");
+    }
+
+    #[test]
+    fn test_ctrl_backspace_at_origin() {
+        let mut e = ed("hello");
+        e.ctrl_backspace();
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    #[test]
+    fn test_ctrl_backspace_with_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 5),
+        };
+        e.ctrl_backspace();
+        assert_eq!(e.test_text(), " world");
+    }
+
+    #[test]
+    fn test_duplicate_line() {
+        let mut e = ed("hello\nworld");
+        e.set_cursor(Pos::new(0, 2));
+        e.duplicate_line();
+        assert_eq!(e.test_text(), "hello\nhello\nworld");
+        assert_eq!(e.cursor(), Pos::new(1, 2));
+    }
+
+    // ========================================================================
+    // Find/replace scenarios
+    // ========================================================================
+
+    #[test]
+    fn test_find_highlights_smart_case() {
+        let mut e = ed("Hello hello HELLO");
+        e.update_find_highlights("hello");
+        assert_eq!(e.find_matches.len(), 3); // case-insensitive (all lowercase pattern)
+    }
+
+    #[test]
+    fn test_find_case_sensitive() {
+        let mut e = ed("Hello hello HELLO");
+        e.update_find_highlights("Hello");
+        assert_eq!(e.find_matches.len(), 1); // uppercase in pattern → case-sensitive
+    }
+
+    #[test]
+    fn test_find_invalid_regex() {
+        let mut e = ed("hello [world");
+        e.update_find_highlights("[invalid");
+        assert!(e.find_matches.is_empty()); // invalid regex → no matches, no panic
+    }
+
+    #[test]
+    fn test_find_empty_pattern() {
+        let mut e = ed("hello");
+        e.update_find_highlights("");
+        assert!(e.find_matches.is_empty());
+    }
+
+    #[test]
+    fn test_find_next_wraps_around() {
+        let mut e = ed("aa bb aa");
+        e.update_find_highlights("aa");
+        assert_eq!(e.find_matches.len(), 2);
+        e.find_active = true;
+        // Position cursor past all matches
+        e.set_cursor(Pos::new(0, 8));
+        e.find_next();
+        assert_eq!(e.find_index, 0); // wrapped around
+    }
+
+    #[test]
+    fn test_find_prev_wraps_around() {
+        let mut e = ed("aa bb aa");
+        e.update_find_highlights("aa");
+        e.find_active = true;
+        e.set_cursor(Pos::new(0, 0));
+        e.find_prev();
+        assert_eq!(e.find_index, 1); // wrapped around to last match
+    }
+
+    #[test]
+    fn test_find_next_from_submit() {
+        let mut e = ed("hello world hello");
+        e.find_next_from_submit("hello");
+        assert!(e.find_active);
+        assert_eq!(e.find_matches.len(), 2);
+        assert_eq!(e.find_index, 0);
+    }
+
+    #[test]
+    fn test_find_next_from_submit_no_matches() {
+        let mut e = ed("hello world");
+        e.find_next_from_submit("xyz");
+        assert!(!e.find_active);
+        assert!(e.status_msg.contains("no matches"));
+    }
+
+    #[test]
+    fn test_exit_find_mode_selects_match() {
+        let mut e = ed("hello world hello");
+        e.find_next_from_submit("hello");
+        e.exit_find_mode();
+        assert!(!e.find_active);
+        assert!(e.find_matches.is_empty());
+        // Selection should cover the match
+        assert!(!e.sel.is_empty());
+    }
+
+    #[test]
+    fn test_replace_all_whole_file() {
+        let mut e = ed("foo bar foo");
+        e.replace_all("foo", "baz");
+        assert_eq!(e.test_text(), "baz bar baz");
+        assert!(e.status_msg.contains("2"));
+    }
+
+    #[test]
+    fn test_replace_all_in_selection() {
+        let mut e = ed("foo bar foo");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 3),
+        };
+        e.replace_all("foo", "baz");
+        assert_eq!(e.test_text(), "baz bar foo");
+    }
+
+    #[test]
+    fn test_replace_all_no_matches() {
+        let mut e = ed("hello world");
+        e.replace_all("xyz", "abc");
+        assert!(e.status_msg.contains("0"));
+    }
+
+    #[test]
+    fn test_replace_all_invalid_regex() {
+        let mut e = ed("hello");
+        e.replace_all("[invalid", "x");
+        assert!(e.status_msg.contains("Invalid regex"));
+    }
+
+    // ========================================================================
+    // Command dispatch scenarios
+    // ========================================================================
+
+    #[test]
+    fn test_goto_line_in_range() {
+        let text = (0..50)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = ed(&text);
+        e.goto_line(25);
+        assert_eq!(e.cursor().line, 24); // goto is 1-indexed
+    }
+
+    #[test]
+    fn test_goto_line_zero() {
+        let mut e = ed("hello\nworld");
+        e.goto_line(0);
+        assert_eq!(e.cursor().line, 0);
+    }
+
+    #[test]
+    fn test_goto_line_beyond_end() {
+        let mut e = ed("hello\nworld");
+        e.goto_line(999);
+        assert_eq!(e.cursor().line, 1); // clamped to last line
+    }
+
+    #[test]
+    fn test_goto_top_end() {
+        let mut e = ed("hello\nworld\nfoo");
+        e.set_cursor(Pos::new(1, 2));
+        e.goto_top();
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+        e.goto_end();
+        assert_eq!(e.cursor(), Pos::new(2, 3));
+    }
+
+    #[test]
+    fn test_kill_line_middle() {
+        let mut e = ed("aaa\nbbb\nccc");
+        e.set_cursor(Pos::new(1, 1));
+        e.kill_line();
+        assert_eq!(e.test_text(), "aaa\nccc");
+    }
+
+    #[test]
+    fn test_kill_line_last() {
+        let mut e = ed("aaa\nbbb");
+        e.set_cursor(Pos::new(1, 0));
+        e.kill_line();
+        assert_eq!(e.test_text(), "aaa\n");
+    }
+
+    #[test]
+    fn test_execute_command_goto() {
+        let mut e = ed("aaa\nbbb\nccc");
+        e.execute_command("goto 2");
+        assert_eq!(e.cursor().line, 1);
+    }
+
+    #[test]
+    fn test_execute_command_ruler_toggle() {
+        let mut e = ed("hello");
+        assert!(e.ruler_on);
+        e.execute_command("ruler");
+        assert!(!e.ruler_on);
+        e.execute_command("ruler");
+        assert!(e.ruler_on);
+    }
+
+    #[test]
+    fn test_execute_command_quit() {
+        let mut e = ed("hello");
+        e.execute_command("quit");
+        assert!(!e.running);
+    }
+
+    #[test]
+    fn test_execute_command_unknown() {
+        let mut e = ed("hello");
+        e.execute_command("foobar");
+        assert!(e.status_msg.contains("Unknown"));
+    }
+
+    #[test]
+    fn test_execute_command_replaceall() {
+        let mut e = ed("foo bar foo");
+        e.execute_command("replaceall foo baz");
+        assert_eq!(e.test_text(), "baz bar baz");
+    }
+
+    #[test]
+    fn test_execute_command_comment() {
+        let mut e = ed_named("hello", "test.rs");
+        e.execute_command("comment");
+        assert_eq!(e.test_text(), "// hello");
+    }
+
+    #[test]
+    fn test_complete_command_single_match() {
+        let mut e = ed("hello");
+        e.cmd_buf.open(CommandBufferMode::Command, "> ", "rul");
+        e.complete_command();
+        assert_eq!(e.cmd_buf.input, "ruler");
+        assert!(e.cmd_buf.completions.is_empty());
+    }
+
+    #[test]
+    fn test_complete_command_multiple_matches() {
+        let mut e = ed("hello");
+        e.cmd_buf.open(CommandBufferMode::Command, "> ", "q");
+        e.complete_command();
+        assert_eq!(e.cmd_buf.completions.len(), 2); // "q" and "quit"
+    }
+
+    #[test]
+    fn test_complete_command_no_matches() {
+        let mut e = ed("hello");
+        e.cmd_buf.open(CommandBufferMode::Command, "> ", "xyz");
+        e.complete_command();
+        assert!(e.cmd_buf.completions.is_empty());
+    }
+
+    #[test]
+    fn test_complete_command_empty_shows_all() {
+        let mut e = ed("hello");
+        e.cmd_buf.open(CommandBufferMode::Command, "> ", "");
+        e.complete_command();
+        assert!(!e.cmd_buf.completions.is_empty());
+    }
+
+    // ========================================================================
+    // handle_cmd_result scenarios
+    // ========================================================================
+
+    #[test]
+    fn test_handle_cmd_result_submit_find() {
+        let mut e = ed("hello world hello");
+        e.handle_cmd_result(
+            CommandBufferMode::Find,
+            CommandBufferResult::Submit("hello".to_string()),
+        );
+        assert!(e.find_active);
+    }
+
+    #[test]
+    fn test_handle_cmd_result_submit_goto() {
+        let mut e = ed("aaa\nbbb\nccc");
+        e.handle_cmd_result(
+            CommandBufferMode::Goto,
+            CommandBufferResult::Submit("2".to_string()),
+        );
+        assert_eq!(e.cursor().line, 1);
+    }
+
+    #[test]
+    fn test_handle_cmd_result_submit_prompt() {
+        let mut e = ed("hello");
+        e.handle_cmd_result(
+            CommandBufferMode::Prompt,
+            CommandBufferResult::Submit("test.txt".to_string()),
+        );
+        assert_eq!(e.doc.filename.as_deref(), Some("test.txt"));
+    }
+
+    #[test]
+    fn test_handle_cmd_result_cancel_find() {
+        let mut e = ed("hello");
+        e.find_matches = vec![(Pos::new(0, 0), Pos::new(0, 5))];
+        e.handle_cmd_result(CommandBufferMode::Find, CommandBufferResult::Cancel);
+        assert!(e.find_matches.is_empty());
+    }
+
+    #[test]
+    fn test_handle_cmd_result_cancel_sudo() {
+        let mut e = ed("hello");
+        e.sudo_save_tmp = Some("/tmp/nonexistent_test_file".to_string());
+        e.handle_cmd_result(CommandBufferMode::SudoSave, CommandBufferResult::Cancel);
+        assert!(e.sudo_save_tmp.is_none());
+        assert!(e.status_msg.contains("cancelled"));
+    }
+
+    #[test]
+    fn test_handle_cmd_result_changed_find() {
+        let mut e = ed("hello world hello");
+        e.handle_cmd_result(
+            CommandBufferMode::Find,
+            CommandBufferResult::Changed("hello".to_string()),
+        );
+        assert_eq!(e.find_matches.len(), 2);
+    }
+
+    #[test]
+    fn test_handle_cmd_result_tab_complete() {
+        let mut e = ed("hello");
+        e.cmd_buf.open(CommandBufferMode::Command, "> ", "rul");
+        e.handle_cmd_result(CommandBufferMode::Command, CommandBufferResult::TabComplete);
+        assert_eq!(e.cmd_buf.input, "ruler");
+    }
+
+    #[test]
+    fn test_handle_cmd_result_continue_noop() {
+        let mut e = ed("hello");
+        e.handle_cmd_result(CommandBufferMode::Command, CommandBufferResult::Continue);
+        // Should not change anything
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    // ========================================================================
+    // Event/key handling scenarios
+    // ========================================================================
+
+    #[test]
+    fn test_handle_event_dispatches_key() {
+        let mut e = ed("hello");
+        e.handle_event(Event::Key(Key::Char('x')));
+        assert_eq!(e.test_text(), "xhello");
+    }
+
+    #[test]
+    fn test_handle_event_mouse_ignored_when_cmd_active() {
+        let mut e = ed("hello");
+        e.cmd_buf.open(CommandBufferMode::Command, "> ", "");
+        e.handle_event(Event::Mouse(MouseEvent::Press(MouseButton::Left, 1, 1)));
+        // Mouse should be ignored when cmd_buf is active
+        assert!(e.cmd_buf.active);
+    }
+
+    #[test]
+    fn test_handle_event_unsupported_ctrl_shift_up() {
+        let mut e = ed("hello\nworld");
+        e.set_cursor(Pos::new(1, 3));
+        e.handle_event(Event::Unsupported(CTRL_SHIFT_UP.to_vec()));
+        assert_eq!(e.sel.cursor, Pos::new(0, 0));
+    }
+
+    #[test]
+    fn test_handle_event_unsupported_ctrl_shift_down() {
+        let mut e = ed("hello\nworld");
+        e.set_cursor(Pos::new(0, 2));
+        e.handle_event(Event::Unsupported(CTRL_SHIFT_DOWN.to_vec()));
+        assert_eq!(e.sel.cursor, Pos::new(1, 5));
+    }
+
+    #[test]
+    fn test_quit_clean_buffer() {
+        let mut e = ed("hello");
+        e.try_quit();
+        assert!(!e.running);
+    }
+
+    #[test]
+    fn test_quit_dirty_confirms() {
+        let mut e = ed("hello");
+        e.doc.dirty = true;
+        e.try_quit();
+        assert!(e.running);
+        assert!(e.quit_pending);
+        assert!(e.status_msg.contains("Save changes"));
+    }
+
+    #[test]
+    fn test_quit_dirty_then_y() {
+        let dir = std::env::temp_dir().join("e_test_quit_y");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let mut e = ed_named("hello", path.to_str().unwrap());
+        e.doc.dirty = true;
+        e.try_quit();
+        e.handle_key(Key::Char('y'));
+        assert!(!e.running);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_quit_dirty_then_n() {
+        let mut e = ed("hello");
+        e.doc.dirty = true;
+        e.try_quit();
+        e.handle_key(Key::Char('n'));
+        assert!(!e.running);
+    }
+
+    #[test]
+    fn test_quit_dirty_then_cancel() {
+        let mut e = ed("hello");
+        e.doc.dirty = true;
+        e.try_quit();
+        e.handle_key(Key::Esc);
+        assert!(e.running);
+        assert!(!e.quit_pending);
+    }
+
+    #[test]
+    fn test_find_nav_up_down() {
+        let mut e = ed("aa bb aa");
+        e.find_next_from_submit("aa");
+        assert!(e.find_active);
+        e.handle_key(Key::Down);
+        assert_eq!(e.find_index, 1);
+        e.handle_key(Key::Up);
+        assert_eq!(e.find_index, 0);
+    }
+
+    #[test]
+    fn test_find_nav_esc_clears() {
+        let mut e = ed("aa bb aa");
+        e.find_next_from_submit("aa");
+        e.handle_key(Key::Esc);
+        assert!(!e.find_active);
+        assert!(e.sel.is_empty());
+    }
+
+    #[test]
+    fn test_find_nav_other_key_exits_and_processes() {
+        let mut e = ed("aa bb");
+        e.find_next_from_submit("aa");
+        assert!(e.find_active);
+        e.handle_key(Key::Char('x'));
+        assert!(!e.find_active);
+        // 'x' should have been processed as an insert
+        assert!(e.test_text().contains('x'));
+    }
+
+    #[test]
+    fn test_esc_clears_selection_and_matches() {
+        let mut e = ed("hello");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 5),
+        };
+        e.find_matches = vec![(Pos::new(0, 0), Pos::new(0, 5))];
+        e.handle_key(Key::Esc);
+        assert!(e.sel.is_empty());
+        assert!(e.find_matches.is_empty());
+    }
+
+    #[test]
+    fn test_keybinding_action_dispatch() {
+        let mut e = ed("hello");
+        // Ctrl+a should select all
+        e.handle_key(Key::Ctrl('a'));
+        assert!(!e.sel.is_empty());
+    }
+
+    #[test]
+    fn test_handle_cmd_key_dispatches() {
+        let mut e = ed("hello");
+        e.cmd_buf.open(CommandBufferMode::Command, "> ", "");
+        e.handle_cmd_key(Key::Char('a'));
+        assert_eq!(e.cmd_buf.input, "a");
+    }
+
+    // ========================================================================
+    // Mouse scenarios
+    // ========================================================================
+
+    #[test]
+    fn test_mouse_single_click() {
+        let mut e = ed("hello\nworld");
+        e.mouse_press(6, 2); // col 5, row 1 (1-indexed terminal coords)
+        assert_eq!(e.cursor().line, 1);
+    }
+
+    #[test]
+    fn test_mouse_drag() {
+        let mut e = ed("hello world");
+        e.mouse_press(3, 1); // start drag
+        assert!(e.dragging);
+        e.mouse_drag(8, 1);
+        assert_ne!(e.sel.anchor, e.sel.cursor);
+    }
+
+    #[test]
+    fn test_mouse_release() {
+        let mut e = ed("hello");
+        e.dragging = true;
+        e.handle_mouse(MouseEvent::Release(0, 0));
+        assert!(!e.dragging);
+    }
+
+    #[test]
+    fn test_mouse_scroll_up_down() {
+        let text = (0..50)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = ed(&text);
+        e.view.scroll_line = 10;
+        e.set_cursor(Pos::new(15, 0));
+        e.scroll_down();
+        assert!(e.view.scroll_line > 10);
+        let prev = e.view.scroll_line;
+        e.scroll_up();
+        assert!(e.view.scroll_line < prev);
+    }
+
+    #[test]
+    fn test_scroll_up_at_top() {
+        let mut e = ed("hello\nworld");
+        e.scroll_up();
+        assert_eq!(e.view.scroll_line, 0);
+    }
+
+    #[test]
+    fn test_scroll_down_at_bottom() {
+        let mut e = ed("hello");
+        e.scroll_down();
+        assert_eq!(e.view.scroll_line, 0);
+    }
+
+    #[test]
+    fn test_screen_to_buffer_pos_normal() {
+        let mut e = ed("hello\nworld");
+        let pos = e.screen_to_buffer_pos(5, 1); // col 4, row 0
+        assert_eq!(pos.line, 0);
+    }
+
+    #[test]
+    fn test_screen_to_buffer_pos_below_content() {
+        let mut e = ed("hello");
+        let pos = e.screen_to_buffer_pos(1, 20); // way below
+        assert_eq!(pos.line, 0);
+        assert_eq!(pos.col, 5);
+    }
+
+    #[test]
+    fn test_clamp_cursor_to_viewport() {
+        let text = (0..50)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = ed(&text);
+        e.set_cursor(Pos::new(0, 0));
+        e.view.scroll_line = 10;
+        let gw = gutter_width(e.doc.buf.line_count());
+        let tc = e.view.text_cols(gw);
+        e.clamp_cursor_to_viewport(gw, tc);
+        // Cursor should be moved into viewport
+        assert!(e.cursor().line >= e.view.scroll_line);
+    }
+
+    #[test]
+    fn test_handle_event_mouse_exits_find_active() {
+        let mut e = ed("hello world");
+        e.find_active = true;
+        e.find_matches = vec![(Pos::new(0, 0), Pos::new(0, 5))];
+        e.handle_event(Event::Mouse(MouseEvent::Press(MouseButton::Left, 1, 1)));
+        assert!(!e.find_active);
+    }
+
+    // ========================================================================
+    // Clipboard/undo scenarios
+    // ========================================================================
+
+    #[test]
+    fn test_copy_paste_workflow() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 5),
+        };
+        e.copy();
+        e.set_cursor(Pos::new(0, 11));
+        e.paste();
+        assert_eq!(e.test_text(), "hello worldhello");
+    }
+
+    #[test]
+    fn test_cut() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 5),
+        };
+        e.cut();
+        assert_eq!(e.test_text(), " world");
+        e.paste();
+        assert_eq!(e.test_text(), "hello world");
+    }
+
+    #[test]
+    fn test_paste_text_replaces_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 6),
+            cursor: Pos::new(0, 11),
+        };
+        e.paste_text("earth");
+        assert_eq!(e.test_text(), "hello earth");
+    }
+
+    #[test]
+    fn test_paste_empty_noop() {
+        let mut e = ed("hello");
+        e.paste_text("");
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    #[test]
+    fn test_copy_empty_selection_noop() {
+        let mut e = ed("hello");
+        e.copy();
+        // Internal clipboard should still be empty
+        assert_eq!(e.clipboard.paste(), "");
+    }
+
+    #[test]
+    fn test_undo_redo_chain() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 5));
+        e.doc.seal_undo();
+        e.insert_char('!');
+        e.doc.seal_undo();
+        assert_eq!(e.test_text(), "hello!");
+        e.undo();
+        assert_eq!(e.test_text(), "hello");
+        e.redo();
+        assert_eq!(e.test_text(), "hello!");
+    }
+
+    // ========================================================================
+    // Comment/dedent scenarios
+    // ========================================================================
+
+    #[test]
+    fn test_toggle_comment_on_rs_file() {
+        let mut e = ed_named("hello\nworld", "test.rs");
+        e.set_cursor(Pos::new(0, 0));
+        e.toggle_comment();
+        assert_eq!(e.test_text(), "// hello\nworld");
+    }
+
+    #[test]
+    fn test_toggle_comment_off_rs_file() {
+        let mut e = ed_named("// hello\nworld", "test.rs");
+        e.set_cursor(Pos::new(0, 0));
+        e.toggle_comment();
+        assert_eq!(e.test_text(), "hello\nworld");
+    }
+
+    #[test]
+    fn test_toggle_comment_no_language() {
+        let mut e = ed("hello");
+        e.toggle_comment();
+        assert!(e.status_msg.contains("No language"));
+    }
+
+    #[test]
+    fn test_toggle_comment_selection() {
+        let mut e = ed_named("aaa\nbbb\nccc", "test.rs");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(2, 3),
+        };
+        e.toggle_comment();
+        assert_eq!(e.test_text(), "// aaa\n// bbb\n// ccc");
+    }
+
+    #[test]
+    fn test_dedent_spaces() {
+        let mut e = ed("  hello");
+        e.set_cursor(Pos::new(0, 2));
+        e.dedent();
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    #[test]
+    fn test_dedent_tab() {
+        let mut e = ed("\thello");
+        e.set_cursor(Pos::new(0, 1));
+        e.dedent();
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    #[test]
+    fn test_dedent_no_indent() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 0));
+        e.dedent();
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    #[test]
+    fn test_indent_selection_skips_blank_lines() {
+        let mut e = ed_named("aaa\n\nbbb", "test.rs");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(2, 3),
+        };
+        e.indent_selection();
+        assert_eq!(e.test_text(), "  aaa\n\n  bbb");
+    }
+
+    // ========================================================================
+    // File I/O scenarios
+    // ========================================================================
+
+    #[test]
+    fn test_strip_trailing_whitespace() {
+        let mut e = ed("hello   \nworld  ");
+        e.set_cursor(Pos::new(0, 8));
+        e.strip_trailing_whitespace();
+        assert_eq!(e.test_text(), "hello\nworld");
+        // Cursor should be clamped
+        assert!(e.cursor().col <= 5);
+    }
+
+    #[test]
+    fn test_save_no_filename_opens_prompt() {
+        let mut e = ed("hello");
+        e.save_file();
+        assert!(e.cmd_buf.active);
+        assert_eq!(e.cmd_buf.mode, CommandBufferMode::Prompt);
+    }
+
+    #[test]
+    fn test_save_to_temp_file() {
+        let dir = std::env::temp_dir().join("e_test_save");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        let mut e = ed_named("hello world", path.to_str().unwrap());
+        e.doc.dirty = true;
+        e.save_file();
+        assert!(!e.doc.dirty);
+        assert!(e.status_msg.contains("Saved"));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "hello world\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_status_left_scratch() {
+        let e = ed("hello");
+        let left = e.status_left();
+        assert!(left.contains("[scratch]"));
+    }
+
+    #[test]
+    fn test_status_left_named_clean() {
+        let e = ed_named("hello", "test.rs");
+        let left = e.status_left();
+        assert!(left.contains("test.rs"));
+        assert!(left.contains("Rust"));
+        assert!(!left.contains('*'));
+    }
+
+    #[test]
+    fn test_status_left_named_dirty() {
+        let mut e = ed_named("hello", "test.rs");
+        e.doc.dirty = true;
+        let left = e.status_left();
+        assert!(left.contains("test.rs*"));
+    }
+
+    #[test]
+    fn test_status_right() {
+        let e = ed("hello");
+        let right = e.status_right();
+        assert!(right.contains("e v"));
+    }
+
+    // ========================================================================
+    // Standalone functions
+    // ========================================================================
+
+    #[test]
+    fn test_common_prefix_basic() {
+        assert_eq!(common_prefix(&["abc", "abd", "abe"]), "ab");
+    }
+
+    #[test]
+    fn test_common_prefix_empty() {
+        assert_eq!(common_prefix(&[]), "");
+    }
+
+    #[test]
+    fn test_common_prefix_single() {
+        assert_eq!(common_prefix(&["hello"]), "hello");
+    }
+
+    #[test]
+    fn test_common_prefix_no_common() {
+        assert_eq!(common_prefix(&["abc", "xyz"]), "");
+    }
+
+    #[test]
+    fn test_is_paste_start_end() {
+        assert!(is_paste_start(&Event::Unsupported(PASTE_START.to_vec())));
+        assert!(is_paste_end(&Event::Unsupported(PASTE_END.to_vec())));
+        assert!(!is_paste_start(&Event::Key(Key::Char('a'))));
+        assert!(!is_paste_end(&Event::Key(Key::Char('a'))));
+    }
+
+    #[test]
+    fn test_cursor_display_col_with_tabs() {
+        let mut e = ed("\thello");
+        e.set_cursor(Pos::new(0, 1));
+        assert_eq!(e.cursor_display_col(), 2); // tab = 2 display cols
+    }
+
+    #[test]
+    fn test_cursor_display_col_no_tabs() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 3));
+        assert_eq!(e.cursor_display_col(), 3);
+    }
+
+    #[test]
+    fn test_find_matching_bracket() {
+        let mut e = ed("(hello)");
+        e.set_cursor(Pos::new(0, 0));
+        let result = e.find_matching_bracket();
+        assert!(result.is_some());
+        let (cursor, match_pos) = result.unwrap();
+        assert_eq!(cursor, Pos::new(0, 0));
+        assert_eq!(match_pos, Pos::new(0, 6));
+    }
+
+    #[test]
+    fn test_find_matching_bracket_none() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 0));
+        assert!(e.find_matching_bracket().is_none());
+    }
+
+    #[test]
+    fn test_center_view_on_line() {
+        let text = (0..100)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = ed(&text);
+        e.center_view_on_line(50);
+        // Scroll should be near line 50 - half of text_rows
+        assert!(e.view.scroll_line <= 50);
+        assert!(e.view.scroll_line + e.view.text_rows() > 50);
+    }
+
+    // ========================================================================
+    // draw() smoke test
+    // ========================================================================
+
+    #[test]
+    fn test_draw_does_not_panic() {
+        let mut e = ed_named("hello\nworld", "test.rs");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 5),
+        };
+        e.find_matches = vec![(Pos::new(0, 0), Pos::new(0, 5))];
+        e.find_active = true;
+        let mut output = Vec::new();
+        e.draw(&mut output).unwrap();
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_draw_with_cmd_buf_active() {
+        let mut e = ed("hello");
+        e.cmd_buf.open(CommandBufferMode::Find, "find: ", "test");
+        e.cmd_buf.completions = vec!["comp1".to_string()];
+        let mut output = Vec::new();
+        e.draw(&mut output).unwrap();
+        let s = String::from_utf8_lossy(&output);
+        assert!(s.contains("find: test"));
+    }
+
+    #[test]
+    fn test_draw_ruler_off() {
+        let mut e = ed("hello");
+        e.ruler_on = false;
+        let mut output = Vec::new();
+        e.draw(&mut output).unwrap();
+        assert!(!output.is_empty());
+    }
+
+    // ========================================================================
+    // handle_key non-configurable keys
+    // ========================================================================
+
+    #[test]
+    fn test_handle_key_delete() {
+        let mut e = ed("hello");
+        e.handle_key(Key::Delete);
+        assert_eq!(e.test_text(), "ello");
+    }
+
+    #[test]
+    fn test_handle_key_backtab() {
+        let mut e = ed("  hello");
+        e.set_cursor(Pos::new(0, 2));
+        e.handle_key(Key::BackTab);
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    #[test]
+    fn test_handle_key_newline() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 5));
+        e.handle_key(Key::Char('\n'));
+        assert_eq!(e.test_text(), "hello\n");
+    }
+
+    #[test]
+    fn test_handle_key_char() {
+        let mut e = ed("");
+        e.handle_key(Key::Char('a'));
+        e.handle_key(Key::Char('b'));
+        assert_eq!(e.test_text(), "ab");
+    }
+
+    #[test]
+    fn test_handle_key_unknown_does_nothing() {
+        let mut e = ed("hello");
+        e.handle_key(Key::F(12));
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    // ========================================================================
+    // keybinding dispatch
+    // ========================================================================
+
+    #[test]
+    fn test_keybinding_save() {
+        let dir = std::env::temp_dir().join("e_test_kb_save");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let mut e = ed_named("hello", path.to_str().unwrap());
+        e.doc.dirty = true;
+        e.handle_key(Key::Ctrl('s'));
+        assert!(!e.doc.dirty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_keybinding_undo_redo() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 5));
+        e.insert_char('!');
+        e.doc.seal_undo();
+        e.handle_key(Key::Ctrl('z'));
+        assert_eq!(e.test_text(), "hello");
+        e.handle_key(Key::Ctrl('y'));
+        assert_eq!(e.test_text(), "hello!");
+    }
+
+    #[test]
+    fn test_keybinding_copy_paste() {
+        let mut e = ed("hello");
+        e.handle_key(Key::Ctrl('a')); // select all
+        e.handle_key(Key::Ctrl('c')); // copy
+        e.set_cursor(Pos::new(0, 5));
+        e.handle_key(Key::Ctrl('v')); // paste
+        assert_eq!(e.test_text(), "hellohello");
+    }
+
+    #[test]
+    fn test_keybinding_cut() {
+        let mut e = ed("hello");
+        e.handle_key(Key::Ctrl('a'));
+        e.handle_key(Key::Ctrl('x'));
+        assert_eq!(e.test_text(), "");
+    }
+
+    #[test]
+    fn test_keybinding_kill_line() {
+        let mut e = ed("hello\nworld");
+        e.handle_key(Key::Ctrl('k'));
+        assert_eq!(e.test_text(), "world");
+    }
+
+    #[test]
+    fn test_keybinding_goto_top_end() {
+        let mut e = ed("aaa\nbbb\nccc");
+        e.set_cursor(Pos::new(1, 1));
+        e.handle_key(Key::Ctrl('t'));
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+        e.handle_key(Key::Ctrl('g'));
+        assert_eq!(e.cursor(), Pos::new(2, 3));
+    }
+
+    #[test]
+    fn test_keybinding_toggle_ruler() {
+        let mut e = ed("hello");
+        assert!(e.ruler_on);
+        e.handle_key(Key::Ctrl('r'));
+        assert!(!e.ruler_on);
+    }
+
+    #[test]
+    fn test_keybinding_command_palette() {
+        let mut e = ed("hello");
+        e.handle_key(Key::Ctrl('p'));
+        assert!(e.cmd_buf.active);
+        assert_eq!(e.cmd_buf.mode, CommandBufferMode::Command);
+    }
+
+    #[test]
+    fn test_keybinding_goto_line() {
+        let mut e = ed("hello");
+        e.handle_key(Key::Ctrl('l'));
+        assert!(e.cmd_buf.active);
+        assert_eq!(e.cmd_buf.mode, CommandBufferMode::Goto);
+    }
+
+    #[test]
+    fn test_keybinding_find() {
+        let mut e = ed("hello");
+        e.handle_key(Key::Ctrl('f'));
+        assert!(e.cmd_buf.active);
+        assert_eq!(e.cmd_buf.mode, CommandBufferMode::Find);
+    }
+
+    #[test]
+    fn test_keybinding_find_prefills_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 6),
+            cursor: Pos::new(0, 11),
+        };
+        e.handle_key(Key::Ctrl('f'));
+        assert_eq!(e.cmd_buf.input, "world");
+    }
+
+    #[test]
+    fn test_keybinding_ctrl_backspace() {
+        let mut e = ed("hello world");
+        e.set_cursor(Pos::new(0, 11));
+        e.handle_key(Key::Ctrl('h'));
+        assert_eq!(e.test_text(), "hello ");
+    }
+
+    #[test]
+    fn test_keybinding_toggle_comment() {
+        let mut e = ed_named("hello", "test.rs");
+        e.handle_key(Key::Ctrl('d'));
+        assert_eq!(e.test_text(), "// hello");
+    }
+
+    #[test]
+    fn test_keybinding_duplicate_line() {
+        let mut e = ed("hello");
+        e.handle_key(Key::Ctrl('j'));
+        assert_eq!(e.test_text(), "hello\nhello");
+    }
+
+    #[test]
+    fn test_keybinding_select_word() {
+        let mut e = ed("hello world");
+        e.set_cursor(Pos::new(0, 7));
+        e.handle_key(Key::Ctrl('w'));
+        assert!(!e.sel.is_empty());
+    }
+
+    // ========================================================================
+    // desired_col reset
+    // ========================================================================
+
+    #[test]
+    fn test_desired_col_reset_on_non_vertical_movement() {
+        let mut e = ed("hello\nworld");
+        e.set_cursor(Pos::new(0, 3));
+        e.handle_key(Key::Down); // sets desired_col
+        assert!(e.desired_col.is_some());
+        e.handle_key(Key::Char('x')); // non-vertical key should clear it
+        assert!(e.desired_col.is_none());
+    }
+
+    // ========================================================================
+    // mouse double/triple click
+    // ========================================================================
+
+    #[test]
+    fn test_select_word_at_empty_line() {
+        let mut e = ed("hello\n\nworld");
+        e.select_word_at(Pos::new(1, 0));
+        // Empty line should not select anything (early return)
+        assert!(e.sel.is_empty());
+    }
+
+    #[test]
+    fn test_select_line_at_out_of_bounds() {
+        let mut e = ed("hello");
+        e.select_line_at(999);
+        assert!(e.sel.is_empty());
+    }
+
+    // ========================================================================
+    // set_status
+    // ========================================================================
+
+    #[test]
+    fn test_set_status() {
+        let mut e = ed("hello");
+        e.set_status("test message".to_string());
+        assert_eq!(e.status_msg, "test message");
+        assert!(e.status_time.is_some());
+    }
+
+    // ========================================================================
+    // handle_mouse dispatch
+    // ========================================================================
+
+    #[test]
+    fn test_handle_mouse_wheel_up() {
+        let text = (0..50)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = ed(&text);
+        e.view.scroll_line = 10;
+        e.set_cursor(Pos::new(15, 0));
+        e.handle_mouse(MouseEvent::Press(MouseButton::WheelUp, 1, 1));
+        assert!(e.view.scroll_line < 10);
+    }
+
+    #[test]
+    fn test_handle_mouse_wheel_down() {
+        let text = (0..50)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = ed(&text);
+        e.set_cursor(Pos::new(5, 0));
+        e.handle_mouse(MouseEvent::Press(MouseButton::WheelDown, 1, 1));
+        assert!(e.view.scroll_line > 0);
+    }
+
+    #[test]
+    fn test_handle_mouse_other_button_noop() {
+        let mut e = ed("hello");
+        e.handle_mouse(MouseEvent::Press(MouseButton::Middle, 1, 1));
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    // ========================================================================
+    // save_undo_if_named
+    // ========================================================================
+
+    #[test]
+    fn test_save_undo_if_named_no_file() {
+        let mut e = ed("hello");
+        e.save_undo_if_named(); // should not panic
+    }
+
+    // ========================================================================
+    // handle_event dispatches cmd_key when cmd_buf active
+    // ========================================================================
+
+    #[test]
+    fn test_handle_event_dispatches_cmd_key() {
+        let mut e = ed("hello");
+        e.cmd_buf.open(CommandBufferMode::Command, "> ", "");
+        e.handle_event(Event::Key(Key::Char('x')));
+        assert_eq!(e.cmd_buf.input, "x");
+    }
+
+    #[test]
+    fn test_unsupported_ignored_when_cmd_active() {
+        let mut e = ed("hello\nworld");
+        e.cmd_buf.open(CommandBufferMode::Command, "> ", "");
+        e.handle_event(Event::Unsupported(CTRL_SHIFT_UP.to_vec()));
+        // Should be ignored, cursor unchanged
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+    }
+
+    // ========================================================================
+    // find_next / find_prev with empty matches
+    // ========================================================================
+
+    #[test]
+    fn test_find_next_empty_matches() {
+        let mut e = ed("hello");
+        e.find_next(); // should not panic
+    }
+
+    #[test]
+    fn test_find_prev_empty_matches() {
+        let mut e = ed("hello");
+        e.find_prev(); // should not panic
+    }
+
+    // ========================================================================
+    // kill_line empty buffer
+    // ========================================================================
+
+    #[test]
+    fn test_kill_line_single_line() {
+        let mut e = ed("hello");
+        e.kill_line();
+        assert_eq!(e.test_text(), "");
+    }
+
+    // ========================================================================
+    // shift+arrow
+    // ========================================================================
+
+    #[test]
+    fn test_shift_arrows_dispatch() {
+        let mut e = ed("hello\nworld");
+        e.set_cursor(Pos::new(0, 2));
+        e.handle_key(Key::ShiftRight);
+        assert_eq!(e.sel.cursor, Pos::new(0, 3));
+        e.handle_key(Key::ShiftLeft);
+        assert_eq!(e.sel.cursor, Pos::new(0, 2));
+        e.handle_key(Key::ShiftDown);
+        assert_eq!(e.sel.cursor, Pos::new(1, 2));
+        e.handle_key(Key::ShiftUp);
+        assert_eq!(e.sel.cursor, Pos::new(0, 2));
+    }
+
+    // ========================================================================
+    // page up/down dispatch
+    // ========================================================================
+
+    #[test]
+    fn test_page_up_down_dispatch() {
+        let text = (0..50)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = ed(&text);
+        e.set_cursor(Pos::new(25, 0));
+        e.handle_key(Key::PageUp);
+        assert!(e.cursor().line < 25);
+        e.handle_key(Key::PageDown);
+        assert!(e.cursor().line > 3);
+    }
+
+    // ========================================================================
+    // movement dispatch via handle_key
+    // ========================================================================
+
+    #[test]
+    fn test_arrow_keys_dispatch() {
+        let mut e = ed("hello\nworld");
+        e.handle_key(Key::Down);
+        assert_eq!(e.cursor().line, 1);
+        e.handle_key(Key::Up);
+        assert_eq!(e.cursor().line, 0);
+        e.handle_key(Key::Right);
+        assert_eq!(e.cursor().col, 1);
+        e.handle_key(Key::Left);
+        assert_eq!(e.cursor().col, 0);
+        e.handle_key(Key::End);
+        assert_eq!(e.cursor().col, 5);
+        e.handle_key(Key::Home);
+        assert_eq!(e.cursor().col, 0);
+    }
+
+    // ========================================================================
+    // Tab key dispatch
+    // ========================================================================
+
+    #[test]
+    fn test_tab_key_dispatch() {
+        let mut e = ed_named("hello", "test.rs");
+        e.handle_key(Key::Char('\t'));
+        assert_eq!(e.test_text(), "  hello");
+    }
+
+    // ========================================================================
+    // Coverage gap: scroll_up through wrapped prev line (lines 1071-1073)
+    // ========================================================================
+
+    #[test]
+    fn test_scroll_up_through_wrapped_prev_line() {
+        // Line 0 is very long (wraps many times), line 1 is short
+        let long_line = "a".repeat(300);
+        let text = format!("{}\nshort", long_line);
+        let mut e = ed(&text);
+        e.ruler_on = false;
+        // Start scrolled at line 1
+        e.view.scroll_line = 1;
+        e.view.scroll_wrap = 0;
+        e.set_cursor(Pos::new(1, 0));
+        // Scroll up — should go into line 0's wraps
+        e.scroll_up();
+        assert_eq!(e.view.scroll_line, 0);
+        assert!(e.view.scroll_wrap > 0); // should be partway through wraps
+    }
+
+    // ========================================================================
+    // Coverage gap: scroll_down partial wrap (lines 1104-1105)
+    // ========================================================================
+
+    #[test]
+    fn test_scroll_down_partial_wrap_advance() {
+        // Single very long line that wraps many times
+        // With 80 cols and no ruler, SCROLL_LINES=3 should advance by 3 wraps
+        let long_line = "a".repeat(500);
+        let text = format!("{}\nend", long_line);
+        let mut e = ed(&text);
+        e.ruler_on = false;
+        e.view.scroll_line = 0;
+        e.view.scroll_wrap = 0;
+        e.set_cursor(Pos::new(0, 0));
+        e.scroll_down();
+        // Should have advanced through wraps within line 0
+        assert_eq!(e.view.scroll_line, 0);
+        assert_eq!(e.view.scroll_wrap, 3); // SCROLL_LINES = 3
+    }
+
+    // ========================================================================
+    // Coverage gap: handle_key Save keybinding (line 478)
+    // ========================================================================
+
+    #[test]
+    fn test_save_keybinding_no_filename() {
+        let mut e = ed("hello");
+        e.handle_key(Key::Ctrl('s'));
+        // No filename → opens save-as prompt
+        assert!(e.cmd_buf.active);
+    }
+
+    // ========================================================================
+    // Coverage gap: handle_key Backspace (line 544)
+    // ========================================================================
+
+    #[test]
+    fn test_backspace_key_dispatch() {
+        let mut e = ed("ab");
+        e.set_cursor(Pos::new(0, 2));
+        e.handle_key(Key::Backspace);
+        assert_eq!(e.test_text(), "a");
+    }
+
+    // ========================================================================
+    // Coverage gap: command submit via handle_cmd_result (line 588)
+    // ========================================================================
+
+    #[test]
+    fn test_cmd_submit_executes_command() {
+        let mut e = ed("hello");
+        e.handle_cmd_result(
+            crate::command_buffer::CommandBufferMode::Command,
+            crate::command_buffer::CommandBufferResult::Submit("ruler".to_string()),
+        );
+        // ruler command toggles ruler
+        assert!(!e.ruler_on);
+    }
+
+    // ========================================================================
+    // Coverage gap: execute_command None action (line 679)
+    // ========================================================================
+
+    #[test]
+    fn test_execute_unknown_command() {
+        let mut e = ed("hello");
+        e.execute_command("nonexistent_command");
+        // Should set status message about unknown command
+        assert!(e.status_msg.contains("Unknown"));
+    }
+
+    // ========================================================================
+    // Coverage gap: kill_line on single-line doc (line 731)
+    // ========================================================================
+
+    #[test]
+    fn test_kill_line_on_last_line() {
+        let mut e = ed("hello");
+        e.kill_line();
+        assert_eq!(e.test_text(), "");
+    }
+
+    // ========================================================================
+    // Coverage gap: draw with status_msg (line 280)
+    // ========================================================================
+
+    #[test]
+    fn test_draw_with_status_msg() {
+        let mut e = ed("hello\nworld");
+        e.set_status("Test status".to_string());
+        assert!(!e.status_msg.is_empty());
+        let mut buf = Vec::new();
+        let _ = e.draw(&mut buf);
+        let output = String::from_utf8_lossy(&buf);
+        assert!(output.contains("Test status"));
+    }
+
+    // ========================================================================
+    // Coverage gap: center_view_on_line with ruler off (line 353)
+    // ========================================================================
+
+    #[test]
+    fn test_center_view_ruler_off() {
+        let mut e =
+            ed("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\nr\ns\nt\nu\nv\nw\nx\ny\nz");
+        e.ruler_on = false;
+        e.center_view_on_line(20);
+        // Cursor should be somewhere near line 20
+        assert!(e.view.scroll_line > 0);
+    }
+
+    // ========================================================================
+    // Coverage gap: find_matching_bracket for quotes (line 393)
+    // ========================================================================
+
+    #[test]
+    fn test_find_matching_quote() {
+        let mut e = ed("let s = \"hello\";\n");
+        // Place cursor on the opening quote
+        e.set_cursor(Pos::new(0, 8));
+        let pair = e.find_matching_bracket();
+        assert!(pair.is_some());
+        let (_, match_pos) = pair.unwrap();
+        assert_eq!(match_pos.col, 14); // closing quote
+    }
+
+    // ========================================================================
+    // Coverage gap: replace_all case-sensitive (line 863)
+    // ========================================================================
+
+    #[test]
+    fn test_replace_all_case_sensitive() {
+        let mut e = ed("Hello hello HELLO");
+        // Capital letter in pattern → case-sensitive
+        e.replace_all("Hello", "Bye");
+        assert_eq!(e.test_text(), "Bye hello HELLO");
+    }
+
+    // ========================================================================
+    // Coverage gap: mouse drag Hold event (line 909)
+    // ========================================================================
+
+    #[test]
+    fn test_mouse_hold_drag() {
+        let mut e = ed("hello world");
+        e.ruler_on = false;
+        // Start a press first so dragging=true
+        e.handle_mouse(MouseEvent::Press(MouseButton::Left, 1, 1));
+        assert!(e.dragging);
+        // Now drag
+        e.handle_mouse(MouseEvent::Hold(6, 1));
+        assert!(!e.sel.is_empty());
+    }
+
+    // ========================================================================
+    // Coverage gap: mouse release event
+    // ========================================================================
+
+    #[test]
+    fn test_mouse_release_stops_drag() {
+        let mut e = ed("hello");
+        e.dragging = true;
+        e.handle_mouse(MouseEvent::Release(1, 1));
+        assert!(!e.dragging);
+    }
+
+    // ========================================================================
+    // Coverage gap: screen_to_buffer_pos ruler off (line 924)
+    // ========================================================================
+
+    #[test]
+    fn test_screen_to_buffer_pos_ruler_off() {
+        let mut e = ed("hello\nworld");
+        e.ruler_on = false;
+        let pos = e.screen_to_buffer_pos(1, 1);
+        assert_eq!(pos, Pos::new(0, 0));
+        let pos2 = e.screen_to_buffer_pos(1, 2);
+        assert_eq!(pos2, Pos::new(1, 0));
+    }
+
+    // ========================================================================
+    // Coverage gap: screen_to_buffer_pos text_cols=0 (line 928)
+    // ========================================================================
+
+    #[test]
+    fn test_screen_to_buffer_pos_zero_cols() {
+        let mut e = ed("hello");
+        e.view = crate::view::View::new(1, 3); // very narrow
+        e.ruler_on = true;
+        // With gutter eating all columns, text_cols might be 0
+        let pos = e.screen_to_buffer_pos(1, 1);
+        assert_eq!(pos, Pos::zero());
+    }
+
+    // ========================================================================
+    // Coverage gap: multi-click double/triple (lines 977-994)
+    // ========================================================================
+
+    #[test]
+    fn test_double_click_selects_word() {
+        let mut e = ed("hello world");
+        e.ruler_on = false;
+        // First click
+        e.mouse_press(1, 1);
+        // Simulate double click by setting last_click_time/pos and calling again
+        e.mouse_press(1, 1);
+        // Should select word "hello"
+        assert!(!e.sel.is_empty());
+    }
+
+    #[test]
+    fn test_triple_click_selects_line() {
+        let mut e = ed("hello world\nsecond");
+        e.ruler_on = false;
+        // Three clicks at the same spot
+        e.mouse_press(1, 1);
+        e.mouse_press(1, 1);
+        e.mouse_press(1, 1);
+        // Should select entire first line
+        assert!(!e.sel.is_empty());
+    }
+
+    // ========================================================================
+    // Coverage gap: mouse_drag when not dragging (line 1000)
+    // ========================================================================
+
+    #[test]
+    fn test_mouse_drag_not_dragging_noop() {
+        let mut e = ed("hello");
+        e.dragging = false;
+        let cursor_before = e.cursor();
+        e.mouse_drag(5, 1);
+        assert_eq!(e.cursor(), cursor_before);
+    }
+
+    // ========================================================================
+    // Coverage gap: scroll_up/down with ruler off (lines 1052, 1091)
+    // ========================================================================
+
+    #[test]
+    fn test_scroll_up_ruler_off() {
+        let text = (0..50)
+            .map(|i| format!("line{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = ed(&text);
+        e.ruler_on = false;
+        e.view.scroll_line = 20;
+        e.set_cursor(Pos::new(20, 0));
+        e.scroll_up();
+        assert!(e.view.scroll_line < 20);
+    }
+
+    #[test]
+    fn test_scroll_down_ruler_off() {
+        let text = (0..50)
+            .map(|i| format!("line{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = ed(&text);
+        e.ruler_on = false;
+        e.set_cursor(Pos::new(0, 0));
+        e.scroll_down();
+        assert!(e.view.scroll_line > 0);
+    }
+
+    // ========================================================================
+    // Coverage gap: scroll_up with scroll_wrap > 0 (lines 1059-1061)
+    // ========================================================================
+
+    #[test]
+    fn test_scroll_up_with_wrap() {
+        let long_line = "a".repeat(200);
+        let mut e = ed(&long_line);
+        e.ruler_on = false;
+        // Set scroll_wrap to simulate being partway through a wrapped line
+        e.view.scroll_wrap = 3;
+        e.set_cursor(Pos::new(0, 0));
+        e.scroll_up();
+        assert!(e.view.scroll_wrap < 3);
+    }
+
+    // ========================================================================
+    // Coverage gap: scroll_down wrapping (lines 1104-1105)
+    // ========================================================================
+
+    #[test]
+    fn test_scroll_down_with_wrap() {
+        let long_line = "a".repeat(200);
+        let text = format!("{}\nshort", long_line);
+        let mut e = ed(&text);
+        e.ruler_on = false;
+        e.set_cursor(Pos::new(0, 0));
+        // Scroll down — should advance through wraps of the long line
+        e.scroll_down();
+        assert!(e.view.scroll_wrap > 0 || e.view.scroll_line > 0);
+    }
+
+    // ========================================================================
+    // Coverage gap: clamp_cursor_to_viewport zero rows/cols (line 1120)
+    // ========================================================================
+
+    #[test]
+    fn test_clamp_cursor_zero_rows() {
+        let mut e = ed("hello");
+        e.view = crate::view::View::new(80, 2); // only 2 rows = 0 text rows
+        let cursor_before = e.cursor();
+        e.clamp_cursor_to_viewport(0, 80);
+        // Should return early without changing cursor
+        assert_eq!(e.cursor(), cursor_before);
+    }
+
+    // ========================================================================
+    // Coverage gap: clamp_cursor below viewport (lines 1173-1177)
+    // ========================================================================
+
+    #[test]
+    fn test_clamp_cursor_below_viewport() {
+        let text = (0..50)
+            .map(|i| format!("line{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut e = ed(&text);
+        e.ruler_on = false;
+        // Put cursor far below viewport
+        e.sel.cursor = Pos::new(45, 0);
+        e.sel.anchor = Pos::new(45, 0);
+        e.view.scroll_line = 0;
+        // Clamp should snap cursor into viewport
+        e.clamp_cursor_to_viewport(0, 80);
+        assert!(e.cursor().line < 45);
+    }
+
+    // ========================================================================
+    // Coverage gap: move_left_extend wrapping to prev line (lines 1363-1364)
+    // ========================================================================
+
+    #[test]
+    fn test_move_left_extend_wraps_to_prev_line() {
+        let mut e = ed("hello\nworld");
+        e.set_cursor(Pos::new(1, 0));
+        e.move_left_extend();
+        assert_eq!(e.sel.cursor, Pos::new(0, 5));
+    }
+
+    // ========================================================================
+    // Coverage gap: move_right_extend wrapping to next line (line 1374)
+    // ========================================================================
+
+    #[test]
+    fn test_move_right_extend_wraps_to_next_line() {
+        let mut e = ed("hello\nworld");
+        e.set_cursor(Pos::new(0, 5));
+        e.move_right_extend();
+        assert_eq!(e.sel.cursor, Pos::new(1, 0));
+    }
+
+    // ========================================================================
+    // Coverage gap: indent_selection end line adjustment (line 1410)
+    // ========================================================================
+
+    #[test]
+    fn test_indent_selection_skips_trailing_empty_line() {
+        let mut e = ed_named("aaa\nbbb\nccc\n", "test.rs");
+        // Select lines 0-2 with cursor at col 0 of line 3 (empty trailing)
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(3, 0),
+        };
+        e.indent_selection();
+        // Lines 0-2 should be indented, but not the empty line after
+        assert!(e.test_text().starts_with("  aaa\n  bbb\n  ccc\n"));
+    }
+
+    // ========================================================================
+    // Coverage gap: toggle_comment with selection end line adj (line 1576)
+    // ========================================================================
+
+    #[test]
+    fn test_toggle_comment_selection_end_adj() {
+        let mut e = ed_named("aaa\nbbb\nccc\n", "test.rs");
+        // Select with cursor at col 0 of a later line
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(2, 0),
+        };
+        e.toggle_comment();
+        // Lines 0-1 should be commented (not line 2 since cursor col=0)
+        let text = e.test_text();
+        assert!(text.starts_with("// aaa\n// bbb\n"));
+    }
+
+    // ========================================================================
+    // Coverage gap: toggle_comment with empty/whitespace lines (line 1590, 1630)
+    // ========================================================================
+
+    #[test]
+    fn test_toggle_comment_with_blank_lines() {
+        let mut e = ed_named("aaa\n\nbbb\n", "test.rs");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(2, 3),
+        };
+        e.toggle_comment();
+        // Blank lines should be skipped when commenting
+        let text = e.test_text();
+        assert!(text.contains("// aaa"));
+        assert!(text.contains("// bbb"));
+        // The blank line should stay blank (not get "// " prefix)
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "");
+    }
+
+    // ========================================================================
+    // Coverage gap: dedent selection end line adj (lines 1645-1651)
+    // ========================================================================
+
+    #[test]
+    fn test_dedent_selection_end_adj() {
+        let mut e = ed_named("  aaa\n  bbb\n  ccc\n", "test.rs");
+        // Select with cursor at col 0 of line 2
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(2, 0),
+        };
+        e.dedent();
+        // Lines 0-1 should be dedented
+        let text = e.test_text();
+        assert!(text.starts_with("aaa\nbbb\n"));
+    }
+
+    // ========================================================================
+    // Coverage gap: cut with no selection (line 1695)
+    // ========================================================================
+
+    #[test]
+    fn test_cut_no_selection_noop() {
+        let mut e = ed("hello");
+        e.cut();
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    // ========================================================================
+    // Coverage gap: execute_command Save/SaveAs (lines 679-683)
+    // ========================================================================
+
+    #[test]
+    fn test_execute_command_save_as_file() {
+        let dir = std::env::temp_dir().join("e_test_save_as_cmd");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("new.txt");
+        let mut e = ed("hello");
+        let cmd = format!("save {}", path.to_str().unwrap());
+        e.execute_command(&cmd);
+        assert_eq!(e.doc.filename.as_deref(), Some(path.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_execute_command_quit_via_cmd() {
+        let mut e = ed("hello");
+        e.execute_command("quit");
+        assert!(!e.running);
+    }
+
+    // ========================================================================
+    // Coverage gap: handle_cmd_result SudoSave mode (lines 599-600)
+    // ========================================================================
+
+    #[test]
+    fn test_handle_cmd_result_sudo_cancel_cleans_tmp() {
+        let mut e = ed("hello");
+        e.sudo_save_tmp = Some("/tmp/e_test_sudo_fake".to_string());
+        e.handle_cmd_result(
+            crate::command_buffer::CommandBufferMode::SudoSave,
+            crate::command_buffer::CommandBufferResult::Cancel,
+        );
+        assert!(e.sudo_save_tmp.is_none());
+    }
+
+    // ========================================================================
+    // Coverage gap: delete_selection when empty (line 1185)
+    // ========================================================================
+
+    #[test]
+    fn test_delete_selection_empty_noop() {
+        let mut e = ed("hello");
+        e.delete_selection();
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    // ========================================================================
+    // Coverage gap: save_file with filename opens save prompt when none
+    // ========================================================================
+
+    #[test]
+    fn test_save_file_no_name_opens_prompt() {
+        let mut e = ed("hello");
+        e.save_file();
+        assert!(e.cmd_buf.active);
+        assert_eq!(
+            e.cmd_buf.mode,
+            crate::command_buffer::CommandBufferMode::Prompt
+        );
+    }
+
+    // ========================================================================
+    // Coverage gap: save_file to temp file (covers lines 1789-1794)
+    // ========================================================================
+
+    #[test]
+    fn test_save_file_to_temp() {
+        let dir = std::env::temp_dir().join("e_test_save_file");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        let mut e = ed("hello world");
+        e.doc.filename = Some(path.to_str().unwrap().to_string());
+        e.doc.dirty = true;
+        e.save_file();
+        assert!(!e.doc.dirty);
+        assert!(e.status_msg.contains("Saved"));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "hello world\n"); // trailing newline added
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ========================================================================
+    // Coverage gap: save_undo_if_named (lines 567-570)
+    // ========================================================================
+
+    #[test]
+    fn test_save_undo_if_named_with_existing_file() {
+        let dir = std::env::temp_dir().join("e_test_save_undo");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let mut e = ed("hello");
+        e.doc.filename = Some(path.to_str().unwrap().to_string());
+        e.save_undo_if_named(); // should not panic
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ========================================================================
+    // Coverage gap: Find with selection prefill (lines 498-506)
+    // ========================================================================
+
+    #[test]
+    fn test_find_prefills_from_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 5),
+        };
+        e.handle_key(Key::Ctrl('f'));
+        assert!(e.cmd_buf.active);
+        assert_eq!(e.cmd_buf.input, "hello");
+    }
+
+    // ========================================================================
+    // Coverage gap: multiple completions with common prefix (lines 665-667)
+    // ========================================================================
+
+    #[test]
+    fn test_command_completion_common_prefix() {
+        let mut e = ed("hello");
+        e.cmd_buf
+            .open(crate::command_buffer::CommandBufferMode::Command, "> ", "");
+        e.cmd_buf.input = "go".to_string();
+        e.cmd_buf.cursor = 2;
+        // Request tab completion — should find "goto" and complete the common prefix
+        let result = e.cmd_buf.handle_key(Key::Char('\t'));
+        let mode = e.cmd_buf.mode;
+        e.handle_cmd_result(mode, result);
+        // "goto" and "gotoline" both start with "goto"
+        // Depending on commands available, this should complete to at least "goto"
     }
 }

@@ -254,4 +254,21 @@ mod tests {
         let reg = CommandRegistry::new();
         assert!(matches!(reg.execute("  save  "), CommandAction::Save));
     }
+
+    #[test]
+    fn test_command_names() {
+        let reg = CommandRegistry::new();
+        let names = reg.command_names();
+        assert!(names.contains(&"save"));
+        assert!(names.contains(&"quit"));
+        assert!(names.contains(&"q"));
+        assert!(names.contains(&"goto"));
+        assert!(names.contains(&"ruler"));
+        assert!(names.contains(&"replaceall"));
+        assert!(names.contains(&"comment"));
+        // Should be sorted
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+    }
 }

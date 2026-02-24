@@ -412,6 +412,34 @@ mod tests {
     }
 
     #[test]
+    fn test_begin_end_group() {
+        let mut stack = UndoStack::new();
+        stack.begin_group();
+        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(ins(1, b" "), Pos::new(0, 1), Pos::new(0, 2));
+        stack.record(ins(2, b"b"), Pos::new(0, 2), Pos::new(0, 3));
+        stack.end_group();
+
+        // All three ops in one group, even though space normally breaks
+        let (ops, _) = stack.undo().unwrap();
+        assert_eq!(ops.len(), 3);
+        assert!(stack.undo().is_none());
+    }
+
+    #[test]
+    fn test_force_group_ignores_kind_change() {
+        let mut stack = UndoStack::new();
+        stack.begin_group();
+        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(del(0, b"a"), Pos::new(0, 1), Pos::new(0, 0));
+        stack.end_group();
+
+        // Insert then delete should still be one group when force_group is on
+        let (ops, _) = stack.undo().unwrap();
+        assert_eq!(ops.len(), 2);
+    }
+
+    #[test]
     fn test_multiple_undo_redo_cycles() {
         let mut stack = UndoStack::new();
         stack.record(ins(0, b"x"), Pos::new(0, 0), Pos::new(0, 1));
