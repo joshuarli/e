@@ -21,6 +21,9 @@ pub enum CommandAction {
         replacement: String,
     },
     ToggleComment,
+    CommentOn,
+    CommentOff,
+    SelectAll,
     StatusMsg(String),
 }
 
@@ -39,6 +42,7 @@ impl CommandRegistry {
         commands.insert("ruler".to_string(), cmd_ruler);
         commands.insert("replaceall".to_string(), cmd_replaceall);
         commands.insert("comment".to_string(), cmd_comment);
+        commands.insert("selectall".to_string(), cmd_selectall);
 
         Self { commands }
     }
@@ -113,8 +117,17 @@ fn cmd_replaceall(args: &str, ctx: &mut CommandContext) {
     };
 }
 
-fn cmd_comment(_args: &str, ctx: &mut CommandContext) {
-    ctx.action = CommandAction::ToggleComment;
+fn cmd_comment(args: &str, ctx: &mut CommandContext) {
+    match args.trim() {
+        "on" => ctx.action = CommandAction::CommentOn,
+        "off" => ctx.action = CommandAction::CommentOff,
+        "" => ctx.action = CommandAction::ToggleComment,
+        _ => ctx.action = CommandAction::StatusMsg("Usage: comment [on|off]".to_string()),
+    }
+}
+
+fn cmd_selectall(_args: &str, ctx: &mut CommandContext) {
+    ctx.action = CommandAction::SelectAll;
 }
 
 #[cfg(test)]
@@ -241,6 +254,39 @@ mod tests {
     }
 
     #[test]
+    fn test_comment_on() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.execute("comment on"),
+            CommandAction::CommentOn
+        ));
+    }
+
+    #[test]
+    fn test_comment_off() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.execute("comment off"),
+            CommandAction::CommentOff
+        ));
+    }
+
+    #[test]
+    fn test_comment_invalid_arg() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.execute("comment foo"),
+            CommandAction::StatusMsg(_)
+        ));
+    }
+
+    #[test]
+    fn test_selectall_command() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(reg.execute("selectall"), CommandAction::SelectAll));
+    }
+
+    #[test]
     fn test_unknown_command() {
         let reg = CommandRegistry::new();
         match reg.execute("foobar") {
@@ -266,6 +312,7 @@ mod tests {
         assert!(names.contains(&"ruler"));
         assert!(names.contains(&"replaceall"));
         assert!(names.contains(&"comment"));
+        assert!(names.contains(&"selectall"));
         // Should be sorted
         let mut sorted = names.clone();
         sorted.sort();

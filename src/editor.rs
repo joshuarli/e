@@ -726,6 +726,9 @@ impl Editor {
                 self.replace_all(&pattern, &replacement);
             }
             CommandAction::ToggleComment => self.toggle_comment(),
+            CommandAction::CommentOn => self.set_comment(true),
+            CommandAction::CommentOff => self.set_comment(false),
+            CommandAction::SelectAll => self.select_all(),
             CommandAction::StatusMsg(msg) => self.set_status(msg),
         }
     }
@@ -1587,6 +1590,15 @@ impl Editor {
     // -- commenting ---------------------------------------------------------
 
     fn toggle_comment(&mut self) {
+        self.comment_impl(None);
+    }
+
+    fn set_comment(&mut self, on: bool) {
+        self.comment_impl(Some(on));
+    }
+
+    /// `force`: None = toggle, Some(true) = comment, Some(false) = uncomment.
+    fn comment_impl(&mut self, force: Option<bool>) {
         let comment = match self.doc.filename.as_deref().and_then(language::detect) {
             Some(lang) => lang.comment,
             None => {
@@ -1619,8 +1631,14 @@ impl Editor {
             }
         });
 
+        let do_uncomment = match force {
+            Some(true) => false,   // comment on → never uncomment
+            Some(false) => true,   // comment off → always uncomment
+            None => all_commented, // toggle
+        };
+
         self.doc.begin_undo_group();
-        if all_commented {
+        if do_uncomment {
             // Uncomment: remove first occurrence of "comment " from each line
             for line_idx in (start_line..=end_line).rev() {
                 let text = self.doc.buf.line_text(line_idx);
@@ -2678,6 +2696,46 @@ mod tests {
         let mut e = ed_named("hello", "test.rs");
         e.execute_command("comment");
         assert_eq!(e.test_text(), "// hello");
+    }
+
+    #[test]
+    fn test_execute_command_comment_on() {
+        let mut e = ed_named("// hello", "test.rs");
+        e.execute_command("comment on");
+        // Already commented — idempotent, skips already-commented lines
+        assert_eq!(e.test_text(), "// hello");
+    }
+
+    #[test]
+    fn test_execute_command_comment_on_uncommented() {
+        let mut e = ed_named("hello", "test.rs");
+        e.execute_command("comment on");
+        assert_eq!(e.test_text(), "// hello");
+    }
+
+    #[test]
+    fn test_execute_command_comment_off() {
+        let mut e = ed_named("// hello", "test.rs");
+        e.execute_command("comment off");
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    #[test]
+    fn test_execute_command_comment_off_uncommented() {
+        let mut e = ed_named("hello", "test.rs");
+        e.execute_command("comment off");
+        // Already uncommented, "off" tries to remove but nothing to remove
+        assert_eq!(e.test_text(), "hello");
+    }
+
+    #[test]
+    fn test_execute_command_selectall() {
+        let mut e = ed("hello\nworld");
+        e.execute_command("selectall");
+        assert!(!e.sel.is_empty());
+        let (start, end) = e.sel.ordered();
+        assert_eq!(start, Pos::zero());
+        assert_eq!(end.line, 1);
     }
 
     #[test]

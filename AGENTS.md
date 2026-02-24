@@ -102,7 +102,8 @@ Entered via `^p` command palette. Available commands:
 | `goto <line>` | Jump to line number |
 | `ruler` | Toggle line number ruler |
 | `replaceall <regex> <replacement>` | Replace all matches (in selection if active, else whole file) |
-| `comment` | Toggle line comments (language-aware) |
+| `comment [on\|off]` | Toggle line comments (language-aware); `on` forces comment, `off` forces uncomment |
+| `selectall` | Select all text in the buffer |
 
 ## Building
 
