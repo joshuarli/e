@@ -83,7 +83,6 @@ pub fn prev_word_boundary(line_bytes: &[u8], col: usize) -> usize {
 }
 
 /// Find the end of the next word from `col` in `line_bytes`.
-#[allow(dead_code)]
 pub fn next_word_boundary(line_bytes: &[u8], col: usize) -> usize {
     let len = line_bytes.len();
     let mut i = col;

@@ -17,7 +17,7 @@ use crate::highlight;
 use crate::keybind::{EditorAction, KeybindingTable};
 use crate::language;
 use crate::render::{Renderer, char_col_for_display_col, display_col_for_char_col, gutter_width};
-use crate::selection::{Pos, Selection, is_word_char, prev_word_boundary};
+use crate::selection::{Pos, Selection, is_word_char, next_word_boundary, prev_word_boundary};
 use crate::view::View;
 
 const SCROLL_LINES: usize = 3;
@@ -26,7 +26,24 @@ const PASTE_START: &[u8] = &[0x1b, b'[', b'2', b'0', b'0', b'~'];
 const PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
 const CTRL_SHIFT_UP: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'A'];
 const CTRL_SHIFT_DOWN: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'B'];
+const CTRL_LEFT: &[u8] = &[0x1b, b'[', b'1', b';', b'5', b'D'];
+const CTRL_RIGHT: &[u8] = &[0x1b, b'[', b'1', b';', b'5', b'C'];
 const FOCUS_IN: &[u8] = &[0x1b, b'[', b'I'];
+
+fn auto_close_char(c: char) -> Option<char> {
+    match c {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '"' => Some('"'),
+        '\'' => Some('\''),
+        _ => None,
+    }
+}
+
+fn is_close_char(c: char) -> bool {
+    matches!(c, ')' | ']' | '}' | '"' | '\'')
+}
 
 fn is_paste_start(ev: &Event) -> bool {
     matches!(ev, Event::Unsupported(bytes) if bytes == PASTE_START)
@@ -451,6 +468,10 @@ impl Editor {
                         self.select_above();
                     } else if bytes == CTRL_SHIFT_DOWN {
                         self.select_below();
+                    } else if bytes == CTRL_LEFT {
+                        self.word_left();
+                    } else if bytes == CTRL_RIGHT {
+                        self.word_right();
                     }
                 }
             }
@@ -1352,6 +1373,44 @@ impl Editor {
         }
     }
 
+    fn word_left(&mut self) {
+        if !self.sel.is_empty() {
+            let (start, _) = self.sel.ordered();
+            self.set_cursor(start);
+            return;
+        }
+        let c = self.cursor();
+        if c.col == 0 {
+            if c.line > 0 {
+                let prev_len = self.doc.buf.line_char_len(c.line - 1);
+                self.set_cursor(Pos::new(c.line - 1, prev_len));
+            }
+            return;
+        }
+        let line_text = self.doc.buf.line_text(c.line);
+        let boundary = prev_word_boundary(&line_text, c.col);
+        self.set_cursor(Pos::new(c.line, boundary));
+    }
+
+    fn word_right(&mut self) {
+        if !self.sel.is_empty() {
+            let (_, end) = self.sel.ordered();
+            self.set_cursor(end);
+            return;
+        }
+        let c = self.cursor();
+        let line_len = self.doc.buf.line_char_len(c.line);
+        if c.col >= line_len {
+            if c.line + 1 < self.doc.buf.line_count() {
+                self.set_cursor(Pos::new(c.line + 1, 0));
+            }
+            return;
+        }
+        let line_text = self.doc.buf.line_text(c.line);
+        let boundary = next_word_boundary(&line_text, c.col);
+        self.set_cursor(Pos::new(c.line, boundary));
+    }
+
     fn move_home(&mut self) {
         self.set_cursor(Pos::new(self.cursor().line, 0));
     }
@@ -1428,10 +1487,60 @@ impl Editor {
 
     fn insert_char(&mut self, c: char) {
         if !self.sel.is_empty() {
+            // Wrap selection with matching pairs
+            if let Some(close) = auto_close_char(c) {
+                let (start, end) = self.sel.ordered();
+                let text = self.doc.text_in_range(start, end);
+                let mut wrapped = vec![c as u8];
+                wrapped.extend_from_slice(&text);
+                wrapped.push(close as u8);
+                self.doc.begin_undo_group();
+                self.doc.delete_range(start, end);
+                let after = self.doc.insert(start.line, start.col, &wrapped);
+                self.doc.end_undo_group();
+                // Select the inner text (between the pair chars)
+                self.sel = Selection {
+                    anchor: Pos::new(start.line, start.col + 1),
+                    cursor: Pos::new(after.line, after.col - 1),
+                };
+                return;
+            }
             self.delete_selection();
         }
+
+        // Skip over closing char if it's already the next character
+        if is_close_char(c) {
+            let line_text = self.doc.buf.line_text(self.cursor().line);
+            let col = self.cursor().col;
+            if col < line_text.len() && line_text[col] == c as u8 {
+                self.set_cursor(Pos::new(self.cursor().line, col + 1));
+                return;
+            }
+        }
+
         let mut bytes = [0u8; 4];
         let s = c.encode_utf8(&mut bytes);
+
+        // Auto-close pairs
+        if let Some(close) = auto_close_char(c) {
+            let line_text = self.doc.buf.line_text(self.cursor().line);
+            let col = self.cursor().col;
+            let next_is_boundary = col >= line_text.len()
+                || line_text[col] == b' '
+                || line_text[col] == b'\t'
+                || is_close_char(line_text[col] as char);
+            if next_is_boundary {
+                let mut pair = s.as_bytes().to_vec();
+                pair.push(close as u8);
+                let pos = self
+                    .doc
+                    .insert(self.cursor().line, self.cursor().col, &pair);
+                // Place cursor between the pair
+                self.set_cursor(Pos::new(pos.line, pos.col - 1));
+                return;
+            }
+        }
+
         let pos = self
             .doc
             .insert(self.cursor().line, self.cursor().col, s.as_bytes());
@@ -1536,6 +1645,19 @@ impl Editor {
                 if all_spaces && c.col.is_multiple_of(2) {
                     let end = Pos::new(c.line, c.col);
                     let start = Pos::new(c.line, c.col - 2);
+                    self.doc.delete_range(start, end);
+                    self.set_cursor(start);
+                    return;
+                }
+            }
+
+            // Delete matching auto-close pair if cursor is between them
+            let prev = line_text[c.col - 1];
+            if c.col < line_text.len() {
+                let next = line_text[c.col];
+                if auto_close_char(prev as char) == Some(next as char) {
+                    let start = Pos::new(c.line, c.col - 1);
+                    let end = Pos::new(c.line, c.col + 1);
                     self.doc.delete_range(start, end);
                     self.set_cursor(start);
                     return;
@@ -1803,12 +1925,65 @@ impl Editor {
         if !self.sel.is_empty() {
             self.delete_selection();
         }
+        let text = self.reindent_paste(text);
         self.doc.seal_undo();
         let pos = self
             .doc
             .insert(self.cursor().line, self.cursor().col, text.as_bytes());
         self.doc.seal_undo();
         self.set_cursor(pos);
+    }
+
+    /// Re-indent pasted multi-line text to match the current cursor's indent level.
+    fn reindent_paste(&mut self, text: &str) -> String {
+        let lines: Vec<&str> = text.split('\n').collect();
+        if lines.len() < 2 {
+            return text.to_string();
+        }
+
+        // Find the minimum indentation of non-empty lines in the pasted text
+        // (skip the first line since it will be placed at cursor position)
+        let min_indent = lines[1..]
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.len() - l.trim_start().len())
+            .min()
+            .unwrap_or(0);
+
+        // Get the indent of the current line at cursor
+        let cur_line_text = self.doc.buf.line_text(self.cursor().line);
+        let cur_indent: usize = cur_line_text
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+
+        // If the first line of paste has content, use cursor column as the base
+        // indent for subsequent lines; otherwise use the current line's indent
+        let target_indent = if !lines[0].trim().is_empty() {
+            self.cursor().col
+        } else {
+            cur_indent
+        };
+
+        if target_indent == min_indent {
+            return text.to_string();
+        }
+
+        let mut result = String::with_capacity(text.len());
+        result.push_str(lines[0]);
+        for line in &lines[1..] {
+            result.push('\n');
+            if line.trim().is_empty() {
+                result.push_str(line);
+            } else {
+                let stripped = &line[min_indent.min(line.len())..];
+                for _ in 0..target_indent {
+                    result.push(' ');
+                }
+                result.push_str(stripped);
+            }
+        }
+        result
     }
 
     // -- undo/redo ----------------------------------------------------------
@@ -2836,12 +3011,16 @@ mod tests {
 
     #[test]
     fn test_handle_cmd_result_submit_prompt() {
+        let dir = std::env::temp_dir().join("e_test_cmd_prompt");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
         let mut e = ed("hello");
         e.handle_cmd_result(
             CommandBufferMode::Prompt,
-            CommandBufferResult::Submit("test.txt".to_string()),
+            CommandBufferResult::Submit(path.to_str().unwrap().to_string()),
         );
-        assert_eq!(e.doc.filename.as_deref(), Some("test.txt"));
+        assert_eq!(e.doc.filename.as_deref(), Some(path.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4617,5 +4796,640 @@ mod tests {
         assert!(e.file_mtime.is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ========================================================================
+    // Word navigation (Ctrl+Left / Ctrl+Right)
+    // ========================================================================
+
+    #[test]
+    fn test_word_left_middle_of_line() {
+        let mut e = ed("hello world foo");
+        e.set_cursor(Pos::new(0, 15));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 12));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 6));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+    }
+
+    #[test]
+    fn test_word_right_middle_of_line() {
+        let mut e = ed("hello world foo");
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 6));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 12));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 15));
+    }
+
+    #[test]
+    fn test_word_left_wraps_to_prev_line() {
+        let mut e = ed("hello\nworld");
+        e.set_cursor(Pos::new(1, 0));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 5));
+    }
+
+    #[test]
+    fn test_word_right_wraps_to_next_line() {
+        let mut e = ed("hello\nworld");
+        e.set_cursor(Pos::new(0, 5));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(1, 0));
+    }
+
+    #[test]
+    fn test_word_left_collapses_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 2),
+            cursor: Pos::new(0, 8),
+        };
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+        assert!(e.sel.is_empty());
+    }
+
+    #[test]
+    fn test_word_right_collapses_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 2),
+            cursor: Pos::new(0, 8),
+        };
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 8));
+        assert!(e.sel.is_empty());
+    }
+
+    #[test]
+    fn test_word_left_at_origin() {
+        let mut e = ed("hello");
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+    }
+
+    #[test]
+    fn test_word_right_at_end() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 5));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 5));
+    }
+
+    #[test]
+    fn test_word_left_skips_punctuation() {
+        // "foo.bar" at end: skip "bar", skip ".", skip "foo" -> 0
+        let mut e = ed("foo.bar");
+        e.set_cursor(Pos::new(0, 7));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 4));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+    }
+
+    #[test]
+    fn test_word_right_skips_punctuation() {
+        // "foo.bar" from 0: skip "foo" to 3, skip "." to 4
+        let mut e = ed("foo.bar");
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 4));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 7));
+    }
+
+    #[test]
+    fn test_word_left_multiple_spaces() {
+        let mut e = ed("foo   bar");
+        e.set_cursor(Pos::new(0, 9));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 6));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+    }
+
+    #[test]
+    fn test_word_right_multiple_spaces() {
+        let mut e = ed("foo   bar");
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 6));
+    }
+
+    #[test]
+    fn test_word_left_empty_line() {
+        let mut e = ed("hello\n\nworld");
+        e.set_cursor(Pos::new(2, 0));
+        e.word_left();
+        // wraps to end of empty line 1
+        assert_eq!(e.cursor(), Pos::new(1, 0));
+        e.word_left();
+        // wraps to end of line 0
+        assert_eq!(e.cursor(), Pos::new(0, 5));
+    }
+
+    #[test]
+    fn test_word_right_empty_line() {
+        let mut e = ed("hello\n\nworld");
+        e.set_cursor(Pos::new(0, 5));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(1, 0));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(2, 0));
+    }
+
+    #[test]
+    fn test_word_left_from_middle_of_word() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 3));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+    }
+
+    #[test]
+    fn test_word_right_from_middle_of_word() {
+        // "hello world" from col 3: skip "lo" to 5, skip " " to 6
+        let mut e = ed("hello world");
+        e.set_cursor(Pos::new(0, 3));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 6));
+    }
+
+    #[test]
+    fn test_word_left_underscores() {
+        // underscores are word chars
+        let mut e = ed("foo_bar baz");
+        e.set_cursor(Pos::new(0, 11));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 8));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 0)); // foo_bar is one word
+    }
+
+    #[test]
+    fn test_word_right_underscores() {
+        let mut e = ed("foo_bar baz");
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 8)); // skips whole foo_bar + space
+    }
+
+    #[test]
+    fn test_word_left_at_last_line_end() {
+        let mut e = ed("one\ntwo");
+        e.set_cursor(Pos::new(1, 3));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(1, 0));
+    }
+
+    #[test]
+    fn test_word_right_at_last_line_end() {
+        // at end of last line, no next line, stays put
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 5));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 5));
+    }
+
+    #[test]
+    fn test_word_nav_roundtrip() {
+        // word_right then word_left should return near starting region
+        let mut e = ed("  fn main() {");
+        e.word_right();
+        // from col 0: skip word chars (none), skip non-word ("  ") -> lands at 2
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+        e.word_right();
+        // from col 2: skip word chars ("fn") to 4, skip non-word (" ") to 5
+        assert_eq!(e.cursor(), Pos::new(0, 5));
+        e.word_left();
+        // from col 5: skip non-word (" ") to 4, skip word ("fn") to 2
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+    }
+
+    // ========================================================================
+    // Auto-close pairs
+    // ========================================================================
+
+    #[test]
+    fn test_autoclose_paren() {
+        let mut e = ed("");
+        e.insert_char('(');
+        assert_eq!(e.test_text(), "()");
+        assert_eq!(e.cursor(), Pos::new(0, 1)); // between parens
+    }
+
+    #[test]
+    fn test_autoclose_bracket() {
+        let mut e = ed("");
+        e.insert_char('[');
+        assert_eq!(e.test_text(), "[]");
+        assert_eq!(e.cursor(), Pos::new(0, 1));
+    }
+
+    #[test]
+    fn test_autoclose_brace() {
+        let mut e = ed("");
+        e.insert_char('{');
+        assert_eq!(e.test_text(), "{}");
+        assert_eq!(e.cursor(), Pos::new(0, 1));
+    }
+
+    #[test]
+    fn test_autoclose_double_quote() {
+        let mut e = ed("");
+        e.insert_char('"');
+        assert_eq!(e.test_text(), "\"\"");
+        assert_eq!(e.cursor(), Pos::new(0, 1));
+    }
+
+    #[test]
+    fn test_autoclose_single_quote() {
+        let mut e = ed("");
+        e.insert_char('\'');
+        assert_eq!(e.test_text(), "''");
+        assert_eq!(e.cursor(), Pos::new(0, 1));
+    }
+
+    #[test]
+    fn test_autoclose_skip_closing_paren() {
+        let mut e = ed("");
+        e.insert_char('(');
+        assert_eq!(e.test_text(), "()");
+        assert_eq!(e.cursor(), Pos::new(0, 1));
+        e.insert_char(')'); // should skip over the closing paren
+        assert_eq!(e.test_text(), "()");
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+    }
+
+    #[test]
+    fn test_autoclose_skip_closing_bracket() {
+        let mut e = ed("");
+        e.insert_char('[');
+        e.insert_char(']');
+        assert_eq!(e.test_text(), "[]");
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+    }
+
+    #[test]
+    fn test_autoclose_skip_closing_brace() {
+        let mut e = ed("");
+        e.insert_char('{');
+        e.insert_char('}');
+        assert_eq!(e.test_text(), "{}");
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+    }
+
+    #[test]
+    fn test_autoclose_skip_closing_double_quote() {
+        let mut e = ed("");
+        e.insert_char('"');
+        e.insert_char('"');
+        assert_eq!(e.test_text(), "\"\"");
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+    }
+
+    #[test]
+    fn test_autoclose_skip_closing_single_quote() {
+        let mut e = ed("");
+        e.insert_char('\'');
+        e.insert_char('\'');
+        assert_eq!(e.test_text(), "''");
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+    }
+
+    #[test]
+    fn test_autoclose_no_pair_when_next_is_word() {
+        let mut e = ed("hello");
+        e.insert_char('(');
+        assert_eq!(e.test_text(), "(hello"); // no auto-close
+    }
+
+    #[test]
+    fn test_autoclose_pair_when_next_is_space() {
+        let mut e = ed(" hello");
+        e.insert_char('(');
+        assert_eq!(e.test_text(), "() hello");
+        assert_eq!(e.cursor(), Pos::new(0, 1));
+    }
+
+    #[test]
+    fn test_autoclose_pair_when_next_is_close_char() {
+        let mut e = ed(")");
+        e.insert_char('(');
+        assert_eq!(e.test_text(), "())");
+        assert_eq!(e.cursor(), Pos::new(0, 1));
+    }
+
+    #[test]
+    fn test_autoclose_backspace_deletes_paren_pair() {
+        let mut e = ed("");
+        e.insert_char('(');
+        assert_eq!(e.test_text(), "()");
+        e.backspace();
+        assert_eq!(e.test_text(), "");
+    }
+
+    #[test]
+    fn test_autoclose_backspace_deletes_bracket_pair() {
+        let mut e = ed("");
+        e.insert_char('[');
+        e.backspace();
+        assert_eq!(e.test_text(), "");
+    }
+
+    #[test]
+    fn test_autoclose_backspace_deletes_brace_pair() {
+        let mut e = ed("");
+        e.insert_char('{');
+        e.backspace();
+        assert_eq!(e.test_text(), "");
+    }
+
+    #[test]
+    fn test_autoclose_backspace_deletes_double_quote_pair() {
+        let mut e = ed("");
+        e.insert_char('"');
+        e.backspace();
+        assert_eq!(e.test_text(), "");
+    }
+
+    #[test]
+    fn test_autoclose_backspace_deletes_single_quote_pair() {
+        let mut e = ed("");
+        e.insert_char('\'');
+        e.backspace();
+        assert_eq!(e.test_text(), "");
+    }
+
+    #[test]
+    fn test_autoclose_backspace_only_deletes_pair_when_matched() {
+        // "(x" with cursor at 1 — next char is 'x' not ')', so only delete '('
+        let mut e = ed("(x");
+        e.set_cursor(Pos::new(0, 1));
+        e.backspace();
+        assert_eq!(e.test_text(), "x");
+    }
+
+    #[test]
+    fn test_autoclose_wraps_selection_paren() {
+        let mut e = ed("hello");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 5),
+        };
+        e.insert_char('(');
+        assert_eq!(e.test_text(), "(hello)");
+        // Inner text should be selected
+        let (s, end) = e.sel.ordered();
+        assert_eq!(s, Pos::new(0, 1));
+        assert_eq!(end, Pos::new(0, 6));
+    }
+
+    #[test]
+    fn test_autoclose_wraps_selection_bracket() {
+        let mut e = ed("world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 5),
+        };
+        e.insert_char('[');
+        assert_eq!(e.test_text(), "[world]");
+    }
+
+    #[test]
+    fn test_autoclose_wraps_selection_brace() {
+        let mut e = ed("abc");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 3),
+        };
+        e.insert_char('{');
+        assert_eq!(e.test_text(), "{abc}");
+    }
+
+    #[test]
+    fn test_autoclose_wraps_selection_double_quote() {
+        let mut e = ed("text");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 4),
+        };
+        e.insert_char('"');
+        assert_eq!(e.test_text(), "\"text\"");
+    }
+
+    #[test]
+    fn test_autoclose_wraps_selection_single_quote() {
+        let mut e = ed("text");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 4),
+        };
+        e.insert_char('\'');
+        assert_eq!(e.test_text(), "'text'");
+    }
+
+    #[test]
+    fn test_autoclose_wraps_partial_selection() {
+        let mut e = ed("hello world");
+        e.sel = Selection {
+            anchor: Pos::new(0, 6),
+            cursor: Pos::new(0, 11),
+        };
+        e.insert_char('(');
+        assert_eq!(e.test_text(), "hello (world)");
+    }
+
+    #[test]
+    fn test_autoclose_wraps_multiline_selection() {
+        let mut e = ed("foo\nbar");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(1, 3),
+        };
+        e.insert_char('{');
+        assert_eq!(e.test_text(), "{foo\nbar}");
+    }
+
+    #[test]
+    fn test_autoclose_non_pair_char_replaces_selection() {
+        // Typing a regular char with selection should replace it (not wrap)
+        let mut e = ed("hello");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 5),
+        };
+        e.insert_char('x');
+        assert_eq!(e.test_text(), "x");
+    }
+
+    #[test]
+    fn test_autoclose_type_inside_pair() {
+        let mut e = ed("");
+        e.insert_char('(');
+        e.insert_char('x');
+        assert_eq!(e.test_text(), "(x)");
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+    }
+
+    #[test]
+    fn test_autoclose_nested_pairs() {
+        let mut e = ed("");
+        e.insert_char('(');
+        e.insert_char('[');
+        assert_eq!(e.test_text(), "([])");
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+        e.insert_char(']');
+        assert_eq!(e.test_text(), "([])");
+        assert_eq!(e.cursor(), Pos::new(0, 3));
+        e.insert_char(')');
+        assert_eq!(e.test_text(), "([])");
+        assert_eq!(e.cursor(), Pos::new(0, 4));
+    }
+
+    #[test]
+    fn test_autoclose_at_end_of_line() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 5));
+        e.insert_char('(');
+        assert_eq!(e.test_text(), "hello()");
+        assert_eq!(e.cursor(), Pos::new(0, 6));
+    }
+
+    #[test]
+    fn test_autoclose_no_pair_before_digit() {
+        let mut e = ed("42");
+        e.insert_char('(');
+        assert_eq!(e.test_text(), "(42"); // digit is word char, no auto-close
+    }
+
+    #[test]
+    fn test_autoclose_wraps_backward_selection() {
+        // Selection where cursor < anchor (backward selection)
+        let mut e = ed("hello");
+        e.sel = Selection {
+            anchor: Pos::new(0, 5),
+            cursor: Pos::new(0, 0),
+        };
+        e.insert_char('(');
+        assert_eq!(e.test_text(), "(hello)");
+    }
+
+    // ========================================================================
+    // Smart paste (auto-indent)
+    // ========================================================================
+
+    #[test]
+    fn test_smart_paste_reindents_to_cursor() {
+        let mut e = ed("    fn main() {\n        ");
+        e.set_cursor(Pos::new(1, 8));
+        e.paste_text("if true {\n    println!(\"hi\");\n}");
+        assert_eq!(
+            e.test_text(),
+            "    fn main() {\n        if true {\n            println!(\"hi\");\n        }"
+        );
+    }
+
+    #[test]
+    fn test_smart_paste_single_line_no_change() {
+        let mut e = ed("    ");
+        e.set_cursor(Pos::new(0, 4));
+        e.paste_text("hello");
+        assert_eq!(e.test_text(), "    hello");
+    }
+
+    #[test]
+    fn test_smart_paste_already_correct_indent() {
+        let mut e = ed("  ");
+        e.set_cursor(Pos::new(0, 2));
+        e.paste_text("a\n  b\n  c");
+        assert_eq!(e.test_text(), "  a\n  b\n  c");
+    }
+
+    #[test]
+    fn test_smart_paste_dedents_when_needed() {
+        // Paste text indented at 8 spaces into a position at col 2
+        let mut e = ed("  ");
+        e.set_cursor(Pos::new(0, 2));
+        e.paste_text("x\n        y\n        z");
+        assert_eq!(e.test_text(), "  x\n  y\n  z");
+    }
+
+    #[test]
+    fn test_smart_paste_preserves_relative_indent() {
+        let mut e = ed("    ");
+        e.set_cursor(Pos::new(0, 4));
+        e.paste_text("if true {\n  nested\n}");
+        // min_indent of lines 1+ is 0 (the "}"), target is col 4
+        // so all continuation lines get +4
+        assert_eq!(e.test_text(), "    if true {\n      nested\n    }");
+    }
+
+    #[test]
+    fn test_smart_paste_empty_lines_preserved() {
+        let mut e = ed("    ");
+        e.set_cursor(Pos::new(0, 4));
+        e.paste_text("a\n\nb");
+        // Empty line should be preserved as-is
+        assert_eq!(e.test_text(), "    a\n\n    b");
+    }
+
+    #[test]
+    fn test_smart_paste_zero_indent_no_change() {
+        // Pasting at col 0 with text that has 0 indent — no change
+        let mut e = ed("");
+        e.paste_text("a\nb\nc");
+        assert_eq!(e.test_text(), "a\nb\nc");
+    }
+
+    #[test]
+    fn test_smart_paste_with_selection_replaces() {
+        let mut e = ed("    old stuff\n    more old");
+        e.sel = Selection {
+            anchor: Pos::new(0, 4),
+            cursor: Pos::new(0, 13),
+        };
+        e.paste_text("new\n    thing");
+        // selection deleted first, then pasted at col 4
+        assert_eq!(e.test_text(), "    new\n    thing\n    more old");
+    }
+
+    #[test]
+    fn test_smart_paste_cursor_position() {
+        let mut e = ed("");
+        e.paste_text("hello\nworld");
+        // Cursor should be at end of pasted text
+        assert_eq!(e.cursor(), Pos::new(1, 5));
+    }
+
+    #[test]
+    fn test_smart_paste_empty_string() {
+        let mut e = ed("hello");
+        e.set_cursor(Pos::new(0, 5));
+        e.paste_text("");
+        assert_eq!(e.test_text(), "hello");
+        assert_eq!(e.cursor(), Pos::new(0, 5));
+    }
+
+    #[test]
+    fn test_smart_paste_all_empty_continuation_lines() {
+        // When all continuation lines are empty, min_indent is 0, should not crash
+        let mut e = ed("    ");
+        e.set_cursor(Pos::new(0, 4));
+        e.paste_text("a\n\n\n");
+        assert_eq!(e.test_text(), "    a\n\n\n");
+    }
+
+    #[test]
+    fn test_smart_paste_tabs_in_pasted_text() {
+        // Tabs in pasted text — min_indent is calculated by byte length
+        let mut e = ed("  ");
+        e.set_cursor(Pos::new(0, 2));
+        e.paste_text("a\n\tb");
+        // \t is 1 char of indent, target is 2, so re-indented
+        assert_eq!(e.test_text(), "  a\n  b");
     }
 }
