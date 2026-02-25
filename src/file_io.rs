@@ -511,6 +511,170 @@ fn load_undo_history_from(
     None
 }
 
+// -- cursor position persistence --------------------------------------------
+//
+// Stores last cursor position per file in: ~/.config/e/cursor.bin
+// Format: [magic:4 "eCUR"][version:1][entry_count:4] then entries:
+//   [path_len:4][path_bytes][line:4][col:4]
+// No mtime validation — cursor position is clamped to buffer bounds on load.
+// Stale entries for deleted files are pruned on write.
+
+const CURSOR_MAGIC: &[u8; 4] = b"eCUR";
+const CURSOR_VERSION: u8 = 1;
+const CURSOR_MAX_ENTRIES: u32 = 10_000;
+
+fn cursor_db_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".config/e/cursor.bin")
+}
+
+/// Save cursor position for a file. Errors silently ignored.
+pub fn save_cursor_position(file_path: &Path, cursor: Pos) {
+    let _ = save_cursor_position_to(&cursor_db_path(), file_path, cursor);
+}
+
+fn save_cursor_position_to(db_path: &Path, file_path: &Path, cursor: Pos) -> Option<()> {
+    let abs_path = resolve_absolute(file_path);
+    let abs_str = abs_path.to_string_lossy();
+    let path_bytes = abs_str.as_bytes();
+
+    // Build new entry
+    let mut entry = Vec::new();
+    write_u32(&mut entry, path_bytes.len() as u32);
+    entry.extend_from_slice(path_bytes);
+    write_u32(&mut entry, cursor.line as u32);
+    write_u32(&mut entry, cursor.col as u32);
+
+    // Ensure parent dir, open db, lock
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent).ok()?;
+    }
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(db_path)
+        .ok()?;
+    if !flock_exclusive(&lock_file) {
+        return None;
+    }
+
+    // Read existing, keep entries for other paths (prune deleted files)
+    let existing = fs::read(db_path).unwrap_or_default();
+    let kept = collect_cursor_entries(&existing, path_bytes);
+
+    // Write new db
+    let mut buf = Vec::new();
+    buf.extend_from_slice(CURSOR_MAGIC);
+    write_u8(&mut buf, CURSOR_VERSION);
+    write_u32(&mut buf, kept.len() as u32 + 1);
+    for e in &kept {
+        buf.extend_from_slice(e);
+    }
+    // Length-prefix our new entry
+    write_u32(&mut buf, entry.len() as u32);
+    buf.extend_from_slice(&entry);
+
+    fs::write(db_path, &buf).ok()?;
+    flock_unlock(&lock_file);
+    Some(())
+}
+
+/// Load cursor position for a file. Returns None if not found.
+pub fn load_cursor_position(file_path: &Path) -> Option<Pos> {
+    load_cursor_position_from(&cursor_db_path(), file_path)
+}
+
+fn load_cursor_position_from(db_path: &Path, file_path: &Path) -> Option<Pos> {
+    let abs_path = resolve_absolute(file_path);
+    let abs_str = abs_path.to_string_lossy();
+    let target_path = abs_str.as_bytes();
+
+    let lock_file = fs::File::open(db_path).ok()?;
+    flock_shared(&lock_file);
+    let data = fs::read(db_path).ok()?;
+    if data.len() < 9 || &data[0..4] != CURSOR_MAGIC {
+        return None;
+    }
+    let mut pos = 4usize;
+    let version = read_u8(&data, &mut pos)?;
+    if version != CURSOR_VERSION {
+        return None;
+    }
+    let count = read_u32(&data, &mut pos)?;
+    for _ in 0..count.min(CURSOR_MAX_ENTRIES) {
+        let entry_len = read_u32(&data, &mut pos)? as usize;
+        let entry_start = pos;
+        if pos + entry_len > data.len() {
+            return None;
+        }
+        let path_len = read_u32(&data, &mut pos)? as usize;
+        if pos + path_len > data.len() {
+            return None;
+        }
+        let entry_path = &data[pos..pos + path_len];
+        pos += path_len;
+
+        if entry_path == target_path {
+            let line = read_u32(&data, &mut pos)? as usize;
+            let col = read_u32(&data, &mut pos)? as usize;
+            return Some(Pos::new(line, col));
+        }
+        pos = entry_start + entry_len;
+    }
+    None
+}
+
+/// Collect kept entries from existing cursor db, excluding `exclude_path`
+/// and pruning entries for files that no longer exist.
+/// Returns length-prefixed entry blobs.
+fn collect_cursor_entries<'a>(data: &'a [u8], exclude_path: &[u8]) -> Vec<&'a [u8]> {
+    let mut kept = Vec::new();
+    let header_len = 4 + 1 + 4; // magic + version + entry_count
+    if data.len() < header_len || &data[0..4] != CURSOR_MAGIC || data[4] != CURSOR_VERSION {
+        return kept;
+    }
+    let mut pos = 5usize;
+    let count = match read_u32(data, &mut pos) {
+        Some(c) => c.min(CURSOR_MAX_ENTRIES),
+        None => return kept,
+    };
+    for _ in 0..count {
+        let len_start = pos;
+        let entry_len = match read_u32(data, &mut pos) {
+            Some(l) => l as usize,
+            None => break,
+        };
+        if pos + entry_len > data.len() {
+            break;
+        }
+        let entry_end = pos + entry_len;
+        // Peek at path
+        let mut p = pos;
+        let path_len = match read_u32(data, &mut p) {
+            Some(l) => l as usize,
+            None => {
+                pos = entry_end;
+                continue;
+            }
+        };
+        if p + path_len > data.len() {
+            break;
+        }
+        let entry_path = &data[p..p + path_len];
+
+        if entry_path != exclude_path
+            && let Ok(path_str) = std::str::from_utf8(entry_path)
+            && std::path::Path::new(path_str).exists()
+        {
+            kept.push(&data[len_start..entry_end]);
+        }
+        pos = entry_end;
+    }
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1135,6 +1299,121 @@ mod tests {
         let (undo, redo) = loaded.stacks();
         assert!(undo.is_empty());
         assert!(redo.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- cursor position persistence -------------------------------------------
+
+    #[test]
+    fn test_cursor_position_roundtrip() {
+        let dir = std::env::temp_dir().join("e_test_cursor_rt");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        let db = dir.join("cursor.bin");
+        fs::write(&path, b"hello\nworld\n").unwrap();
+
+        save_cursor_position_to(&db, &path, Pos::new(1, 3));
+        let loaded = load_cursor_position_from(&db, &path);
+        assert_eq!(loaded, Some(Pos::new(1, 3)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cursor_position_update() {
+        let dir = std::env::temp_dir().join("e_test_cursor_upd");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        let db = dir.join("cursor.bin");
+        fs::write(&path, b"hello").unwrap();
+
+        save_cursor_position_to(&db, &path, Pos::new(0, 2));
+        save_cursor_position_to(&db, &path, Pos::new(5, 10));
+        let loaded = load_cursor_position_from(&db, &path);
+        assert_eq!(loaded, Some(Pos::new(5, 10)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cursor_position_multiple_files() {
+        let dir = std::env::temp_dir().join("e_test_cursor_multi");
+        let _ = fs::create_dir_all(&dir);
+        let path_a = dir.join("a.txt");
+        let path_b = dir.join("b.txt");
+        let db = dir.join("cursor.bin");
+        fs::write(&path_a, b"aaa").unwrap();
+        fs::write(&path_b, b"bbb").unwrap();
+
+        save_cursor_position_to(&db, &path_a, Pos::new(0, 1));
+        save_cursor_position_to(&db, &path_b, Pos::new(3, 7));
+
+        assert_eq!(
+            load_cursor_position_from(&db, &path_a),
+            Some(Pos::new(0, 1))
+        );
+        assert_eq!(
+            load_cursor_position_from(&db, &path_b),
+            Some(Pos::new(3, 7))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cursor_position_no_db() {
+        let dir = std::env::temp_dir().join("e_test_cursor_nodb");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        let db = dir.join("nonexistent.bin");
+        fs::write(&path, b"hello").unwrap();
+
+        assert_eq!(load_cursor_position_from(&db, &path), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cursor_position_prunes_deleted_files() {
+        let dir = std::env::temp_dir().join("e_test_cursor_prune");
+        let _ = fs::create_dir_all(&dir);
+        let path_a = dir.join("a.txt");
+        let path_b = dir.join("b.txt");
+        let db = dir.join("cursor.bin");
+        fs::write(&path_a, b"aaa").unwrap();
+        fs::write(&path_b, b"bbb").unwrap();
+
+        save_cursor_position_to(&db, &path_a, Pos::new(0, 1));
+        save_cursor_position_to(&db, &path_b, Pos::new(3, 7));
+
+        // Delete file_a
+        fs::remove_file(&path_a).unwrap();
+
+        // Saving file_b should prune file_a's entry
+        save_cursor_position_to(&db, &path_b, Pos::new(4, 0));
+
+        // Re-create file_a — old cursor entry should be gone
+        fs::write(&path_a, b"aaa").unwrap();
+        assert_eq!(load_cursor_position_from(&db, &path_a), None);
+        assert_eq!(
+            load_cursor_position_from(&db, &path_b),
+            Some(Pos::new(4, 0))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cursor_position_corrupt_db() {
+        let dir = std::env::temp_dir().join("e_test_cursor_corrupt");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.txt");
+        let db = dir.join("cursor.bin");
+        fs::write(&path, b"hello").unwrap();
+        fs::write(&db, b"garbage").unwrap();
+
+        assert_eq!(load_cursor_position_from(&db, &path), None);
 
         let _ = fs::remove_dir_all(&dir);
     }

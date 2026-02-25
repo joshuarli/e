@@ -29,7 +29,7 @@ src/
   command.rs         CommandRegistry: HashMap<String, CommandFn>, built-in commands
   command_buffer.rs  Modal mini-editor for command palette, find, goto, save-as prompt, sudo password; tab completion; paste support (newlines stripped)
   clipboard.rs       Platform-detected clipboard: pbcopy/wl-copy/xclip/xsel/internal fallback
-  file_io.rs         Read/write files, CRLF→LF normalization, binary detection, trailing whitespace strip, file locking, persistent undo history (single binary file ~/.config/e/undo.bin)
+  file_io.rs         Read/write files, CRLF→LF normalization, binary detection, trailing whitespace strip, file locking, persistent undo history (single binary file ~/.config/e/undo.bin), cursor position persistence (~/.config/e/cursor.bin)
   language.rs        Language detection by file extension (~45 languages), comment syntax lookup
   signal.rs          SIGWINCH handler via libc::sigaction + AtomicBool polling
   highlight.rs       Syntax highlighting: byte-by-byte highlighter, HlType/HlState types, per-language rules (16 languages), dedicated JSON/YAML/Markdown/INI highlighters, semver detection, bracket matching, operator highlighting
@@ -181,3 +181,4 @@ All commands that take arguments support single-quoted (`'arg with spaces'`) and
 - [x] Select above/below (`Ctrl+Shift+Up/Down` — select from cursor to start/end of file)
 - [x] Persistent undo history (`~/.config/e/undo.bin`) — survives editor restarts, single binary file with length-prefixed entries, validated by file mtime, silently discarded on external modification
 - [x] External file change detection via terminal focus events (`\x1b[?1004h`) — one `stat()` per focus-in, zero polling overhead, prompts reload (y/n), clamps cursor on reload
+- [x] Cursor position persistence (`~/.config/e/cursor.bin`) — remembers last cursor line/col per file, restored on reopen with clamping to buffer bounds, view centered on restored position, stale entries pruned for deleted files

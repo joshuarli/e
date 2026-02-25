@@ -108,15 +108,26 @@ impl Editor {
             .filename
             .as_ref()
             .and_then(|name| crate::file_io::file_mtime(std::path::Path::new(name)));
+        let mut restored_cursor = None;
         if let Some(ref name) = doc.filename {
             let path = std::path::Path::new(name);
             if path.exists() {
                 crate::file_io::load_undo_history(path, &mut doc.undo_stack);
             }
+            restored_cursor = crate::file_io::load_cursor_position(path);
         }
+        // Clamp restored cursor to buffer bounds
+        let initial_cursor = if let Some(pos) = restored_cursor {
+            let line_count = doc.buf.line_count();
+            let line = pos.line.min(line_count.saturating_sub(1));
+            let col = pos.col.min(doc.buf.line_char_len(line));
+            Pos::new(line, col)
+        } else {
+            Pos::zero()
+        };
         Self {
             doc,
-            sel: Selection::caret(Pos::zero()),
+            sel: Selection::caret(initial_cursor),
             desired_col: None,
             view: View::new(w, h),
             renderer: Renderer::new(),
@@ -145,6 +156,11 @@ impl Editor {
     }
 
     pub fn run(&mut self) -> io::Result<()> {
+        // Center view on restored cursor position
+        if self.sel.cursor != Pos::zero() {
+            self.center_view_on_line(self.sel.cursor.line);
+        }
+
         let mut stdout = stdout().into_raw_mode()?.into_alternate_screen()?;
 
         write!(
@@ -593,6 +609,7 @@ impl Editor {
     fn save_undo_if_named(&mut self) {
         if let Some(name) = self.doc.filename.clone() {
             let path = std::path::Path::new(&name);
+            crate::file_io::save_cursor_position(path, self.sel.cursor);
             if path.exists() {
                 self.doc.seal_undo();
                 crate::file_io::save_undo_history(path, &self.doc.undo_stack);
