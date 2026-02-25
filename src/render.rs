@@ -243,12 +243,12 @@ impl Renderer {
                         let num_str = format!("{}", line_idx + 1);
                         let pad = gw - 1;
                         if is_cursor_line {
-                            write!(w, "\x1b[0;47;30m{:>width$} \x1b[0m", num_str, width = pad)?;
+                            write!(w, "\x1b[0;47;30m{:>width$}\x1b[0m ", num_str, width = pad)?;
                         } else {
                             write!(w, "\x1b[0;2m{:>width$} \x1b[0m", num_str, width = pad)?;
                         }
                     } else if is_cursor_line {
-                        write!(w, "\x1b[0;47;30m{:>width$} \x1b[0m", "", width = gw - 1)?;
+                        write!(w, "\x1b[0;47;30m{:>width$}\x1b[0m ", "", width = gw - 1)?;
                     } else {
                         write!(w, "\x1b[0;2m{:>width$} \x1b[0m", "", width = gw - 1)?;
                     }
