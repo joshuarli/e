@@ -257,12 +257,23 @@ impl Renderer {
                 let chunk_start = wrap * text_cols;
                 let chunk_end = ((wrap + 1) * text_cols).min(chars.len());
 
+                // Trailing whitespace starts after the last non-space character
+                let trailing_ws_start = chars
+                    .iter()
+                    .rposition(|c| !c.is_ascii_whitespace())
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                // Only highlight if the line has non-whitespace content
+                let has_trailing = trailing_ws_start < chars.len()
+                    && chars.iter().any(|c| !c.is_ascii_whitespace());
+
                 if need_per_char || has_find || has_bracket {
                     for (i, ch) in chars.iter().enumerate().take(chunk_end).skip(chunk_start) {
                         let in_sel = need_per_char && i >= line_sel_start && i < line_sel_end;
                         let find_hit = find_ranges.iter().find(|(fs, fe, _)| i >= *fs && i < *fe);
                         let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
                         let is_bracket_match = bracket_cols.contains(&i);
+                        let is_trailing_ws = has_trailing && i >= trailing_ws_start;
 
                         if in_sel {
                             if is_tab_pipe {
@@ -278,6 +289,8 @@ impl Renderer {
                             }
                         } else if is_bracket_match {
                             write!(w, "\x1b[45;30m{}\x1b[0m", ch)?;
+                        } else if is_trailing_ws {
+                            write!(w, "\x1b[41m{}\x1b[0m", ch)?;
                         } else if is_tab_pipe {
                             write!(w, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
@@ -298,7 +311,14 @@ impl Renderer {
                     let mut current_hl = HlType::Normal;
                     for (i, ch) in chars.iter().enumerate().take(chunk_end).skip(chunk_start) {
                         let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
-                        if is_tab_pipe {
+                        let is_trailing_ws = has_trailing && i >= trailing_ws_start;
+                        if is_trailing_ws {
+                            if current_hl != HlType::Normal {
+                                write!(w, "\x1b[0m")?;
+                                current_hl = HlType::Normal;
+                            }
+                            write!(w, "\x1b[41m{}\x1b[0m", ch)?;
+                        } else if is_tab_pipe {
                             if current_hl != HlType::Normal {
                                 write!(w, "\x1b[0m")?;
                                 current_hl = HlType::Normal;

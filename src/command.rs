@@ -65,6 +65,7 @@ pub enum CommandAction {
     CommentOff,
     Find(String),
     SelectAll,
+    Trim,
     StatusMsg(String),
 }
 
@@ -85,6 +86,7 @@ impl CommandRegistry {
         commands.insert("replaceall".to_string(), cmd_replaceall);
         commands.insert("comment".to_string(), cmd_comment);
         commands.insert("selectall".to_string(), cmd_selectall);
+        commands.insert("trim".to_string(), cmd_trim);
 
         Self { commands }
     }
@@ -178,6 +180,10 @@ fn cmd_comment(args: &str, ctx: &mut CommandContext) {
 
 fn cmd_selectall(_args: &str, ctx: &mut CommandContext) {
     ctx.action = CommandAction::SelectAll;
+}
+
+fn cmd_trim(_args: &str, ctx: &mut CommandContext) {
+    ctx.action = CommandAction::Trim;
 }
 
 #[cfg(test)]
@@ -468,6 +474,7 @@ mod tests {
         assert!(names.contains(&"replaceall"));
         assert!(names.contains(&"comment"));
         assert!(names.contains(&"selectall"));
+        assert!(names.contains(&"trim"));
         // Should be sorted
         let mut sorted = names.clone();
         sorted.sort();

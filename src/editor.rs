@@ -768,6 +768,7 @@ impl Editor {
             CommandAction::CommentOn => self.set_comment(true),
             CommandAction::CommentOff => self.set_comment(false),
             CommandAction::SelectAll => self.select_all(),
+            CommandAction::Trim => self.strip_trailing_whitespace(),
             CommandAction::StatusMsg(msg) => self.set_status(msg),
         }
     }
@@ -2093,7 +2094,6 @@ impl Editor {
 
     fn save_file(&mut self) {
         if self.doc.filename.is_some() {
-            self.strip_trailing_whitespace();
             let path = self.doc.filename.clone().unwrap();
             let path_ref = std::path::Path::new(&path);
 

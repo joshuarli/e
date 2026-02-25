@@ -53,7 +53,7 @@ Channel-based (`std::sync::mpsc`). No async runtime.
 
 ## Rendering
 
-All output buffered to a `Vec<u8>`, written to terminal in a single `write_all` per frame. Synchronized output protocol (`\x1b[?2026h`/`\x1b[?2026l`) wraps each frame so supporting terminals (kitty, iTerm2, WezTerm, ghostty, foot) hold rendering until complete; unsupporting terminals ignore the sequences. Lines are overwritten in-place with `\x1b[K` (erase to end of line) after content rather than `\x1b[2K` (erase entire line) before, eliminating clear-then-draw flicker. Scroll at document boundaries short-circuits (no redraw). **Soft-wrap**: long lines wrap at the right edge of the viewport (no horizontal scrolling). A logical line occupying `ceil(display_width / text_cols)` screen rows is rendered as multiple chunks. Line numbers appear only on the first wrapped row; continuation rows get blank gutters. The viewport tracks `(scroll_line, scroll_wrap)` — both which logical line and which wrapped sub-row of that line is at the top of the screen. Cursor screen position uses `col % text_cols` for the column and counts wrapped rows from the scroll position for the row. Mouse clicks walk from the scroll position through wrapped rows to map screen coordinates to buffer positions. Syntax highlighting: per-line HlState cached across frames (keyed by GapBuffer version counter); cache reused during scrolling (zero recomputation), recomputed on edits; per-char HlType mapped from byte highlights; ANSI colors emitted with minimal escape changes on the fast path. Selection/find highlights override syntax colors. Bracket matching: when cursor is on a bracket `()[]{}`, the matching bracket is highlighted with magenta background/black text. Status bar (reverse video) on second-to-last row shows `filename* [Language]` on the left and `e vVERSION` on the right (version from `env!("CARGO_PKG_VERSION")`). Command buffer on last row when active with yellow background/black text and blinking cursor. Tab completions render above the status bar. Selection rendered as reverse video, find matches as yellow background (current match green). Line numbers in dim text (no separator). Tabs display as dark grey `|` pipe followed by space. Cursor hidden during find navigation mode and when selection is active.
+All output buffered to a `Vec<u8>`, written to terminal in a single `write_all` per frame. Synchronized output protocol (`\x1b[?2026h`/`\x1b[?2026l`) wraps each frame so supporting terminals (kitty, iTerm2, WezTerm, ghostty, foot) hold rendering until complete; unsupporting terminals ignore the sequences. Lines are overwritten in-place with `\x1b[K` (erase to end of line) after content rather than `\x1b[2K` (erase entire line) before, eliminating clear-then-draw flicker. Scroll at document boundaries short-circuits (no redraw). **Soft-wrap**: long lines wrap at the right edge of the viewport (no horizontal scrolling). A logical line occupying `ceil(display_width / text_cols)` screen rows is rendered as multiple chunks. Line numbers appear only on the first wrapped row; continuation rows get blank gutters. The viewport tracks `(scroll_line, scroll_wrap)` — both which logical line and which wrapped sub-row of that line is at the top of the screen. Cursor screen position uses `col % text_cols` for the column and counts wrapped rows from the scroll position for the row. Mouse clicks walk from the scroll position through wrapped rows to map screen coordinates to buffer positions. Syntax highlighting: per-line HlState cached across frames (keyed by GapBuffer version counter); cache reused during scrolling (zero recomputation), recomputed on edits; per-char HlType mapped from byte highlights; ANSI colors emitted with minimal escape changes on the fast path. Selection/find highlights override syntax colors. Bracket matching: when cursor is on a bracket `()[]{}`, the matching bracket is highlighted with magenta background/black text. Status bar (reverse video) on second-to-last row shows `filename* [Language]` on the left and `e vVERSION` on the right (version from `env!("CARGO_PKG_VERSION")`). Command buffer on last row when active with yellow background/black text and blinking cursor. Tab completions render above the status bar. Selection rendered as reverse video, find matches as yellow background (current match green). Line numbers in dim text (current line number has white background); no separator. Tabs display as dark grey `|` pipe followed by space. Trailing whitespace highlighted with red background on lines that have non-whitespace content. Cursor hidden during find navigation mode and when selection is active.
 
 ## Keybindings
 
@@ -85,6 +85,8 @@ Configurable via `~/.config/e/keybindings.ini`. Format: `ctrl+key = action`.
 | `Delete` | Forward delete (non-configurable) |
 | `Left/Right` | Move cursor; snaps to 2-space indent stops in leading whitespace |
 | `Shift+Arrows` | Extend selection (left/right also snap to indent stops) |
+| `Ctrl+Left` | Move cursor to previous word boundary |
+| `Ctrl+Right` | Move cursor to next word boundary |
 | `Ctrl+Shift+Up` | Select from cursor to start of file |
 | `Ctrl+Shift+Down` | Select from cursor to end of file |
 | `Esc` / `^q` | Cancel command bar / clear selection / find highlights |
@@ -105,6 +107,7 @@ Entered via `^p` command palette. Available commands:
 | `replaceall <pattern> <replacement>` | Replace all matches (in selection if active, else whole file) |
 | `comment [on\|off]` | Toggle line comments (language-aware); `on` forces comment, `off` forces uncomment |
 | `selectall` | Select all text in the buffer |
+| `trim` | Strip trailing whitespace from all lines |
 
 All commands that take arguments support single-quoted (`'arg with spaces'`) and double-quoted (`"arg"`) tokens. Unquoted arguments are split on whitespace.
 
@@ -147,7 +150,7 @@ All commands that take arguments support single-quoted (`'arg with spaces'`) and
 - [x] SIGWINCH window resize handling
 - [x] File safety checks (binary detection, >5MB confirmation)
 - [x] CRLF→LF normalization on read
-- [x] Trailing whitespace strip on save (adjusts cursor position) + ensure newline on save
+- [x] Trailing whitespace highlighting (red background on non-blank lines) + `trim` command to strip + ensure newline on save
 - [x] Quit confirmation when dirty
 - [x] Save-as prompt for unnamed buffers
 - [x] Mouse support (click, drag, double/triple click, scroll wheel)
@@ -182,3 +185,8 @@ All commands that take arguments support single-quoted (`'arg with spaces'`) and
 - [x] Persistent undo history (`~/.config/e/undo.bin`) — survives editor restarts, single binary file with length-prefixed entries, validated by file mtime, silently discarded on external modification
 - [x] External file change detection via terminal focus events (`\x1b[?1004h`) — one `stat()` per focus-in, zero polling overhead, prompts reload (y/n), clamps cursor on reload
 - [x] Cursor position persistence (`~/.config/e/cursor.bin`) — remembers last cursor line/col per file, restored on reopen with clamping to buffer bounds, view centered on restored position, stale entries pruned for deleted files
+- [x] Word navigation (`Ctrl+Left`/`Ctrl+Right`) — jump by word boundary, wraps across lines, collapses selection
+- [x] Auto-close pairs — `()[]{}""''` auto-insert closing char, skip-over on close, backspace deletes both, wraps selection
+- [x] Smart paste — multi-line pastes re-indented to match cursor indent level
+- [x] Current line number highlight (white background in ruler)
+- [x] Trailing whitespace highlighting (red background on lines with non-whitespace content)
