@@ -101,9 +101,12 @@ Entered via `^p` command palette. Available commands:
 | `quit` / `q` | Quit |
 | `goto <line>` | Jump to line number |
 | `ruler` | Toggle line number ruler |
-| `replaceall <regex> <replacement>` | Replace all matches (in selection if active, else whole file) |
+| `find <pattern>` | Find pattern (regex, smart-case); same as `^f` submit |
+| `replaceall <pattern> <replacement>` | Replace all matches (in selection if active, else whole file) |
 | `comment [on\|off]` | Toggle line comments (language-aware); `on` forces comment, `off` forces uncomment |
 | `selectall` | Select all text in the buffer |
+
+All commands that take arguments support single-quoted (`'arg with spaces'`) and double-quoted (`"arg"`) tokens. Unquoted arguments are split on whitespace.
 
 ## Building
 

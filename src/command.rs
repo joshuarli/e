@@ -1,6 +1,46 @@
 /// Command registry: maps command names to functions.
 use std::collections::HashMap;
 
+/// Parse a command argument string into tokens, respecting single and double quotes.
+/// Unquoted tokens are split on whitespace. Quoted tokens preserve interior whitespace
+/// and the quotes are stripped. Backslash-escaping is NOT supported (keep it simple).
+fn parse_args(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            let quote = c;
+            chars.next(); // consume opening quote
+            let mut token = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch == quote {
+                    chars.next(); // consume closing quote
+                    break;
+                }
+                token.push(ch);
+                chars.next();
+            }
+            args.push(token);
+        } else {
+            let mut token = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch.is_whitespace() {
+                    break;
+                }
+                token.push(ch);
+                chars.next();
+            }
+            args.push(token);
+        }
+    }
+    args
+}
+
 pub type CommandFn = fn(&str, &mut CommandContext);
 
 /// Context passed to command functions so they can affect editor state.
@@ -23,6 +63,7 @@ pub enum CommandAction {
     ToggleComment,
     CommentOn,
     CommentOff,
+    Find(String),
     SelectAll,
     StatusMsg(String),
 }
@@ -40,6 +81,7 @@ impl CommandRegistry {
         commands.insert("q".to_string(), cmd_quit);
         commands.insert("goto".to_string(), cmd_goto);
         commands.insert("ruler".to_string(), cmd_ruler);
+        commands.insert("find".to_string(), cmd_find);
         commands.insert("replaceall".to_string(), cmd_replaceall);
         commands.insert("comment".to_string(), cmd_comment);
         commands.insert("selectall".to_string(), cmd_selectall);
@@ -103,17 +145,25 @@ fn cmd_ruler(_args: &str, ctx: &mut CommandContext) {
     ctx.action = CommandAction::ToggleRuler;
 }
 
+fn cmd_find(args: &str, ctx: &mut CommandContext) {
+    let parsed = parse_args(args);
+    if parsed.is_empty() {
+        ctx.action = CommandAction::StatusMsg("Usage: find <pattern>".to_string());
+        return;
+    }
+    ctx.action = CommandAction::Find(parsed[0].clone());
+}
+
 fn cmd_replaceall(args: &str, ctx: &mut CommandContext) {
-    // replaceall <regex> <replacement>
-    let parts: Vec<&str> = args.splitn(2, ' ').collect();
-    if parts.len() < 2 {
+    let parsed = parse_args(args);
+    if parsed.len() < 2 {
         ctx.action =
-            CommandAction::StatusMsg("Usage: replaceall <regex> <replacement>".to_string());
+            CommandAction::StatusMsg("Usage: replaceall <pattern> <replacement>".to_string());
         return;
     }
     ctx.action = CommandAction::ReplaceAll {
-        pattern: parts[0].to_string(),
-        replacement: parts[1].to_string(),
+        pattern: parsed[0].clone(),
+        replacement: parsed[1].clone(),
     };
 }
 
@@ -212,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replaceall_replacement_with_spaces() {
+    fn test_replaceall_two_unquoted_args() {
         let reg = CommandRegistry::new();
         match reg.execute("replaceall foo bar baz") {
             CommandAction::ReplaceAll {
@@ -220,7 +270,52 @@ mod tests {
                 replacement,
             } => {
                 assert_eq!(pattern, "foo");
-                assert_eq!(replacement, "bar baz");
+                assert_eq!(replacement, "bar");
+            }
+            _ => panic!("expected ReplaceAll"),
+        }
+    }
+
+    #[test]
+    fn test_replaceall_single_quoted_args() {
+        let reg = CommandRegistry::new();
+        match reg.execute("replaceall '  foo ' 'bar'") {
+            CommandAction::ReplaceAll {
+                pattern,
+                replacement,
+            } => {
+                assert_eq!(pattern, "  foo ");
+                assert_eq!(replacement, "bar");
+            }
+            _ => panic!("expected ReplaceAll"),
+        }
+    }
+
+    #[test]
+    fn test_replaceall_double_quoted_args() {
+        let reg = CommandRegistry::new();
+        match reg.execute(r#"replaceall "hello world" "goodbye""#) {
+            CommandAction::ReplaceAll {
+                pattern,
+                replacement,
+            } => {
+                assert_eq!(pattern, "hello world");
+                assert_eq!(replacement, "goodbye");
+            }
+            _ => panic!("expected ReplaceAll"),
+        }
+    }
+
+    #[test]
+    fn test_replaceall_quoted_empty_replacement() {
+        let reg = CommandRegistry::new();
+        match reg.execute("replaceall 'foo' ''") {
+            CommandAction::ReplaceAll {
+                pattern,
+                replacement,
+            } => {
+                assert_eq!(pattern, "foo");
+                assert_eq!(replacement, "");
             }
             _ => panic!("expected ReplaceAll"),
         }
@@ -287,6 +382,65 @@ mod tests {
     }
 
     #[test]
+    fn test_find_command() {
+        let reg = CommandRegistry::new();
+        match reg.execute("find hello") {
+            CommandAction::Find(p) => assert_eq!(p, "hello"),
+            _ => panic!("expected Find"),
+        }
+    }
+
+    #[test]
+    fn test_find_quoted_pattern() {
+        let reg = CommandRegistry::new();
+        match reg.execute("find 'hello world'") {
+            CommandAction::Find(p) => assert_eq!(p, "hello world"),
+            _ => panic!("expected Find"),
+        }
+    }
+
+    #[test]
+    fn test_find_no_args() {
+        let reg = CommandRegistry::new();
+        match reg.execute("find") {
+            CommandAction::StatusMsg(msg) => assert!(msg.contains("Usage")),
+            _ => panic!("expected StatusMsg"),
+        }
+    }
+
+    #[test]
+    fn test_parse_args_basic() {
+        assert_eq!(parse_args("foo bar"), vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn test_parse_args_single_quotes() {
+        assert_eq!(parse_args("'foo bar' baz"), vec!["foo bar", "baz"]);
+    }
+
+    #[test]
+    fn test_parse_args_double_quotes() {
+        assert_eq!(parse_args(r#""foo bar" baz"#), vec!["foo bar", "baz"]);
+    }
+
+    #[test]
+    fn test_parse_args_empty_quoted() {
+        assert_eq!(parse_args("'' 'x'"), vec!["", "x"]);
+    }
+
+    #[test]
+    fn test_parse_args_extra_whitespace() {
+        assert_eq!(parse_args("  foo   bar  "), vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn test_parse_args_empty() {
+        let result: Vec<String> = Vec::new();
+        assert_eq!(parse_args(""), result);
+        assert_eq!(parse_args("   "), result);
+    }
+
+    #[test]
     fn test_unknown_command() {
         let reg = CommandRegistry::new();
         match reg.execute("foobar") {
@@ -308,6 +462,7 @@ mod tests {
         assert!(names.contains(&"save"));
         assert!(names.contains(&"quit"));
         assert!(names.contains(&"q"));
+        assert!(names.contains(&"find"));
         assert!(names.contains(&"goto"));
         assert!(names.contains(&"ruler"));
         assert!(names.contains(&"replaceall"));
