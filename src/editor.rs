@@ -28,6 +28,13 @@ const CTRL_SHIFT_UP: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'A'];
 const CTRL_SHIFT_DOWN: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'B'];
 const CTRL_LEFT: &[u8] = &[0x1b, b'[', b'1', b';', b'5', b'D'];
 const CTRL_RIGHT: &[u8] = &[0x1b, b'[', b'1', b';', b'5', b'C'];
+// rxvt-style (sent by tmux, some terminals)
+const CTRL_LEFT_RXVT: &[u8] = &[0x1b, b'O', b'd'];
+const CTRL_RIGHT_RXVT: &[u8] = &[0x1b, b'O', b'c'];
+const CTRL_SHIFT_LEFT: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'D'];
+const CTRL_SHIFT_RIGHT: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'C'];
+// CSI u encoding for Ctrl+Backspace (kitty, ghostty, etc.)
+const CTRL_BACKSPACE_CSI_U: &[u8] = &[0x1b, b'[', b'1', b'2', b'7', b';', b'5', b'u'];
 const FOCUS_IN: &[u8] = &[0x1b, b'[', b'I'];
 
 fn auto_close_char(c: char) -> Option<char> {
@@ -468,10 +475,16 @@ impl Editor {
                         self.select_above();
                     } else if bytes == CTRL_SHIFT_DOWN {
                         self.select_below();
-                    } else if bytes == CTRL_LEFT {
+                    } else if bytes == CTRL_LEFT || bytes == CTRL_LEFT_RXVT {
                         self.word_left();
-                    } else if bytes == CTRL_RIGHT {
+                    } else if bytes == CTRL_RIGHT || bytes == CTRL_RIGHT_RXVT {
                         self.word_right();
+                    } else if bytes == CTRL_SHIFT_LEFT {
+                        self.word_left_extend();
+                    } else if bytes == CTRL_SHIFT_RIGHT {
+                        self.word_right_extend();
+                    } else if bytes == CTRL_BACKSPACE_CSI_U {
+                        self.ctrl_backspace();
                     }
                 }
             }
@@ -596,6 +609,8 @@ impl Editor {
             Key::Right => self.move_right(),
             Key::Home => self.move_home(),
             Key::End => self.move_end(),
+            Key::CtrlLeft => self.word_left(),
+            Key::CtrlRight => self.word_right(),
             Key::PageUp => self.page_up(),
             Key::PageDown => self.page_down(),
 
@@ -1410,6 +1425,34 @@ impl Editor {
         let line_text = self.doc.buf.line_text(c.line);
         let boundary = next_word_boundary(&line_text, c.col);
         self.set_cursor(Pos::new(c.line, boundary));
+    }
+
+    fn word_left_extend(&mut self) {
+        let c = self.cursor();
+        if c.col == 0 {
+            if c.line > 0 {
+                let prev_len = self.doc.buf.line_char_len(c.line - 1);
+                self.sel.cursor = Pos::new(c.line - 1, prev_len);
+            }
+            return;
+        }
+        let line_text = self.doc.buf.line_text(c.line);
+        let boundary = prev_word_boundary(&line_text, c.col);
+        self.sel.cursor = Pos::new(c.line, boundary);
+    }
+
+    fn word_right_extend(&mut self) {
+        let c = self.cursor();
+        let line_len = self.doc.buf.line_char_len(c.line);
+        if c.col >= line_len {
+            if c.line + 1 < self.doc.buf.line_count() {
+                self.sel.cursor = Pos::new(c.line + 1, 0);
+            }
+            return;
+        }
+        let line_text = self.doc.buf.line_text(c.line);
+        let boundary = next_word_boundary(&line_text, c.col);
+        self.sel.cursor = Pos::new(c.line, boundary);
     }
 
     fn move_home(&mut self) {
