@@ -183,7 +183,7 @@ pub struct View {
 - `text_rows()` — `height - 2` (status bar + command line).
 - `text_cols(gutter_width)` — `width - gutter_width`.
 - `wrapped_rows(display_width, text_cols) -> usize` — `display_width.div_ceil(text_cols)`, minimum 1. Free function.
-- `ensure_cursor_visible(...)` — adjusts scroll so cursor is visible. Computes cursor's wrapped sub-row, counts screen rows from scroll position. Scrolls forward if cursor is below viewport, snaps to cursor if above.
+- `ensure_cursor_visible(...)` — adjusts scroll so cursor is visible. Computes cursor's wrapped sub-row, counts screen rows from scroll position. Scrolls forward if cursor is below viewport, snaps to cursor if above. **Fast path**: if the cursor is more than `2 × text_rows` logical lines below the scroll position it is definitely off-screen; sets `scroll_line = cursor_line + 1 - rows` (cursor at bottom, 1-row-per-line assumption) without scanning intervening lines. This makes large jumps (e.g. Ctrl+A select-all on a 1M-line file) O(1) instead of O(file_size).
 - `scroll_forward(n, ...)` — scrolls forward by `n` screen rows, advancing through wrapped lines.
 - `center_on_line(line, ...)` — centers viewport vertically on a line by walking backward, accumulating screen rows until half the viewport is filled.
 - `buffer_to_screen(line, col, ...) -> Option<(u16, u16)>` — converts buffer position to screen coordinates. Returns None if off-screen.

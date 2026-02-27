@@ -69,6 +69,16 @@ impl View {
             return;
         }
 
+        // Fast path: when the cursor is far off-screen (more than 2× viewport heights
+        // away), skip the O(distance) per-line wrap scan and jump directly.  The slow
+        // path is still used for small overscrolls so minimal-scroll semantics are exact.
+        if cursor_line.saturating_sub(self.scroll_line) > rows * 2 {
+            // Place cursor at the bottom of the viewport (1 row per line assumption).
+            self.scroll_line = cursor_line + 1 - rows;
+            self.scroll_wrap = 0;
+            return;
+        }
+
         // Count screen rows from (scroll_line, scroll_wrap) to (cursor_line, cursor_wrap) inclusive
         let mut screen_rows = 0usize;
 
