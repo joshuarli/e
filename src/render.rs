@@ -200,19 +200,9 @@ impl Renderer {
             );
             let line_str = String::from_utf8_lossy(&self.expanded_scratch);
 
-            // One-pass scan: count chars, find trailing-whitespace boundary.
+            // One-pass scan: count chars.
             // Replaces the former `chars: Vec<char>` allocation.
-            let mut char_count = 0usize;
-            let mut trailing_ws_start = 0usize;
-            let mut any_nonws = false;
-            for (i, c) in line_str.chars().enumerate() {
-                char_count += 1;
-                if !c.is_ascii_whitespace() {
-                    trailing_ws_start = i + 1;
-                    any_nonws = true;
-                }
-            }
-            let has_trailing = any_nonws && trailing_ws_start < char_count;
+            let char_count = line_str.chars().count();
             let total_wraps = crate::view::wrapped_rows(char_count, text_cols);
             let start_wrap = if line_idx == view.scroll_line {
                 first_wrap
@@ -340,8 +330,6 @@ impl Renderer {
                             && i < self.tab_pipes_scratch.len()
                             && self.tab_pipes_scratch[i];
                         let is_bracket_match = bracket_col_0 == Some(i) || bracket_col_1 == Some(i);
-                        let is_trailing_ws = has_trailing && i >= trailing_ws_start;
-
                         if in_sel {
                             if is_tab_pipe {
                                 write!(w, "\x1b[7;90m{}\x1b[0m", ch)?;
@@ -356,8 +344,6 @@ impl Renderer {
                             }
                         } else if is_bracket_match {
                             write!(w, "\x1b[45;30m{}\x1b[0m", ch)?;
-                        } else if is_trailing_ws {
-                            write!(w, "\x1b[41m{}\x1b[0m", ch)?;
                         } else if is_tab_pipe {
                             write!(w, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
@@ -389,14 +375,7 @@ impl Renderer {
                         let is_tab_pipe = has_tabs
                             && i < self.tab_pipes_scratch.len()
                             && self.tab_pipes_scratch[i];
-                        let is_trailing_ws = has_trailing && i >= trailing_ws_start;
-                        if is_trailing_ws {
-                            if current_hl != HlType::Normal {
-                                write!(w, "\x1b[0m")?;
-                                current_hl = HlType::Normal;
-                            }
-                            write!(w, "\x1b[41m{}\x1b[0m", ch)?;
-                        } else if is_tab_pipe {
+                        if is_tab_pipe {
                             if current_hl != HlType::Normal {
                                 write!(w, "\x1b[0m")?;
                                 current_hl = HlType::Normal;

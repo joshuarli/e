@@ -63,9 +63,6 @@ On by default. Togglable. When on:
 
 Long lines wrap at the right edge of the viewport. There is no horizontal scrolling. The viewport tracks both which logical line and which wrapped sub-row is at the top of the screen.
 
-### Trailing whitespace highlighting
-
-On lines that contain non-whitespace content, any trailing whitespace (spaces/tabs) is highlighted with a red background.
 
 ### Cursor visibility
 

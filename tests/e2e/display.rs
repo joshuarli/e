@@ -74,20 +74,17 @@ fn soft_wrap_long_line() {
 }
 
 #[test]
-fn trailing_whitespace_highlighted() {
+fn trailing_whitespace_not_highlighted() {
     let dir = TempDir::new();
-    // Trailing spaces on a line with content
+    // Trailing spaces on a line with content — should NOT be highlighted
     let path = create_file(dir.path(), "test.txt", "hello   \n");
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
-    // Check background color of trailing space
-    // "hello" is at gutter+0..gutter+5, spaces at gutter+5..gutter+8
-    // Gutter is "1 " = 2 chars. So trailing space is at col 7 (2+5)
+    // Gutter is "1 " = 2 chars. Trailing space is at col 7 (2+5)
     let bg = e.cell_bg(0, 7);
-    // Should be red background (Color::Idx(1) for red)
-    assert_ne!(
+    assert_eq!(
         bg,
         vt100::Color::Default,
-        "trailing whitespace should be highlighted"
+        "trailing whitespace should not be highlighted"
     );
 }
 

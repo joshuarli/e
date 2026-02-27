@@ -683,8 +683,8 @@ pub struct Renderer {
    - For each wrapped chunk:
      - **Gutter**: line number (right-aligned, formatted via `write_line_num` into a stack `[u8; 20]` — no heap allocation) on first wrap row; blank on continuation rows. Current line: white bg black text (`\x1b[0;47;30m`). Other lines: dim (`\x1b[0;2m`).
      - **Content**: two paths:
-       - **Slow path** (selection, find matches, or bracket matches present): per-character rendering with priority: selection (reverse video `\x1b[7m`) > find match (yellow bg `\x1b[43;30m`, current match green bg `\x1b[42;30m`) > bracket match (magenta bg `\x1b[45;30m`) > trailing whitespace (red bg `\x1b[41m`) > tab pipe (dark grey `\x1b[90m`) > syntax highlight.
-       - **Fast path** (no overlays): streaming syntax highlighting with minimal escape changes. Trailing whitespace and tab pipes handled inline.
+       - **Slow path** (selection, find matches, or bracket matches present): per-character rendering with priority: selection (reverse video `\x1b[7m`) > find match (yellow bg `\x1b[43;30m`, current match green bg `\x1b[42;30m`) > bracket match (magenta bg `\x1b[45;30m`) > tab pipe (dark grey `\x1b[90m`) > syntax highlight.
+       - **Fast path** (no overlays): streaming syntax highlighting with minimal escape changes. Tab pipes handled inline.
      - Reset and erase to end of line: `\x1b[0m\x1b[K`.
 8. Fill remaining rows with empty lines (blank gutters if ruler on).
 9. **Completions**: dim text (`\x1b[2m`) on rows above status bar.
