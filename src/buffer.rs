@@ -210,22 +210,14 @@ impl GapBuffer {
             self.line_starts[j] += n;
         }
 
-        // Collect new line starts from newlines in the inserted bytes
-        let new_entries: Vec<usize> = bytes
-            .iter()
-            .enumerate()
-            .filter_map(|(k, &b)| {
+        // Splice new line starts from newlines in the inserted bytes
+        self.line_starts.splice(
+            shift_from..shift_from,
+            bytes.iter().enumerate().filter_map(|(k, &b)| {
                 let s = pos + k + 1;
                 (b == b'\n' && s < new_len).then_some(s)
-            })
-            .collect();
-
-        if !new_entries.is_empty() {
-            let old_tail = self.line_starts[shift_from..].to_vec();
-            self.line_starts.truncate(shift_from);
-            self.line_starts.extend_from_slice(&new_entries);
-            self.line_starts.extend_from_slice(&old_tail);
-        }
+            }),
+        );
 
         self.min_dirty_line = self.min_dirty_line.min(insert_line);
     }

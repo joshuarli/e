@@ -68,15 +68,14 @@ pub fn prev_word_boundary(line_bytes: &[u8], col: usize) -> usize {
     if col == 0 {
         return 0;
     }
-    let chars: Vec<u8> = line_bytes.to_vec();
-    let mut i = col.min(chars.len());
+    let mut i = col.min(line_bytes.len());
 
     // Skip whitespace/non-word chars backward
-    while i > 0 && !is_word_char(chars[i - 1]) {
+    while i > 0 && !is_word_char(line_bytes[i - 1]) {
         i -= 1;
     }
     // Skip word chars backward
-    while i > 0 && is_word_char(chars[i - 1]) {
+    while i > 0 && is_word_char(line_bytes[i - 1]) {
         i -= 1;
     }
     i

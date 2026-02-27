@@ -115,10 +115,11 @@ impl UndoStack {
             cursor_before,
             cursor_after,
         });
-        group.ops.push(op.clone());
+        let kind = op.kind();
+        group.ops.push(op);
         group.cursor_after = cursor_after;
 
-        self.last_kind = Some(op.kind());
+        self.last_kind = Some(kind);
         self.last_time = Some(Instant::now());
         self.last_cursor = cursor_after;
     }
