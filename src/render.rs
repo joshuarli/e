@@ -155,7 +155,7 @@ impl Renderer {
                 }
                 self.hl_cache_version = buf_version;
             }
-            self.refresh_hl_cache(visible_end, line_count, buf, rules);
+            self.refresh_hl_cache(visible_end, view.scroll_line, line_count, buf, rules);
             self.hl_dirty_from = usize::MAX;
         } else {
             self.hl_cache.clear();
@@ -511,9 +511,15 @@ impl Renderer {
     ///   output state (= input state for the next line), then continue forward.
     /// - When `hl_dirty_from` is set (edit occurred), recomputes forward from
     ///   that line, stopping early once the cached output state matches.
+    /// - **Large-jump fast path**: when the viewport jumped far past the computed
+    ///   range (e.g. select-all on a 1M-line file), the intermediate entries are
+    ///   filled with `HlState::Normal` and only the `scroll_line-200..end` range
+    ///   is actually computed.  Multi-line constructs starting in the skipped gap
+    ///   will be cosmetically wrong until the user scrolls back through them.
     fn refresh_hl_cache(
         &mut self,
         end: usize,
+        scroll_line: usize,
         line_count: usize,
         buf: &mut GapBuffer,
         rules: &'static SyntaxRules,
@@ -528,7 +534,8 @@ impl Renderer {
 
         let computed = self.hl_cache.len(); // valid entries before this call
 
-        // Grow to cover the viewport.
+        // Grow to cover the viewport.  Entries beyond the old `computed` point
+        // are initialised to Normal (fast memset).
         if computed < end {
             self.hl_cache.resize(end, HlState::Normal);
         }
@@ -537,8 +544,27 @@ impl Renderer {
         //   dirty_from  — explicit invalidation from an edit
         //   computed-1  — reprocess last known line to recover its output state
         //                 so we can extend the cache forward from there
+        //
+        // Where to start recomputing:
+        //   dirty_from  — explicit invalidation from an edit
+        //   computed-1  — reprocess last known line to recover its output state
+        //                 so we can extend the cache forward from there
+        //
+        // Large-jump optimisation: when the viewport moved far past the computed
+        // range (e.g. select-all jumps scroll_line from 0 to 999 978), skip the
+        // intermediate gap (already filled Normal by resize) and only compute the
+        // ~200 lines just before the visible area.  The condition
+        //   scroll_line > computed + 50
+        // identifies this: a normal one-line scroll keeps scroll_line ≤ computed.
         let start = if computed < end {
-            self.hl_dirty_from.min(computed.saturating_sub(1))
+            let dirty_from = self.hl_dirty_from.min(computed.saturating_sub(1));
+            if scroll_line > computed + 50 {
+                // Far jump: compute only near the new viewport; accept Normal
+                // state approximation for the skipped gap.
+                scroll_line.saturating_sub(200)
+            } else {
+                dirty_from
+            }
         } else {
             self.hl_dirty_from.min(end)
         };
