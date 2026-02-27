@@ -15,11 +15,18 @@ pub fn gutter_width(line_count: usize) -> usize {
     digits + 1
 }
 
-/// Expand tabs to display characters. Returns (expanded_bytes, tab_pipe_positions).
-/// tab_pipe_positions[i] is true if display column i is the '|' of a tab.
-fn expand_tabs(text: &[u8]) -> (Vec<u8>, Vec<bool>) {
-    let mut out = Vec::with_capacity(text.len());
-    let mut tab_pipes = Vec::with_capacity(text.len());
+/// Expand tabs in `text`, writing expanded bytes into `out` and per-column
+/// pipe-markers into `tab_pipes`. Clears both buffers first.
+/// Returns `true` when the line contains tabs (caller can skip tab-pipe checks otherwise).
+/// When no tabs: `out` receives a verbatim copy of `text`; `tab_pipes` is left empty.
+fn expand_tabs_into(text: &[u8], out: &mut Vec<u8>, tab_pipes: &mut Vec<bool>) -> bool {
+    out.clear();
+    if !text.contains(&b'\t') {
+        out.extend_from_slice(text);
+        tab_pipes.clear();
+        return false;
+    }
+    tab_pipes.clear();
     for &b in text {
         if b == b'\t' {
             out.push(b'|');
@@ -31,7 +38,7 @@ fn expand_tabs(text: &[u8]) -> (Vec<u8>, Vec<bool>) {
             tab_pipes.push(false);
         }
     }
-    (out, tab_pipes)
+    true
 }
 
 pub struct Renderer {
@@ -45,6 +52,10 @@ pub struct Renderer {
     hl_dirty_from: usize,
     /// Scratch buffer reused each line for line_text_into.
     line_buf: Vec<u8>,
+    /// Scratch buffer reused each line for tab-expanded output.
+    expanded_scratch: Vec<u8>,
+    /// Scratch buffer reused each line for tab-pipe column markers.
+    tab_pipes_scratch: Vec<bool>,
     /// Scratch buffer reused each line for byte-indexed highlight output.
     hl_scratch: Vec<HlType>,
     /// Scratch buffer reused each line for char-indexed highlight output.
@@ -60,6 +71,8 @@ impl Renderer {
             hl_cache_version: u64::MAX,
             hl_dirty_from: 0,
             line_buf: Vec::new(),
+            expanded_scratch: Vec::new(),
+            tab_pipes_scratch: Vec::new(),
             hl_scratch: Vec::new(),
             char_hl_scratch: Vec::new(),
         }
@@ -154,8 +167,12 @@ impl Renderer {
         while screen_row < text_rows && line_idx < line_count {
             buf.line_text_into(line_idx, &mut self.line_buf);
             let raw_text: &[u8] = &self.line_buf;
-            let (expanded, tab_pipes) = expand_tabs(raw_text);
-            let line_str = String::from_utf8_lossy(&expanded);
+            let has_tabs = expand_tabs_into(
+                raw_text,
+                &mut self.expanded_scratch,
+                &mut self.tab_pipes_scratch,
+            );
+            let line_str = String::from_utf8_lossy(&self.expanded_scratch);
 
             // One-pass scan: count chars, find trailing-whitespace boundary.
             // Replaces the former `chars: Vec<char>` allocation.
@@ -285,7 +302,9 @@ impl Renderer {
                     {
                         let in_sel = need_per_char && i >= line_sel_start && i < line_sel_end;
                         let find_hit = find_ranges.iter().find(|(fs, fe, _)| i >= *fs && i < *fe);
-                        let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
+                        let is_tab_pipe = has_tabs
+                            && i < self.tab_pipes_scratch.len()
+                            && self.tab_pipes_scratch[i];
                         let is_bracket_match = bracket_cols.contains(&i);
                         let is_trailing_ws = has_trailing && i >= trailing_ws_start;
 
@@ -333,7 +352,9 @@ impl Renderer {
                         .take(chunk_end)
                         .skip(chunk_start)
                     {
-                        let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
+                        let is_tab_pipe = has_tabs
+                            && i < self.tab_pipes_scratch.len()
+                            && self.tab_pipes_scratch[i];
                         let is_trailing_ws = has_trailing && i >= trailing_ws_start;
                         if is_trailing_ws {
                             if current_hl != HlType::Normal {
@@ -616,40 +637,52 @@ mod tests {
         assert_eq!(gutter_width(100000), 7); // 6 digits + 1
     }
 
-    // -- expand_tabs ----------------------------------------------------------
+    // -- expand_tabs_into -----------------------------------------------------
+
+    fn call_expand(text: &[u8]) -> (Vec<u8>, Vec<bool>, bool) {
+        let mut out = Vec::new();
+        let mut pipes = Vec::new();
+        let has_tabs = expand_tabs_into(text, &mut out, &mut pipes);
+        (out, pipes, has_tabs)
+    }
 
     #[test]
     fn test_expand_tabs_no_tabs() {
-        let (bytes, pipes) = expand_tabs(b"hello");
+        let (bytes, pipes, has_tabs) = call_expand(b"hello");
         assert_eq!(bytes, b"hello");
-        assert_eq!(pipes, vec![false; 5]);
+        assert!(!has_tabs);
+        assert!(pipes.is_empty());
     }
 
     #[test]
     fn test_expand_tabs_single_tab() {
-        let (bytes, pipes) = expand_tabs(b"\thello");
+        let (bytes, pipes, has_tabs) = call_expand(b"\thello");
         assert_eq!(bytes, b"| hello");
+        assert!(has_tabs);
         assert_eq!(pipes, vec![true, false, false, false, false, false, false]);
     }
 
     #[test]
     fn test_expand_tabs_multiple_tabs() {
-        let (bytes, pipes) = expand_tabs(b"\t\t");
+        let (bytes, pipes, has_tabs) = call_expand(b"\t\t");
         assert_eq!(bytes, b"| | ");
+        assert!(has_tabs);
         assert_eq!(pipes, vec![true, false, true, false]);
     }
 
     #[test]
     fn test_expand_tabs_mixed() {
-        let (bytes, pipes) = expand_tabs(b"a\tb\tc");
+        let (bytes, pipes, has_tabs) = call_expand(b"a\tb\tc");
         assert_eq!(bytes, b"a| b| c");
+        assert!(has_tabs);
         assert_eq!(pipes, vec![false, true, false, false, true, false, false]);
     }
 
     #[test]
     fn test_expand_tabs_empty() {
-        let (bytes, pipes) = expand_tabs(b"");
+        let (bytes, pipes, has_tabs) = call_expand(b"");
         assert_eq!(bytes, b"");
+        assert!(!has_tabs);
         assert!(pipes.is_empty());
     }
 
