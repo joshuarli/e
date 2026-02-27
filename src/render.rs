@@ -473,17 +473,16 @@ impl Renderer {
                     sr = cursor_wrap.saturating_sub(view.scroll_wrap);
                 } else {
                     // Remaining wraps of scroll_line
+                    buf.line_text_into(view.scroll_line, &mut self.line_buf);
                     let first_wraps = crate::view::wrapped_rows(
-                        display_col_for_char_col(
-                            &buf.line_text(view.scroll_line),
-                            buf.line_char_len(view.scroll_line),
-                        ),
+                        display_col_for_char_col(&self.line_buf, usize::MAX),
                         text_cols,
                     );
                     sr += first_wraps.saturating_sub(view.scroll_wrap);
                     for l in (view.scroll_line + 1)..cursor_line {
+                        buf.line_text_into(l, &mut self.line_buf);
                         sr += crate::view::wrapped_rows(
-                            display_col_for_char_col(&buf.line_text(l), buf.line_char_len(l)),
+                            display_col_for_char_col(&self.line_buf, usize::MAX),
                             text_cols,
                         );
                     }

@@ -132,8 +132,8 @@ Word boundary helpers:
 
 ```rust
 pub enum Operation {
-    Insert { pos: usize, data: Vec<u8> },  // byte offset + inserted data
-    Delete { pos: usize, data: Vec<u8> },  // byte offset + deleted data (for undo)
+    Insert { pos: usize, data: Arc<[u8]> },  // byte offset + inserted data
+    Delete { pos: usize, data: Arc<[u8]> },  // byte offset + deleted data (for undo)
 }
 
 pub struct OperationGroup {
@@ -644,9 +644,16 @@ Special behaviors:
 pub struct Renderer {
     pub needs_full_redraw: bool,
     syntax: Option<&'static SyntaxRules>,
-    hl_cache: Vec<HlState>,     // Cached highlight state at start of each line
-    hl_cache_version: u64,      // Buffer version the cache was for
-    hl_dirty_from: usize,       // First line needing recompute (usize::MAX = clean)
+    hl_cache: Vec<HlState>,              // Cached highlight state at start of each line
+    hl_cache_version: u64,               // Buffer version the cache was for
+    hl_dirty_from: usize,                // First line needing recompute (usize::MAX = clean)
+    // Scratch buffers reused across render iterations (no per-frame allocation):
+    line_buf: Vec<u8>,                   // Raw line bytes from line_text_into
+    expanded_scratch: Vec<u8>,           // Tab-expanded bytes
+    tab_pipes_scratch: Vec<bool>,        // Per-column tab-pipe markers (empty when no tabs)
+    hl_scratch: Vec<HlType>,             // Byte-indexed highlight output
+    char_hl_scratch: Vec<HlType>,        // Char-indexed highlight output
+    find_scratch: Vec<(usize, usize, bool)>, // Per-line find-range display columns
 }
 ```
 
@@ -673,7 +680,7 @@ pub struct Renderer {
 11. **Cursor positioning**:
     - If `find_active` or selection active: cursor stays hidden.
     - If command buffer active: position cursor in command line at `prompt.len() + cursor`, show cursor.
-    - Otherwise: compute cursor screen position accounting for soft-wrap (col % text_cols + gutter for column, count wrapped rows from scroll position for row), show cursor.
+    - Otherwise: compute cursor screen position accounting for soft-wrap (col % text_cols + gutter for column, count wrapped rows from scroll position for row using `line_text_into` + `display_col_for_char_col` — no allocation), show cursor.
 12. Write entire frame buffer via single `write_all`.
 
 ### Display column conversion
