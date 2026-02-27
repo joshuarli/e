@@ -7,11 +7,28 @@ use crate::selection::Pos;
 
 /// Read a file, converting CRLF → LF. Returns the bytes.
 pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
-    let data = fs::read(path)?;
-    Ok(normalize_line_endings(&data))
+    let mut data = fs::read(path)?;
+    // Normalize CRLF in-place. For pure-LF files (the common case) this is a
+    // single fast scan with no allocation or copy.
+    if data.contains(&b'\r') {
+        let orig_len = data.len();
+        let mut w = 0usize;
+        let mut r = 0usize;
+        while r < orig_len {
+            if data[r] == b'\r' && r + 1 < orig_len && data[r + 1] == b'\n' {
+                r += 1; // skip \r, the \n will be copied on the next iteration
+            }
+            data[w] = data[r];
+            w += 1;
+            r += 1;
+        }
+        data.truncate(w);
+    }
+    Ok(data)
 }
 
-/// Strip CRLF → LF.
+/// Strip CRLF → LF. Used in tests; production uses the in-place path in `read_file`.
+#[cfg(test)]
 pub fn normalize_line_endings(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;

@@ -15,7 +15,7 @@ impl Document {
         let buf = if text.is_empty() {
             GapBuffer::new()
         } else {
-            GapBuffer::from_text(&text)
+            GapBuffer::from_vec(text) // takes ownership, no copy
         };
         Self {
             buf,

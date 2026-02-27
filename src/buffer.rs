@@ -30,26 +30,44 @@ impl GapBuffer {
         }
     }
 
-    pub fn from_text(text: &[u8]) -> Self {
+    /// Build a `GapBuffer` from an owned `Vec<u8>`, reusing the allocation.
+    ///
+    /// This is the fast path for opening files: the caller passes the `Vec`
+    /// returned by `read_file` and we extend it in-place for the gap, so the
+    /// whole startup path goes from 3 allocations + 2 copies down to 1.
+    ///
+    /// `data` must already be CRLF-normalized (as `read_file` guarantees).
+    /// Pre-allocates `line_starts` with a heuristic to avoid reallocs.
+    pub fn from_vec(mut data: Vec<u8>) -> Self {
         let gap = MIN_GAP;
-        let mut data = Vec::with_capacity(text.len() + gap);
-        data.extend_from_slice(text);
-        data.resize(text.len() + gap, 0);
-        let len = text.len();
-        let mut starts = vec![0usize];
-        for (i, &b) in text.iter().enumerate() {
-            if b == b'\n' && i + 1 < len {
+        // Reserve the gap space now so the resize at the end doesn't reallocate.
+        data.reserve(gap);
+        let content_len = data.len();
+        // Heuristic: typical source lines are ~20 bytes; pre-allocate to avoid
+        // the ~20 doublings that Vec would otherwise do for 1M-line files.
+        let mut starts = Vec::with_capacity(content_len / 20 + 16);
+        starts.push(0usize);
+        for (i, &b) in data.iter().enumerate() {
+            if b == b'\n' && i + 1 < content_len {
                 starts.push(i + 1);
             }
         }
+        data.resize(content_len + gap, 0);
         Self {
             data,
-            gap_start: text.len(),
-            gap_end: text.len() + gap,
+            gap_start: content_len,
+            gap_end: content_len + gap,
             line_starts: starts,
             min_dirty_line: usize::MAX,
             version: 0,
         }
+    }
+
+    /// Build a `GapBuffer` from a byte slice. Allocates a new `Vec` internally.
+    /// Used in tests; production code should prefer `from_vec`.
+    #[cfg(test)]
+    pub fn from_text(text: &[u8]) -> Self {
+        Self::from_vec(text.to_vec())
     }
 
     pub fn version(&self) -> u64 {
