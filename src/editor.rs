@@ -532,7 +532,12 @@ impl Editor {
             match key {
                 Key::Char('y') | Key::Char('Y') => {
                     self.save_file();
-                    self.running = false;
+                    if !self.cmd_buf.active {
+                        // Named file: save completed (or failed); quit now.
+                        // If cmd_buf is active, save_file opened a "Save as:" prompt;
+                        // quit_pending stays true and the Prompt handler will quit after save.
+                        self.running = false;
+                    }
                 }
                 Key::Char('n') | Key::Char('N') => {
                     self.save_undo_if_named();
@@ -723,6 +728,10 @@ impl Editor {
                         // save-as prompt
                         self.doc.filename = Some(val.clone());
                         self.save_file();
+                        if self.quit_pending && !self.cmd_buf.active {
+                            self.quit_pending = false;
+                            self.running = false;
+                        }
                     }
                     CommandBufferMode::SudoSave => {
                         self.save_file_sudo(&val);
@@ -3377,6 +3386,36 @@ mod tests {
         e.try_quit();
         e.handle_key(Key::Char('y'));
         assert!(!e.running);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_quit_scratch_dirty_y_then_save_as() {
+        // Regression: quit on a scratch buffer (no filename) with y should open
+        // the save-as prompt and only quit after the filename is confirmed —
+        // not immediately exit without writing any file.
+        let dir = std::env::temp_dir().join("e_test_quit_scratch");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("out.txt");
+        let mut e = ed("hello");
+        e.doc.dirty = true;
+        e.try_quit();
+        // Pressing 'y' on a scratch buffer must open the save-as prompt, not quit.
+        e.handle_key(Key::Char('y'));
+        assert!(e.running, "editor must not quit before filename is given");
+        assert!(e.cmd_buf.active, "save-as prompt must be open");
+        assert!(
+            e.quit_pending,
+            "quit_pending must stay true until save completes"
+        );
+        // Submit the filename — this should save and quit.
+        let path_str = path.to_str().unwrap().to_string();
+        for ch in path_str.chars() {
+            e.handle_cmd_key(Key::Char(ch));
+        }
+        e.handle_cmd_key(Key::Char('\n'));
+        assert!(!e.running, "editor must quit after filename confirmed");
+        assert!(path.exists(), "file must have been written to disk");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

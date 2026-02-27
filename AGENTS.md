@@ -318,7 +318,7 @@ Uses `termion::raw::IntoRawMode` and `termion::screen::IntoAlternateScreen`.
 - `Event::Unsupported(bytes)` → check for special sequences above.
 
 `handle_key(key)` flow:
-1. **Quit pending check** — if `quit_pending`: `y`/`Y` → save and quit; `n`/`N` → save undo history and quit; anything else → cancel.
+1. **Quit pending check** — if `quit_pending`: `y`/`Y` → save and quit (if no filename, opens "Save as:" prompt and defers quit until prompt is confirmed); `n`/`N` → save undo history and quit; anything else → cancel.
 2. **Reload pending check** — if `reload_pending`: `y`/`Y` → reload file; anything else → dismiss.
 3. **Find active check** — if `find_active`: Up → find_prev; Down → find_next; Esc → exit find and clear selection; anything else → exit find and fall through.
 4. **Desired column reset** — preserved only for Up/Down/PageUp/PageDown; reset to None for all other keys.
@@ -971,7 +971,7 @@ Re-reads file, creates new Document, clamps cursor to valid position, clears fin
 ### Quit flow
 
 1. If dirty: shows "Save changes to {name}? (y/n)", sets `quit_pending`.
-2. `y` → save file then quit.
+2. `y` → `save_file()` then quit. If the buffer has no filename, `save_file()` opens the "Save as:" prompt and does NOT quit yet (`quit_pending` stays true, `running` stays true). After the filename is confirmed, the Prompt handler saves and then clears `quit_pending` and sets `running = false`.
 3. `n` → save undo history and cursor position, then quit.
 4. Anything else → cancel quit.
 5. Before quitting (in all paths): `save_undo_if_named()` saves cursor position and undo history to disk.
