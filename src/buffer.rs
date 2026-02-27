@@ -308,6 +308,53 @@ impl GapBuffer {
         }
     }
 
+    /// Compute the display column at char position `char_col` on `line`.
+    /// Tabs count as 2 display columns; every other character counts as 1.
+    /// Pass `char_col = usize::MAX` to get the total display width of the line.
+    /// Does not allocate.
+    pub fn display_col_at(&self, line: usize, char_col: usize) -> usize {
+        let ls = self.line_start(line);
+        let le = self.line_end(line);
+        let mut display = 0usize;
+        let mut ci = 0usize;
+        let mut bi = ls;
+        while ci < char_col && bi < le {
+            let b = self.byte_at(bi);
+            if b == b'\n' {
+                break;
+            }
+            display += if b == b'\t' { 2 } else { 1 };
+            bi += utf8_char_len(b);
+            ci += 1;
+        }
+        display
+    }
+
+    /// Map a display column back to a char column on `line`.
+    /// Inverse of `display_col_at`; reads the gap buffer directly.
+    /// Does not allocate.
+    pub fn char_col_from_display(&self, line: usize, target_display: usize) -> usize {
+        let ls = self.line_start(line);
+        let le = self.line_end(line);
+        let mut display = 0usize;
+        let mut ci = 0usize;
+        let mut bi = ls;
+        while bi < le {
+            let b = self.byte_at(bi);
+            if b == b'\n' {
+                break;
+            }
+            let w = if b == b'\t' { 2 } else { 1 };
+            if display + w > target_display {
+                break;
+            }
+            display += w;
+            bi += utf8_char_len(b);
+            ci += 1;
+        }
+        ci
+    }
+
     /// Convert a (line, col) to a byte offset. Col is clamped to line length.
     pub fn pos_to_offset(&self, line: usize, col: usize) -> usize {
         let start = self.line_start(line);

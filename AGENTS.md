@@ -75,6 +75,8 @@ pub struct GapBuffer {
 - All line-query methods (`line_count`, `line_start`, `line_end`, `line_text`, `pos_to_offset`, `offset_to_pos`, `line_char_len`) take `&self` — no mutable borrow needed.
 - `pos_to_offset(line, col)` walks UTF-8 chars from line start to find byte offset.
 - `offset_to_pos(offset)` binary searches `line_starts` for the line, then counts UTF-8 chars for the column.
+- `display_col_at(line, char_col) -> usize` — display column at `char_col` chars into the line (tabs = 2, other = 1). Pass `usize::MAX` for total line display width. Does not allocate.
+- `char_col_from_display(line, target_display) -> usize` — inverse of `display_col_at`: maps a display column back to a char column. Does not allocate.
 
 Free functions:
 - `utf8_char_len(first_byte: u8) -> usize` — returns 1-4 based on leading byte.

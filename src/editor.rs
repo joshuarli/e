@@ -37,7 +37,7 @@ use crate::document::Document;
 use crate::highlight;
 use crate::keybind::{EditorAction, KeybindingTable};
 use crate::language;
-use crate::render::{Renderer, char_col_for_display_col, display_col_for_char_col, gutter_width};
+use crate::render::{Renderer, gutter_width};
 use crate::selection::{Pos, Selection, is_word_char, next_word_boundary, prev_word_boundary};
 use crate::view::View;
 
@@ -334,12 +334,8 @@ impl Editor {
 
         let display_col = self.cursor_display_col();
         let cursor_line = self.sel.cursor.line;
-        let mut line_display_width = |line: usize| -> usize {
-            display_col_for_char_col(
-                &self.doc.buf.line_text(line),
-                self.doc.buf.line_char_len(line),
-            )
-        };
+        let mut line_display_width =
+            |line: usize| -> usize { self.doc.buf.display_col_at(line, usize::MAX) };
         self.view
             .ensure_cursor_visible(cursor_line, display_col, gw, &mut line_display_width);
 
@@ -432,27 +428,14 @@ impl Editor {
         } else {
             0
         };
-        let mut ldw = |l: usize| -> usize {
-            display_col_for_char_col(&self.doc.buf.line_text(l), self.doc.buf.line_char_len(l))
-        };
+        let mut ldw = |l: usize| -> usize { self.doc.buf.display_col_at(l, usize::MAX) };
         self.view.center_on_line(line, &mut ldw, gw);
     }
 
-    fn cursor_display_col(&mut self) -> usize {
-        let line_text = self.doc.buf.line_text(self.cursor().line);
-        let mut display_col = 0;
-        let mut char_idx = 0;
-        let mut byte_idx = 0;
-        while char_idx < self.cursor().col && byte_idx < line_text.len() {
-            if line_text[byte_idx] == b'\t' {
-                display_col += 2;
-            } else {
-                display_col += 1;
-            }
-            byte_idx += crate::buffer::utf8_char_len(line_text[byte_idx]);
-            char_idx += 1;
-        }
-        display_col
+    fn cursor_display_col(&self) -> usize {
+        self.doc
+            .buf
+            .display_col_at(self.cursor().line, self.cursor().col)
     }
 
     fn find_matching_bracket(&mut self) -> Option<(Pos, Pos)> {
@@ -1059,9 +1042,8 @@ impl Editor {
         let first_wrap = self.view.scroll_wrap;
 
         while line_idx < line_count {
-            let raw_text = self.doc.buf.line_text(line_idx);
+            let display_width = self.doc.buf.display_col_at(line_idx, usize::MAX);
             let char_len = self.doc.buf.line_char_len(line_idx);
-            let display_width = display_col_for_char_col(&raw_text, char_len);
             let total_wraps = crate::view::wrapped_rows(display_width, text_cols);
             let start_wrap = if line_idx == self.view.scroll_line {
                 first_wrap
@@ -1073,8 +1055,7 @@ impl Editor {
                 if screen_row == target_row {
                     // This is the screen row the user clicked on
                     let display_col = wrap * text_cols + click_col;
-                    // Convert display col back to char col
-                    let char_col = char_col_for_display_col(&raw_text, display_col);
+                    let char_col = self.doc.buf.char_col_from_display(line_idx, display_col);
                     return Pos::new(line_idx, char_col.min(char_len));
                 }
                 screen_row += 1;
@@ -1183,10 +1164,10 @@ impl Editor {
                 remaining -= step;
             } else if self.view.scroll_line > 0 {
                 self.view.scroll_line -= 1;
-                let dw = display_col_for_char_col(
-                    &self.doc.buf.line_text(self.view.scroll_line),
-                    self.doc.buf.line_char_len(self.view.scroll_line),
-                );
+                let dw = self
+                    .doc
+                    .buf
+                    .display_col_at(self.view.scroll_line, usize::MAX);
                 let wraps = crate::view::wrapped_rows(dw, text_cols);
                 remaining -= 1;
                 if remaining > 0 && wraps > 1 {
@@ -1216,10 +1197,10 @@ impl Editor {
         // Scroll forward by SCROLL_LINES screen rows
         let mut remaining = SCROLL_LINES;
         while remaining > 0 && self.view.scroll_line < line_count.saturating_sub(1) {
-            let dw = display_col_for_char_col(
-                &self.doc.buf.line_text(self.view.scroll_line),
-                self.doc.buf.line_char_len(self.view.scroll_line),
-            );
+            let dw = self
+                .doc
+                .buf
+                .display_col_at(self.view.scroll_line, usize::MAX);
             let wraps = crate::view::wrapped_rows(dw, text_cols);
             let remaining_in_line = wraps.saturating_sub(self.view.scroll_wrap);
             if remaining < remaining_in_line {
@@ -1253,8 +1234,10 @@ impl Editor {
             // Snap cursor to the first visible position
             // The first visible char col is scroll_wrap * text_cols
             let first_dcol = self.view.scroll_wrap * text_cols;
-            let raw = self.doc.buf.line_text(self.view.scroll_line);
-            let char_col = char_col_for_display_col(&raw, first_dcol);
+            let char_col = self
+                .doc
+                .buf
+                .char_col_from_display(self.view.scroll_line, first_dcol);
             let line_len = self.doc.buf.line_char_len(self.view.scroll_line);
             self.set_cursor(Pos::new(self.view.scroll_line, char_col.min(line_len)));
             return;
@@ -1267,10 +1250,7 @@ impl Editor {
         let mut last_visible_wrap = self.view.scroll_wrap;
 
         while screen_row < text_rows && line_idx < line_count {
-            let dw = display_col_for_char_col(
-                &self.doc.buf.line_text(line_idx),
-                self.doc.buf.line_char_len(line_idx),
-            );
+            let dw = self.doc.buf.display_col_at(line_idx, usize::MAX);
             let total = crate::view::wrapped_rows(dw, text_cols);
             let start_w = if line_idx == self.view.scroll_line {
                 self.view.scroll_wrap
@@ -1293,8 +1273,10 @@ impl Editor {
         {
             // Snap cursor to last visible wrap row
             let target_dcol = last_visible_wrap * text_cols;
-            let raw = self.doc.buf.line_text(last_visible_line);
-            let char_col = char_col_for_display_col(&raw, target_dcol);
+            let char_col = self
+                .doc
+                .buf
+                .char_col_from_display(last_visible_line, target_dcol);
             let line_len = self.doc.buf.line_char_len(last_visible_line);
             self.set_cursor(Pos::new(last_visible_line, char_col.min(line_len)));
         }

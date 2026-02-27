@@ -573,23 +573,6 @@ impl Renderer {
     }
 }
 
-/// Convert a display column back to a char column (inverse of display_col_for_char_col).
-pub(crate) fn char_col_for_display_col(raw_text: &[u8], target_display: usize) -> usize {
-    let mut display = 0;
-    let mut ci = 0;
-    let mut bi = 0;
-    while bi < raw_text.len() {
-        let width = if raw_text[bi] == b'\t' { 2 } else { 1 };
-        if display + width > target_display {
-            break;
-        }
-        display += width;
-        bi += buffer::utf8_char_len(raw_text[bi]);
-        ci += 1;
-    }
-    ci
-}
-
 pub(crate) fn display_col_for_char_col(raw_text: &[u8], char_col: usize) -> usize {
     let mut display = 0;
     let mut ci = 0;
