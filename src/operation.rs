@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::selection::Pos;
@@ -7,11 +8,11 @@ use crate::selection::Pos;
 pub enum Operation {
     Insert {
         pos: usize, // byte offset
-        data: Vec<u8>,
+        data: Arc<[u8]>,
     },
     Delete {
-        pos: usize,    // byte offset
-        data: Vec<u8>, // the deleted bytes (for undo)
+        pos: usize,      // byte offset
+        data: Arc<[u8]>, // the deleted bytes (for undo)
     },
 }
 
@@ -152,7 +153,7 @@ impl UndoStack {
 
         // Word boundary: space after non-space for inserts
         if let Operation::Insert { data, .. } = op
-            && (data == b" " || data == b"\n")
+            && (data.as_ref() == b" " || data.as_ref() == b"\n")
         {
             return true;
         }
@@ -202,14 +203,14 @@ mod tests {
     fn ins(pos: usize, data: &[u8]) -> Operation {
         Operation::Insert {
             pos,
-            data: data.to_vec(),
+            data: Arc::from(data),
         }
     }
 
     fn del(pos: usize, data: &[u8]) -> Operation {
         Operation::Delete {
             pos,
-            data: data.to_vec(),
+            data: Arc::from(data),
         }
     }
 

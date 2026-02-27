@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::operation::{Operation, OperationGroup, UndoStack};
 use crate::selection::Pos;
@@ -227,13 +228,13 @@ fn serialize_group(buf: &mut Vec<u8>, group: &OperationGroup) {
                 write_u8(buf, 0);
                 write_u64(buf, *pos as u64);
                 write_u32(buf, data.len() as u32);
-                buf.extend_from_slice(data);
+                buf.extend_from_slice(data.as_ref());
             }
             Operation::Delete { pos, data } => {
                 write_u8(buf, 1);
                 write_u64(buf, *pos as u64);
                 write_u32(buf, data.len() as u32);
-                buf.extend_from_slice(data);
+                buf.extend_from_slice(data.as_ref());
             }
         }
     }
@@ -256,7 +257,7 @@ fn deserialize_group(data: &[u8], pos: &mut usize) -> Option<OperationGroup> {
         if *pos + data_len > data.len() {
             return None;
         }
-        let op_data = data[*pos..*pos + data_len].to_vec();
+        let op_data: Arc<[u8]> = Arc::from(&data[*pos..*pos + data_len]);
         *pos += data_len;
         let op = match kind {
             0 => Operation::Insert {
@@ -792,7 +793,7 @@ mod tests {
         stack.record(
             Operation::Insert {
                 pos: 0,
-                data: b"hello".to_vec(),
+                data: Arc::from(b"hello".as_ref()),
             },
             Pos::new(0, 0),
             Pos::new(0, 5),
@@ -801,7 +802,7 @@ mod tests {
         stack.record(
             Operation::Delete {
                 pos: 3,
-                data: b"lo".to_vec(),
+                data: Arc::from(b"lo".as_ref()),
             },
             Pos::new(0, 5),
             Pos::new(0, 3),
@@ -975,7 +976,7 @@ mod tests {
         stack_b.record(
             Operation::Insert {
                 pos: 0,
-                data: b"x".to_vec(),
+                data: Arc::from(b"x".as_ref()),
             },
             Pos::new(0, 0),
             Pos::new(0, 1),
@@ -1011,7 +1012,7 @@ mod tests {
         stack2.record(
             Operation::Insert {
                 pos: 0,
-                data: b"x".to_vec(),
+                data: Arc::from(b"x".as_ref()),
             },
             Pos::new(0, 0),
             Pos::new(0, 1),

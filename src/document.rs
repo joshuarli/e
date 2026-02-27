@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::buffer::GapBuffer;
 use crate::operation::{Operation, UndoStack};
 use crate::selection::Pos;
@@ -36,7 +38,7 @@ impl Document {
         self.undo_stack.record(
             Operation::Insert {
                 pos: offset,
-                data: bytes.to_vec(),
+                data: Arc::from(bytes),
             },
             cursor_before,
             cursor_after,
@@ -58,7 +60,7 @@ impl Document {
         self.undo_stack.record(
             Operation::Delete {
                 pos: start_offset,
-                data: deleted,
+                data: Arc::from(deleted.as_slice()),
             },
             end_pos,
             start_pos,
@@ -91,7 +93,7 @@ impl Document {
                 }
                 Operation::Delete { pos, data } => {
                     // To undo a delete, insert
-                    self.buf.insert(*pos, data);
+                    self.buf.insert(*pos, data.as_ref());
                 }
             }
         }
@@ -105,7 +107,7 @@ impl Document {
         for op in &ops {
             match op {
                 Operation::Insert { pos, data } => {
-                    self.buf.insert(*pos, data);
+                    self.buf.insert(*pos, data.as_ref());
                 }
                 Operation::Delete { pos, data } => {
                     self.buf.delete(*pos, data.len());
@@ -129,7 +131,7 @@ impl Document {
         self.undo_stack.record(
             Operation::Insert {
                 pos: offset,
-                data: bytes.to_vec(),
+                data: Arc::from(bytes),
             },
             cursor_before,
             cursor_after,
@@ -151,7 +153,7 @@ impl Document {
         self.undo_stack.record(
             Operation::Delete {
                 pos: offset,
-                data: deleted,
+                data: Arc::from(deleted.as_slice()),
             },
             cursor_before,
             cursor_after,
