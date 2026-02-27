@@ -5,43 +5,9 @@ use std::path::{Path, PathBuf};
 use crate::operation::{Operation, OperationGroup, UndoStack};
 use crate::selection::Pos;
 
-/// Read a file, converting CRLF → LF. Returns the bytes.
+/// Read a file. Returns the raw bytes as-is.
 pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
-    let mut data = fs::read(path)?;
-    // Normalize CRLF in-place. For pure-LF files (the common case) this is a
-    // single fast scan with no allocation or copy.
-    if data.contains(&b'\r') {
-        let orig_len = data.len();
-        let mut w = 0usize;
-        let mut r = 0usize;
-        while r < orig_len {
-            if data[r] == b'\r' && r + 1 < orig_len && data[r + 1] == b'\n' {
-                r += 1; // skip \r, the \n will be copied on the next iteration
-            }
-            data[w] = data[r];
-            w += 1;
-            r += 1;
-        }
-        data.truncate(w);
-    }
-    Ok(data)
-}
-
-/// Strip CRLF → LF. Used in tests; production uses the in-place path in `read_file`.
-#[cfg(test)]
-pub fn normalize_line_endings(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut i = 0;
-    while i < data.len() {
-        if data[i] == b'\r' && i + 1 < data.len() && data[i + 1] == b'\n' {
-            out.push(b'\n');
-            i += 2;
-        } else {
-            out.push(data[i]);
-            i += 1;
-        }
-    }
-    out
+    fs::read(path)
 }
 
 /// Write `data` to `path`. Strips trailing whitespace from each line and ensures
@@ -696,42 +662,6 @@ fn collect_cursor_entries<'a>(data: &'a [u8], exclude_path: &[u8]) -> Vec<&'a [u
 mod tests {
     use super::*;
 
-    // -- normalize_line_endings ---------------------------------------------
-
-    #[test]
-    fn test_normalize_no_crlf() {
-        assert_eq!(normalize_line_endings(b"hello\nworld"), b"hello\nworld");
-    }
-
-    #[test]
-    fn test_normalize_crlf() {
-        assert_eq!(
-            normalize_line_endings(b"hello\r\nworld\r\n"),
-            b"hello\nworld\n"
-        );
-    }
-
-    #[test]
-    fn test_normalize_mixed() {
-        assert_eq!(normalize_line_endings(b"a\r\nb\nc\r\n"), b"a\nb\nc\n");
-    }
-
-    #[test]
-    fn test_normalize_lone_cr() {
-        // \r not followed by \n should be kept
-        assert_eq!(normalize_line_endings(b"a\rb"), b"a\rb");
-    }
-
-    #[test]
-    fn test_normalize_empty() {
-        assert_eq!(normalize_line_endings(b""), b"");
-    }
-
-    #[test]
-    fn test_normalize_only_crlf() {
-        assert_eq!(normalize_line_endings(b"\r\n"), b"\n");
-    }
-
     // -- strip_trailing_whitespace_and_ensure_newline -----------------------
 
     #[test]
@@ -839,20 +769,6 @@ mod tests {
         write_file(&path, b"hello   \nworld  ").unwrap();
         let read_back = fs::read(&path).unwrap();
         assert_eq!(read_back, b"hello\nworld\n");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_write_normalizes_crlf_on_read() {
-        let dir = std::env::temp_dir().join("e_test_crlf");
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("test.txt");
-
-        // Write raw CRLF
-        fs::write(&path, b"hello\r\nworld\r\n").unwrap();
-        let data = read_file(&path).unwrap();
-        assert_eq!(data, b"hello\nworld\n");
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -69,7 +69,7 @@ pub struct GapBuffer {
 - Insertions fill the gap. Deletions widen the gap.
 - `move_gap_to(pos)` shifts the gap to a logical byte offset using `copy_within`.
 - `ensure_gap(needed)` grows the buffer if gap is too small, shifting the tail right.
-- `from_vec(data: Vec<u8>) -> Self` — production fast path: takes ownership of the data Vec, pre-allocates `line_starts` with heuristic `content_len / 20 + 16` (avoids ~20 growth doublings for large files), extends the Vec in-place for the gap. Zero extra allocation for pure-LF files on load.
+- `from_vec(data: Vec<u8>) -> Self` — production fast path: takes ownership of the data Vec, pre-allocates `line_starts` with heuristic `content_len / 20 + 16` (avoids ~20 growth doublings for large files), extends the Vec in-place for the gap. Only one allocation total for the whole file-open path.
 - Line index: always valid, updated incrementally on every insert/delete. `from_vec()` scans bytes once at load. Each edit uses `binary_search` to locate the affected region and shifts/inserts/removes only the changed entries. A trailing `\n` does NOT create a new line entry.
 - `take_dirty_line() -> usize` — returns and resets `min_dirty_line` (used by renderer for incremental highlight invalidation).
 - All line-query methods (`line_count`, `line_start`, `line_end`, `line_text`, `pos_to_offset`, `offset_to_pos`, `line_char_len`) take `&self` — no mutable borrow needed.
@@ -838,8 +838,7 @@ Languages include (with comment syntax): Rust (//), C (//), C++ (//), Go (//), J
 
 ### Read/Write
 
-- `read_file(path) -> io::Result<Vec<u8>>` — reads file into an owned `Vec<u8>`, then normalizes CRLF to LF **in-place** (no allocation for pure-LF files; only allocates a read pointer for CRLF files). Returns the owned Vec for zero-copy handoff to `GapBuffer::from_vec`.
-- `normalize_line_endings(data) -> Vec<u8>` — allocating version (test-only, `#[cfg(test)]`): replaces `\r\n` with `\n`. Lone `\r` preserved.
+- `read_file(path) -> io::Result<Vec<u8>>` — reads file bytes as-is (`fs::read`). No CRLF normalization. Returns the owned Vec for zero-copy handoff to `GapBuffer::from_vec`.
 - `write_file(path, data) -> io::Result<()>` — strips trailing whitespace from each line (via `split('\n')` and `trim_end()`), ensures trailing newline, writes.
 - `clean_for_write(data) -> Vec<u8>` — same cleaning as write_file but returns bytes (for sudo save).
 - `is_likely_binary(data) -> bool` — checks first 8KB (min of data length and 8192) for null bytes.

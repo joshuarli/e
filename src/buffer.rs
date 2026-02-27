@@ -34,9 +34,7 @@ impl GapBuffer {
     ///
     /// This is the fast path for opening files: the caller passes the `Vec`
     /// returned by `read_file` and we extend it in-place for the gap, so the
-    /// whole startup path goes from 3 allocations + 2 copies down to 1.
-    ///
-    /// `data` must already be CRLF-normalized (as `read_file` guarantees).
+    /// whole startup path needs only one allocation (the fs::read itself).
     /// Pre-allocates `line_starts` with a heuristic to avoid reallocs.
     pub fn from_vec(mut data: Vec<u8>) -> Self {
         let gap = MIN_GAP;

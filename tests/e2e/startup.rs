@@ -167,20 +167,6 @@ fn multiline_file_shows_all_lines() {
 }
 
 #[test]
-fn crlf_normalized_to_lf() {
-    let dir = TempDir::new();
-    let path = create_file(dir.path(), "crlf.txt", "line one\r\nline two\r\n");
-    let mut e = TestEditor::new(&[path.to_str().unwrap()]);
-    // Should display as two separate lines, not with visible \r
-    let r0 = e.row(0);
-    let r1 = e.row(1);
-    assert!(r0.contains("line one"), "row 0: {r0}");
-    assert!(r1.contains("line two"), "row 1: {r1}");
-    // The \r should not be visible
-    assert!(!r0.contains('\r'), "should not show \\r");
-}
-
-#[test]
 fn cursor_starts_at_top() {
     let dir = TempDir::new();
     let path = create_file(dir.path(), "test.txt", "hello\nworld\n");
