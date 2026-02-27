@@ -398,7 +398,7 @@ ctrl+q = quit
 4. **Auto-close**: if char has auto-close pair and next char is a boundary (space, tab, close-char, or end-of-line) → insert both chars, place cursor between them.
 5. Otherwise: insert character normally.
 
-Auto-close pairs: `(→)`, `[→]`, `{→}`, `"→"`, `'→'`.
+Auto-close pairs: `(→)`, `[→]`, `{→}`, `"→"`, `'→'`. Exception: single-quote autoclose is suppressed for plain Text (no detected language) and Markdown, where apostrophes and contractions make it too noisy.
 
 ### Insert tab (`insert_tab`)
 

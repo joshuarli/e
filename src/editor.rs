@@ -58,13 +58,15 @@ const CTRL_SHIFT_RIGHT: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'C'];
 const CTRL_BACKSPACE_CSI_U: &[u8] = &[0x1b, b'[', b'1', b'2', b'7', b';', b'5', b'u'];
 const FOCUS_IN: &[u8] = &[0x1b, b'[', b'I'];
 
-fn auto_close_char(c: char) -> Option<char> {
+fn auto_close_char(c: char, lang_name: Option<&str>) -> Option<char> {
     match c {
         '(' => Some(')'),
         '[' => Some(']'),
         '{' => Some('}'),
         '"' => Some('"'),
-        '\'' => Some('\''),
+        // Skip single-quote autoclose for plain Text and Markdown: apostrophes
+        // and contractions make it far too noisy there.
+        '\'' if lang_name.is_some_and(|n| n != "Markdown") => Some('\''),
         _ => None,
     }
 }
@@ -1722,9 +1724,15 @@ impl Editor {
     // -- editing ------------------------------------------------------------
 
     fn insert_char(&mut self, c: char) {
+        let lang_name = self
+            .doc
+            .filename
+            .as_deref()
+            .and_then(language::detect)
+            .map(|l| l.name);
         if !self.sel.is_empty() {
             // Wrap selection with matching pairs
-            if let Some(close) = auto_close_char(c) {
+            if let Some(close) = auto_close_char(c, lang_name) {
                 let (start, end) = self.sel.ordered();
                 let text = self.doc.text_in_range(start, end);
                 let mut wrapped = vec![c as u8];
@@ -1761,7 +1769,7 @@ impl Editor {
         let s = c.encode_utf8(&mut char_buf);
 
         // Auto-close pairs: insert open+close on a stack buffer, no heap alloc.
-        if let Some(close) = auto_close_char(c) {
+        if let Some(close) = auto_close_char(c, lang_name) {
             let line = self.cursor().line;
             let col = self.cursor().col;
             let ls = self.doc.buf.line_start(line);
@@ -1906,7 +1914,13 @@ impl Editor {
             let prev = self.doc.buf.byte_at(ls + c.col - 1);
             if ls + c.col < le {
                 let next = self.doc.buf.byte_at(ls + c.col);
-                if auto_close_char(prev as char) == Some(next as char) {
+                let lang_name = self
+                    .doc
+                    .filename
+                    .as_deref()
+                    .and_then(language::detect)
+                    .map(|l| l.name);
+                if auto_close_char(prev as char, lang_name) == Some(next as char) {
                     let start = Pos::new(c.line, c.col - 1);
                     let end = Pos::new(c.line, c.col + 1);
                     self.doc.delete_range(start, end);
@@ -5350,7 +5364,17 @@ mod tests {
 
     #[test]
     fn test_autoclose_single_quote() {
+        // Plain Text (no filename): single quote must NOT be auto-closed.
         let mut e = ed("");
+        e.insert_char('\'');
+        assert_eq!(e.test_text(), "'");
+        assert_eq!(e.cursor(), Pos::new(0, 1));
+    }
+
+    #[test]
+    fn test_autoclose_single_quote_in_rust() {
+        // Named .rs file: single quote SHOULD be auto-closed.
+        let mut e = ed_named("", "/tmp/test.rs");
         e.insert_char('\'');
         assert_eq!(e.test_text(), "''");
         assert_eq!(e.cursor(), Pos::new(0, 1));
@@ -5526,7 +5550,20 @@ mod tests {
 
     #[test]
     fn test_autoclose_wraps_selection_single_quote() {
+        // Plain Text: single quote replaces selection rather than wrapping it.
         let mut e = ed("text");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(0, 4),
+        };
+        e.insert_char('\'');
+        assert_eq!(e.test_text(), "'");
+    }
+
+    #[test]
+    fn test_autoclose_wraps_selection_single_quote_in_rust() {
+        // Named .rs file: single quote SHOULD wrap the selection.
+        let mut e = ed_named("text", "/tmp/test.rs");
         e.sel = Selection {
             anchor: Pos::new(0, 0),
             cursor: Pos::new(0, 4),
