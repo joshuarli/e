@@ -1369,24 +1369,42 @@ impl Editor {
     }
 
     fn indent_snap_left(&mut self, line: usize, col: usize) -> usize {
-        let line_text = self.doc.buf.line_text(line);
-        let leading_ws: usize = line_text
-            .iter()
-            .take_while(|&&b| b == b' ' || b == b'\t')
-            .count();
-        if col <= leading_ws && col >= 1 && line_text[..col].iter().all(|&b| b == b' ') {
-            return (col - 1) / 2 * 2;
+        let ls = self.doc.buf.line_start(line);
+        let le = self.doc.buf.line_end(line);
+        // Count leading whitespace (spaces/tabs are ASCII: byte offset == char offset).
+        let mut leading_ws = 0;
+        while ls + leading_ws < le {
+            match self.doc.buf.byte_at(ls + leading_ws) {
+                b' ' | b'\t' => leading_ws += 1,
+                _ => break,
+            }
+        }
+        if col <= leading_ws && col >= 1 {
+            // Snap only if the bytes before the cursor are all spaces (not tabs).
+            if (0..col).all(|i| self.doc.buf.byte_at(ls + i) == b' ') {
+                return (col - 1) / 2 * 2;
+            }
         }
         col - 1
     }
 
     fn indent_snap_right(&mut self, line: usize, col: usize) -> usize {
-        let line_text = self.doc.buf.line_text(line);
-        let leading_ws: usize = line_text
-            .iter()
-            .take_while(|&&b| b == b' ' || b == b'\t')
-            .count();
-        if col < leading_ws && line_text[..leading_ws].iter().all(|&b| b == b' ') {
+        let ls = self.doc.buf.line_start(line);
+        let le = self.doc.buf.line_end(line);
+        // Count leading whitespace and check all-spaces in one pass.
+        let mut leading_ws = 0;
+        let mut all_spaces = true;
+        while ls + leading_ws < le {
+            match self.doc.buf.byte_at(ls + leading_ws) {
+                b' ' => leading_ws += 1,
+                b'\t' => {
+                    all_spaces = false;
+                    leading_ws += 1;
+                }
+                _ => break,
+            }
+        }
+        if col < leading_ws && all_spaces {
             let target = (col / 2 + 1) * 2;
             return target.min(leading_ws);
         }
@@ -1588,33 +1606,43 @@ impl Editor {
             self.delete_selection();
         }
 
-        // Skip over closing char if it's already the next character
+        // Skip over closing char if it's already the next character.
+        // close chars are ASCII so byte_at(line_start + col) == the char at col.
         if is_close_char(c) {
-            let line_text = self.doc.buf.line_text(self.cursor().line);
+            let line = self.cursor().line;
             let col = self.cursor().col;
-            if col < line_text.len() && line_text[col] == c as u8 {
-                self.set_cursor(Pos::new(self.cursor().line, col + 1));
+            let ls = self.doc.buf.line_start(line);
+            let le = self.doc.buf.line_end(line);
+            if ls + col < le && self.doc.buf.byte_at(ls + col) == c as u8 {
+                self.set_cursor(Pos::new(line, col + 1));
                 return;
             }
         }
 
-        let mut bytes = [0u8; 4];
-        let s = c.encode_utf8(&mut bytes);
+        let mut char_buf = [0u8; 4];
+        let s = c.encode_utf8(&mut char_buf);
 
-        // Auto-close pairs
+        // Auto-close pairs: insert open+close on a stack buffer, no heap alloc.
         if let Some(close) = auto_close_char(c) {
-            let line_text = self.doc.buf.line_text(self.cursor().line);
+            let line = self.cursor().line;
             let col = self.cursor().col;
-            let next_is_boundary = col >= line_text.len()
-                || line_text[col] == b' '
-                || line_text[col] == b'\t'
-                || is_close_char(line_text[col] as char);
+            let ls = self.doc.buf.line_start(line);
+            let le = self.doc.buf.line_end(line);
+            // Treat end-of-line (\n or past end) as a boundary.
+            let next = if ls + col < le {
+                self.doc.buf.byte_at(ls + col)
+            } else {
+                b'\n'
+            };
+            let next_is_boundary =
+                next == b' ' || next == b'\t' || next == b'\n' || is_close_char(next as char);
             if next_is_boundary {
-                let mut pair = s.as_bytes().to_vec();
-                pair.push(close as u8);
-                let pos = self
-                    .doc
-                    .insert(self.cursor().line, self.cursor().col, &pair);
+                // Stack-allocate the pair: open char (1–4 bytes) + close char (1 byte).
+                let cb = s.as_bytes();
+                let mut pair = [0u8; 5];
+                pair[..cb.len()].copy_from_slice(cb);
+                pair[cb.len()] = close as u8;
+                let pos = self.doc.insert(line, col, &pair[..cb.len() + 1]);
                 // Place cursor between the pair
                 self.set_cursor(Pos::new(pos.line, pos.col - 1));
                 return;
@@ -1713,15 +1741,20 @@ impl Editor {
         }
         let c = self.cursor();
         if c.col > 0 {
-            let line_text = self.doc.buf.line_text(c.line);
-            let leading_ws: usize = line_text
-                .iter()
-                .take_while(|&&b| b == b' ' || b == b'\t')
-                .count();
+            let ls = self.doc.buf.line_start(c.line);
+            let le = self.doc.buf.line_end(c.line);
+            // Count leading whitespace (ASCII: byte offset == char offset here).
+            let mut leading_ws = 0;
+            while ls + leading_ws < le {
+                match self.doc.buf.byte_at(ls + leading_ws) {
+                    b' ' | b'\t' => leading_ws += 1,
+                    _ => break,
+                }
+            }
 
+            // Smart 2-space dedent
             if c.col <= leading_ws && c.col >= 2 {
-                let before = &line_text[..c.col];
-                let all_spaces = before.iter().all(|&b| b == b' ');
+                let all_spaces = (0..c.col).all(|i| self.doc.buf.byte_at(ls + i) == b' ');
                 if all_spaces && c.col.is_multiple_of(2) {
                     let end = Pos::new(c.line, c.col);
                     let start = Pos::new(c.line, c.col - 2);
@@ -1731,10 +1764,10 @@ impl Editor {
                 }
             }
 
-            // Delete matching auto-close pair if cursor is between them
-            let prev = line_text[c.col - 1];
-            if c.col < line_text.len() {
-                let next = line_text[c.col];
+            // Delete matching auto-close pair if cursor is between them.
+            let prev = self.doc.buf.byte_at(ls + c.col - 1);
+            if ls + c.col < le {
+                let next = self.doc.buf.byte_at(ls + c.col);
                 if auto_close_char(prev as char) == Some(next as char) {
                     let start = Pos::new(c.line, c.col - 1);
                     let end = Pos::new(c.line, c.col + 1);
