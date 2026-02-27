@@ -156,8 +156,21 @@ impl Renderer {
             let raw_text: &[u8] = &self.line_buf;
             let (expanded, tab_pipes) = expand_tabs(raw_text);
             let line_str = String::from_utf8_lossy(&expanded);
-            let chars: Vec<char> = line_str.chars().collect();
-            let total_wraps = crate::view::wrapped_rows(chars.len(), text_cols);
+
+            // One-pass scan: count chars, find trailing-whitespace boundary.
+            // Replaces the former `chars: Vec<char>` allocation.
+            let mut char_count = 0usize;
+            let mut trailing_ws_start = 0usize;
+            let mut any_nonws = false;
+            for (i, c) in line_str.chars().enumerate() {
+                char_count += 1;
+                if !c.is_ascii_whitespace() {
+                    trailing_ws_start = i + 1;
+                    any_nonws = true;
+                }
+            }
+            let has_trailing = any_nonws && trailing_ws_start < char_count;
+            let total_wraps = crate::view::wrapped_rows(char_count, text_cols);
             let start_wrap = if line_idx == view.scroll_line {
                 first_wrap
             } else {
@@ -204,7 +217,7 @@ impl Renderer {
                 let e = if line_idx == sel_end.line {
                     display_col_for_char_col(raw_text, sel_end.col)
                 } else {
-                    chars.len()
+                    char_count
                 };
                 (s, e)
             } else {
@@ -226,7 +239,7 @@ impl Renderer {
                             let fe = if line_idx == e.line {
                                 display_col_for_char_col(raw_text, e.col)
                             } else {
-                                chars.len()
+                                char_count
                             };
                             let is_current = find_current == Some(idx);
                             (fs, fe, is_current)
@@ -261,20 +274,15 @@ impl Renderer {
                 }
 
                 let chunk_start = wrap * text_cols;
-                let chunk_end = ((wrap + 1) * text_cols).min(chars.len());
-
-                // Trailing whitespace starts after the last non-space character
-                let trailing_ws_start = chars
-                    .iter()
-                    .rposition(|c| !c.is_ascii_whitespace())
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                // Only highlight if the line has non-whitespace content
-                let has_trailing = trailing_ws_start < chars.len()
-                    && chars.iter().any(|c| !c.is_ascii_whitespace());
+                let chunk_end = ((wrap + 1) * text_cols).min(char_count);
 
                 if need_per_char || has_find || has_bracket {
-                    for (i, ch) in chars.iter().enumerate().take(chunk_end).skip(chunk_start) {
+                    for (i, ch) in line_str
+                        .chars()
+                        .enumerate()
+                        .take(chunk_end)
+                        .skip(chunk_start)
+                    {
                         let in_sel = need_per_char && i >= line_sel_start && i < line_sel_end;
                         let find_hit = find_ranges.iter().find(|(fs, fe, _)| i >= *fs && i < *fe);
                         let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
@@ -319,7 +327,12 @@ impl Renderer {
                 } else {
                     // Fast path: syntax highlighting only
                     let mut current_hl = HlType::Normal;
-                    for (i, ch) in chars.iter().enumerate().take(chunk_end).skip(chunk_start) {
+                    for (i, ch) in line_str
+                        .chars()
+                        .enumerate()
+                        .take(chunk_end)
+                        .skip(chunk_start)
+                    {
                         let is_tab_pipe = i < tab_pipes.len() && tab_pipes[i];
                         let is_trailing_ws = has_trailing && i >= trailing_ws_start;
                         if is_trailing_ws {
