@@ -289,14 +289,17 @@ impl GapBuffer {
     /// Convert a (line, col) to a byte offset. Col is clamped to line length.
     pub fn pos_to_offset(&self, line: usize, col: usize) -> usize {
         let start = self.line_start(line);
-        let text = self.line_text(line);
-        // Walk UTF-8 chars to find byte offset of the col-th character
+        let end = self.line_end(line);
+        // Exclude trailing newline from the clamping boundary (mirrors line_text behaviour).
+        let limit = if end > start && self.byte_at(end - 1) == b'\n' {
+            end - 1
+        } else {
+            end
+        };
         let mut byte_off = 0;
         let mut char_idx = 0;
-        while char_idx < col && byte_off < text.len() {
-            let b = text[byte_off];
-            let char_len = utf8_char_len(b);
-            byte_off += char_len;
+        while char_idx < col && start + byte_off < limit {
+            byte_off += utf8_char_len(self.byte_at(start + byte_off));
             char_idx += 1;
         }
         start + byte_off
@@ -329,8 +332,14 @@ impl GapBuffer {
 
     /// Return the character count of a line (0-indexed), not counting the newline.
     pub fn line_char_len(&self, line: usize) -> usize {
-        let text = self.line_text(line);
-        char_count(&text)
+        let start = self.line_start(line);
+        let end = self.line_end(line);
+        let end = if end > start && self.byte_at(end - 1) == b'\n' {
+            end - 1
+        } else {
+            end
+        };
+        self.char_count_in_range(start, end)
     }
 }
 
