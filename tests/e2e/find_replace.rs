@@ -48,22 +48,22 @@ fn find_browse_mode_navigates_matches() {
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
     e.ctrl('f');
     e.type_text("apple");
-    e.enter(); // Enter browse mode
-    // Command line should show "match 1 of 3"
-    let cl1 = e.command_line();
-    assert!(
-        cl1.contains("1") && cl1.contains("3"),
-        "should show match 1 of 3, got: {cl1}"
+    e.enter(); // Enter browse mode — lands on first "apple" (row 0)
+    e.escape(); // Exit browse mode; cursor visible at first match
+    let row1 = e.cursor().0;
+
+    // Open find again, navigate to next match
+    e.ctrl('f');
+    e.type_text("apple");
+    e.enter();
+    e.key(Key::Down); // advance to second "apple" (row 2)
+    e.escape(); // exit; cursor visible at second match
+    let row2 = e.cursor().0;
+
+    assert_ne!(
+        row1, row2,
+        "Down in browse mode should advance to next match"
     );
-    // Down should go to next match
-    e.key(Key::Down);
-    let cl2 = e.command_line();
-    assert!(
-        cl2.contains("2") && cl2.contains("3"),
-        "should show match 2 of 3 after Down, got: {cl2}"
-    );
-    // Escape exits browse mode
-    e.escape();
     assert!(e.cursor_visible(), "Esc should exit browse mode");
 }
 

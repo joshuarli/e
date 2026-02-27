@@ -122,8 +122,12 @@ pub struct Editor {
     dragging: bool,
     // Find state
     find_pattern: String,
+    /// Viewport-only matches, repopulated each draw() call.
     find_matches: Vec<(Pos, Pos)>,
-    find_index: usize,
+    /// Compiled regex cached across keystrokes.
+    find_re: Option<regex_lite::Regex>,
+    /// The currently-navigated match (start, end).
+    find_current: Option<(Pos, Pos)>,
     /// True while browsing find results with up/down arrows.
     find_active: bool,
     /// Temp file path for sudo save flow.
@@ -191,7 +195,8 @@ impl Editor {
             dragging: false,
             find_pattern: String::new(),
             find_matches: Vec::new(),
-            find_index: 0,
+            find_re: None,
+            find_current: None,
             find_active: false,
             sudo_save_tmp: None,
             piped_stdin,
@@ -359,13 +364,17 @@ impl Editor {
         };
         let cmd_ref = cmd_line.as_deref();
 
+        // Refresh viewport matches on every draw (cheap — only scans visible lines).
+        if self.find_re.is_some() {
+            self.refresh_viewport_matches();
+        }
         let find_matches = if !self.find_matches.is_empty() {
             Some(self.find_matches.as_slice())
         } else {
             None
         };
         let find_current = if self.find_active {
-            Some(self.find_index)
+            self.find_current
         } else {
             None
         };
@@ -591,6 +600,8 @@ impl Editor {
                     self.cmd_buf
                         .open(CommandBufferMode::Find, "find: ", &prefill);
                     self.find_matches.clear();
+                    self.find_re = None;
+                    self.find_current = None;
                 }
                 EditorAction::CtrlBackspace => self.ctrl_backspace(),
                 EditorAction::ToggleComment => self.toggle_comment(),
@@ -623,6 +634,8 @@ impl Editor {
             Key::Esc => {
                 self.clear_selection();
                 self.find_matches.clear();
+                self.find_re = None;
+                self.find_current = None;
             }
 
             // Editing
@@ -700,6 +713,10 @@ impl Editor {
                 self.cmd_buf.close();
                 if mode == CommandBufferMode::Find {
                     self.find_matches.clear();
+                    self.find_re = None;
+                    self.find_current = None;
+                    self.status_msg.clear();
+                    self.status_time = None;
                 }
                 if mode == CommandBufferMode::SudoSave {
                     if let Some(tmp) = self.sudo_save_tmp.take() {
@@ -711,9 +728,7 @@ impl Editor {
             CommandBufferResult::Changed(val) => {
                 if mode == CommandBufferMode::Find {
                     self.update_find_highlights(&val);
-                    if !self.find_matches.is_empty() {
-                        self.find_index = 0;
-                        let (_start, end) = self.find_matches[0];
+                    if let Some((_, end)) = self.find_current {
                         self.set_cursor(end);
                         self.center_view_on_line(end.line);
                         self.set_find_status();
@@ -851,8 +866,10 @@ impl Editor {
 
     fn update_find_highlights(&mut self, pattern: &str) {
         self.find_matches.clear();
+        self.find_current = None;
         self.find_pattern = pattern.to_string();
         if pattern.is_empty() {
+            self.find_re = None;
             return;
         }
 
@@ -868,83 +885,191 @@ impl Editor {
 
         let re = match re {
             Ok(r) => r,
-            Err(_) => return, // invalid regex — just don't highlight
+            Err(_) => {
+                self.find_re = None;
+                return; // invalid regex — just don't highlight
+            }
         };
 
+        self.find_re = Some(re);
+        // Scan only the viewport lines for visible highlights.
+        self.refresh_viewport_matches();
+        // Pick the first match at or after the cursor; wrap if needed.
+        let cursor = self.cursor();
+        let in_viewport = self
+            .find_matches
+            .iter()
+            .find(|(s, _)| *s >= cursor)
+            .or_else(|| self.find_matches.first())
+            .copied();
+        if let Some(m) = in_viewport {
+            self.find_current = Some(m);
+        } else {
+            // No match in viewport — search forward through the rest of the file.
+            let re = self.find_re.take().unwrap();
+            self.find_current = Self::search_forward(&self.doc.buf, &re, cursor);
+            self.find_re = Some(re);
+        }
+    }
+
+    /// Scan only the current viewport lines and populate `find_matches`.
+    /// Uses take/restore on `find_re` to satisfy the borrow checker.
+    fn refresh_viewport_matches(&mut self) {
+        self.find_matches.clear();
+        let re = match self.find_re.take() {
+            Some(r) => r,
+            None => return,
+        };
         let line_count = self.doc.buf.line_count();
-        for line_idx in 0..line_count {
-            let line = self.doc.buf.line_text(line_idx);
-            let Ok(text) = std::str::from_utf8(&line) else {
+        // A few extra lines beyond text_rows to account for wrapped lines.
+        let viewport_end = (self.view.scroll_line + self.view.text_rows() + 4).min(line_count);
+        let mut line_buf = Vec::new();
+        for line_idx in self.view.scroll_line..viewport_end {
+            self.doc.buf.line_text_into(line_idx, &mut line_buf);
+            let Ok(text) = std::str::from_utf8(&line_buf) else {
                 continue;
             };
             for m in re.find_iter(text) {
-                let start_col = buffer::char_count(&line[..m.start()]);
-                let end_col = buffer::char_count(&line[..m.end()]);
+                let start_col = buffer::char_count(&line_buf[..m.start()]);
+                let end_col = buffer::char_count(&line_buf[..m.end()]);
                 self.find_matches
                     .push((Pos::new(line_idx, start_col), Pos::new(line_idx, end_col)));
             }
         }
+        self.find_re = Some(re);
+    }
+
+    /// Search forward from `from` (inclusive), wrapping around the file.
+    /// Returns the first match found.
+    fn search_forward(
+        buf: &buffer::GapBuffer,
+        re: &regex_lite::Regex,
+        from: Pos,
+    ) -> Option<(Pos, Pos)> {
+        let line_count = buf.line_count();
+        let mut line_buf = Vec::new();
+        for pass in 0..2 {
+            let (start, end) = if pass == 0 {
+                (from.line, line_count)
+            } else {
+                (0, from.line)
+            };
+            for line_idx in start..end {
+                buf.line_text_into(line_idx, &mut line_buf);
+                let Ok(text) = std::str::from_utf8(&line_buf) else {
+                    continue;
+                };
+                for m in re.find_iter(text) {
+                    let start_col = buffer::char_count(&line_buf[..m.start()]);
+                    // On the starting line (pass 0) skip matches before from.col.
+                    if pass == 0 && line_idx == from.line && start_col < from.col {
+                        continue;
+                    }
+                    let end_col = buffer::char_count(&line_buf[..m.end()]);
+                    return Some((Pos::new(line_idx, start_col), Pos::new(line_idx, end_col)));
+                }
+            }
+        }
+        None
+    }
+
+    /// Search backward from `from` (exclusive), wrapping around the file.
+    /// Returns the last match before the cursor position.
+    fn search_backward(
+        buf: &buffer::GapBuffer,
+        re: &regex_lite::Regex,
+        from: Pos,
+    ) -> Option<(Pos, Pos)> {
+        let line_count = buf.line_count();
+        let mut line_buf = Vec::new();
+        for pass in 0..2 {
+            // pass 0: from.line down to 0, filtering out matches at/after from on from.line
+            // pass 1: all lines in reverse (wrap-around), no position filter
+            let range: Box<dyn Iterator<Item = usize>> = if pass == 0 {
+                Box::new((0..=from.line).rev())
+            } else {
+                Box::new((0..line_count).rev())
+            };
+            for line_idx in range {
+                buf.line_text_into(line_idx, &mut line_buf);
+                let Ok(text) = std::str::from_utf8(&line_buf) else {
+                    continue;
+                };
+                // Find the last eligible match on this line.
+                let mut best: Option<(Pos, Pos)> = None;
+                for m in re.find_iter(text) {
+                    let start_col = buffer::char_count(&line_buf[..m.start()]);
+                    let end_col = buffer::char_count(&line_buf[..m.end()]);
+                    // On the from-line in pass 0: skip matches whose end >= from.col.
+                    if pass == 0 && line_idx == from.line && end_col >= from.col {
+                        continue;
+                    }
+                    best = Some((Pos::new(line_idx, start_col), Pos::new(line_idx, end_col)));
+                }
+                if best.is_some() {
+                    return best;
+                }
+            }
+        }
+        None
     }
 
     fn find_next_from_submit(&mut self, pattern: &str) {
         self.update_find_highlights(pattern);
-        if self.find_matches.is_empty() {
+        if self.find_current.is_none() {
             self.set_status("Find: no matches".to_string());
             return;
         }
         self.find_active = true;
-        // Live search already jumped to match 0; just activate browse mode there.
-        self.find_index = 0;
-        let (_start, end) = self.find_matches[0];
-        self.set_cursor(end);
-        self.center_view_on_line(end.line);
-        self.set_find_status();
+        if let Some((_, end)) = self.find_current {
+            self.set_cursor(end);
+            self.center_view_on_line(end.line);
+            self.set_find_status();
+        }
     }
 
     fn find_next(&mut self) {
-        if self.find_matches.is_empty() {
+        if self.find_re.is_none() {
             return;
         }
         let cursor = self.cursor();
-        let idx = self
-            .find_matches
-            .iter()
-            .position(|(start, _)| *start >= cursor);
-        let idx = idx.unwrap_or(0); // wrap around
-        self.find_index = idx;
-        let (_start, end) = self.find_matches[idx];
-        self.set_cursor(end);
-        self.center_view_on_line(end.line);
-        self.set_find_status();
+        let re = self.find_re.take().unwrap();
+        let result = Self::search_forward(&self.doc.buf, &re, cursor);
+        self.find_re = Some(re);
+        if let Some(m) = result {
+            self.find_current = Some(m);
+            let (_, end) = m;
+            self.set_cursor(end);
+            self.center_view_on_line(end.line);
+            self.set_find_status();
+        }
     }
 
     fn find_prev(&mut self) {
-        if self.find_matches.is_empty() {
+        if self.find_re.is_none() {
             return;
         }
         let cursor = self.cursor();
-        let idx = self.find_matches.iter().rposition(|(_, end)| *end < cursor);
-        let idx = idx.unwrap_or(self.find_matches.len() - 1); // wrap around
-        self.find_index = idx;
-        let (_start, end) = self.find_matches[idx];
-        self.set_cursor(end);
-        self.center_view_on_line(end.line);
-        self.set_find_status();
+        let re = self.find_re.take().unwrap();
+        let result = Self::search_backward(&self.doc.buf, &re, cursor);
+        self.find_re = Some(re);
+        if let Some(m) = result {
+            self.find_current = Some(m);
+            let (_, end) = m;
+            self.set_cursor(end);
+            self.center_view_on_line(end.line);
+            self.set_find_status();
+        }
     }
 
     fn set_find_status(&mut self) {
-        self.status_msg = format!(
-            "match {} of {}",
-            self.find_index + 1,
-            self.find_matches.len()
-        );
+        self.status_msg = format!("Find: {}", self.find_pattern);
         self.status_time = None; // don't auto-expire while browsing
     }
 
     fn exit_find_mode(&mut self) {
         // Select the current match so copy/backspace/etc. act on it
-        if !self.find_matches.is_empty() && self.find_index < self.find_matches.len() {
-            let (start, end) = self.find_matches[self.find_index];
+        if let Some((start, end)) = self.find_current {
             self.sel = Selection {
                 anchor: start,
                 cursor: end,
@@ -952,6 +1077,8 @@ impl Editor {
         }
         self.find_active = false;
         self.find_matches.clear();
+        self.find_re = None;
+        self.find_current = None;
         self.status_msg.clear();
         self.status_time = None;
     }
@@ -2169,6 +2296,8 @@ impl Editor {
                 }
                 self.desired_col = None;
                 self.find_matches.clear();
+                self.find_re = None;
+                self.find_current = None;
                 self.renderer.force_full_redraw();
                 self.set_status("Reloaded".to_string());
             }
@@ -2369,7 +2498,8 @@ mod tests {
             dragging: false,
             find_pattern: String::new(),
             find_matches: Vec::new(),
-            find_index: 0,
+            find_re: None,
+            find_current: None,
             find_active: false,
             sudo_save_tmp: None,
             piped_stdin: false,
@@ -2832,7 +2962,8 @@ mod tests {
         // Position cursor past all matches
         e.set_cursor(Pos::new(0, 8));
         e.find_next();
-        assert_eq!(e.find_index, 0); // wrapped around
+        // wrapped around to first match (col 0..2)
+        assert_eq!(e.find_current, Some((Pos::new(0, 0), Pos::new(0, 2))));
     }
 
     #[test]
@@ -2842,7 +2973,8 @@ mod tests {
         e.find_active = true;
         e.set_cursor(Pos::new(0, 0));
         e.find_prev();
-        assert_eq!(e.find_index, 1); // wrapped around to last match
+        // wrapped around to last match (col 6..8)
+        assert_eq!(e.find_current, Some((Pos::new(0, 6), Pos::new(0, 8))));
     }
 
     #[test]
@@ -2851,7 +2983,7 @@ mod tests {
         e.find_next_from_submit("hello");
         assert!(e.find_active);
         assert_eq!(e.find_matches.len(), 2);
-        assert_eq!(e.find_index, 0);
+        assert!(e.find_current.is_some());
     }
 
     #[test]
@@ -3251,10 +3383,14 @@ mod tests {
         let mut e = ed("aa bb aa");
         e.find_next_from_submit("aa");
         assert!(e.find_active);
+        let first = e.find_current;
         e.handle_key(Key::Down);
-        assert_eq!(e.find_index, 1);
+        let second = e.find_current;
+        // moved forward to a different match
+        assert_ne!(first, second);
         e.handle_key(Key::Up);
-        assert_eq!(e.find_index, 0);
+        // moved back to (or past) the original
+        assert_ne!(e.find_current, second);
     }
 
     #[test]

@@ -211,8 +211,9 @@ pub struct Editor {
     click_count: u8,                   // 1=single, 2=double, 3=triple
     dragging: bool,
     find_pattern: String,
-    find_matches: Vec<(Pos, Pos)>,
-    find_index: usize,
+    find_matches: Vec<(Pos, Pos)>,     // Viewport-only matches, refreshed each draw()
+    find_re: Option<regex_lite::Regex>, // Compiled regex cached across keystrokes
+    find_current: Option<(Pos, Pos)>,  // Currently-navigated match
     find_active: bool,                 // Browsing find results
     sudo_save_tmp: Option<String>,
     piped_stdin: bool,
@@ -517,25 +518,32 @@ For multi-line pastes (>= 2 lines after splitting on `\n`):
 
 ## 10. Find & Replace
 
-### Find (`update_find_highlights`)
+### Find (`update_find_highlights`) — lazy / viewport-only
+
+**Design**: never scans the whole file on a keystroke. O(viewport) highlighting; O(lines_to_first_match) initial jump.
 
 1. Smart-case: case-insensitive if pattern is all lowercase.
-2. Uses `regex_lite::RegexBuilder` with `.case_insensitive(true)` for smart-case, or plain `regex_lite::Regex::new`.
-3. Invalid regex → silently ignored (no highlights).
-4. Searches line-by-line via `buf.line_text(line_idx)` — no O(file_size) allocation. Max allocation per keystroke = O(longest_line). Multi-line patterns won't match across line boundaries. Stores matches as `Vec<(Pos, Pos)>`.
+2. Compiles regex once and caches it in `find_re: Option<regex_lite::Regex>`. Invalid regex → silently ignored.
+3. Calls `refresh_viewport_matches()` to populate `find_matches` with only the visible lines' matches (scroll_line..scroll_line + text_rows + 4).
+4. Sets `find_current` to the first viewport match at/after cursor; if none, calls `search_forward` to scan forward through the file until the first match is found.
+5. Multi-line patterns won't match across line boundaries. Stores matches as `Vec<(Pos, Pos)>`.
+
+`refresh_viewport_matches()`: uses `take/restore` on `find_re` to satisfy the borrow checker while calling `buf.line_text_into`. Repopulates `find_matches` from scratch; called every `draw()` so highlights stay correct after scrolling.
 
 ### Find workflow
 
-1. **Ctrl+F**: opens find command buffer. Prefills from selection if <= 100 chars.
-2. **As user types** (`Changed` result): `update_find_highlights` runs. If matches found, jumps to match 0, centers viewport. Status shows "match X of Y".
-3. **Enter**: activates find browse mode (`find_active = true`). Up/Down navigate matches (wrapping). Status updates with current match index.
-4. **Esc while browsing**: exits find mode, clears selection. Clears find highlights and status.
-5. **Any other key while browsing**: exits find mode, processes key normally.
+1. **Ctrl+F**: opens find command buffer. Prefills from selection if <= 100 chars. Clears `find_re`, `find_current`.
+2. **As user types** (`Changed` result): `update_find_highlights` runs. If `find_current` found, jumps to it and centers viewport. Status shows "Find: {pattern}".
+3. **Enter**: activates find browse mode (`find_active = true`). Up/Down navigate matches (wrapping). Status stays "Find: {pattern}".
+4. **Esc while browsing**: exits find mode (`exit_find_mode`), selects current match. Clears `find_re`, `find_current`, `find_matches`, status.
+5. **Cancel (Esc while command buffer open)**: clears `find_re`, `find_current`, `find_matches`, status.
+6. **Any other key while browsing**: exits find mode, processes key normally.
 
 ### Find next/prev
 
-- `find_next`: searches forward from cursor for first match where match start >= cursor. Wraps to index 0.
-- `find_prev`: searches backward from cursor for last match where match end < cursor. Wraps to last match.
+- `find_next`: takes `find_re`, calls `search_forward(buf, re, cursor)` which scans forward from cursor (wrapping around end of file). Updates `find_current`. O(lines_to_next_match).
+- `find_prev`: takes `find_re`, calls `search_backward(buf, re, cursor)` which scans backward from cursor (wrapping around start of file), returning the last match on each line. O(lines_to_prev_match).
+- Both use `take/restore` on `find_re` to avoid borrow conflicts.
 
 ### Replace all (`replace_all`)
 

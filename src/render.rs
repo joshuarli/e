@@ -113,7 +113,7 @@ impl Renderer {
         command_line: Option<&str>,
         selection: Option<Selection>,
         find_matches: Option<&[(Pos, Pos)]>,
-        find_current: Option<usize>,
+        find_current: Option<(Pos, Pos)>,
         completions: &[String],
         cmd_cursor: Option<usize>,
         find_active: bool,
@@ -253,10 +253,9 @@ impl Renderer {
             // Build find ranges into the reusable scratch buffer (no alloc after warm-up).
             self.find_scratch.clear();
             if let Some(matches) = find_matches {
-                for (idx, (s, e)) in matches
+                for (s, e) in matches
                     .iter()
-                    .enumerate()
-                    .filter(|(_, (s, e))| line_idx >= s.line && line_idx <= e.line)
+                    .filter(|(s, e)| line_idx >= s.line && line_idx <= e.line)
                 {
                     let fs = if line_idx == s.line {
                         display_col_for_char_col(raw_text, s.col)
@@ -268,7 +267,8 @@ impl Renderer {
                     } else {
                         char_count
                     };
-                    self.find_scratch.push((fs, fe, find_current == Some(idx)));
+                    let is_current = find_current.is_some_and(|(cs, ce)| cs == *s && ce == *e);
+                    self.find_scratch.push((fs, fe, is_current));
                 }
             }
 
@@ -930,7 +930,7 @@ mod tests {
             None,
             None,
             Some(&matches),
-            Some(0),
+            Some((Pos::new(0, 0), Pos::new(0, 5))), // current = first match
             &[],
             None,
             false,
@@ -939,7 +939,7 @@ mod tests {
         .unwrap();
 
         let s = String::from_utf8_lossy(&output);
-        // Current match (idx 0) → green bg \x1b[42;30m, other → yellow bg \x1b[43;30m
+        // Current match → green bg \x1b[42;30m, other → yellow bg \x1b[43;30m
         assert!(s.contains("\x1b[42;30m"));
         assert!(s.contains("\x1b[43;30m"));
     }
