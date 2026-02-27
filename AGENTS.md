@@ -523,7 +523,7 @@ For multi-line pastes (>= 2 lines after splitting on `\n`):
 1. **Ctrl+F**: opens find command buffer. Prefills from selection if <= 100 chars.
 2. **As user types** (`Changed` result): `update_find_highlights` runs. If matches found, jumps to match 0, centers viewport. Status shows "match X of Y".
 3. **Enter**: activates find browse mode (`find_active = true`). Up/Down navigate matches (wrapping). Status updates with current match index.
-4. **Esc while browsing**: exits find mode, selects the current match (anchor at match start, cursor at match end). Clears find highlights and status.
+4. **Esc while browsing**: exits find mode, clears selection. Clears find highlights and status.
 5. **Any other key while browsing**: exits find mode, processes key normally.
 
 ### Find next/prev
@@ -820,7 +820,7 @@ pub struct Language {
 }
 ```
 
-~45 languages in a static table. Each entry has an array of file extension patterns.
+50 languages in a static table. Each entry has an array of file extension patterns.
 
 Detection (`detect(filename) -> Option<Language>`):
 - Extracts basename from path.
