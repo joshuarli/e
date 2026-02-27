@@ -17,6 +17,22 @@ pub fn gutter_width(line_count: usize) -> usize {
     digits + 1
 }
 
+/// Format a `usize` into a stack-allocated byte buffer, returning a `&str` slice.
+/// `buf` must be at least 20 bytes (enough for any 64-bit decimal).
+fn write_line_num(mut n: usize, buf: &mut [u8; 20]) -> &str {
+    if n == 0 {
+        buf[19] = b'0';
+        return std::str::from_utf8(&buf[19..]).unwrap();
+    }
+    let mut pos = 20usize;
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    std::str::from_utf8(&buf[pos..]).unwrap()
+}
+
 /// Expand tabs in `text`, writing expanded bytes into `out` and per-column
 /// pipe-markers into `tab_pipes`. Clears both buffers first.
 /// Returns `true` when the line contains tabs (caller can skip tab-pipe checks otherwise).
@@ -290,7 +306,8 @@ impl Renderer {
                 if ruler_on {
                     let is_cursor_line = line_idx == cursor_line;
                     if wrap == 0 {
-                        let num_str = format!("{}", line_idx + 1);
+                        let mut num_buf = [0u8; 20];
+                        let num_str = write_line_num(line_idx + 1, &mut num_buf);
                         let pad = gw - 1;
                         if is_cursor_line {
                             write!(w, "\x1b[0;47;30m{:>width$}\x1b[0m ", num_str, width = pad)?;

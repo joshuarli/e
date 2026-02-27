@@ -138,6 +138,8 @@ pub struct Editor {
     file_mtime: Option<std::time::SystemTime>,
     /// Waiting for y/n response to reload prompt.
     reload_pending: bool,
+    /// Cached status-left string; reused each frame to avoid per-draw allocation.
+    status_left_cache: String,
 }
 
 enum EditorEvent {
@@ -202,6 +204,7 @@ impl Editor {
             piped_stdin,
             file_mtime,
             reload_pending: false,
+            status_left_cache: String::new(),
         }
     }
 
@@ -346,8 +349,6 @@ impl Editor {
 
         let lang = self.doc.filename.as_deref().and_then(language::detect);
         let lang_name = lang.map(|l| l.name).unwrap_or("Text");
-        let status_left = self.status_left(lang_name);
-        let status_right = Self::status_right();
         let sel = if self.sel.is_empty() {
             None
         } else {
@@ -355,21 +356,18 @@ impl Editor {
         };
         let ruler_on = self.ruler_on;
 
+        // All &mut self calls must happen before we borrow status_left_cache.
         let bracket_pair = self.find_matching_bracket();
-
-        let cmd_line = if self.cmd_buf.active {
-            Some(self.cmd_buf.display_line())
-        } else if !self.status_msg.is_empty() {
-            Some(self.status_msg.clone())
-        } else {
-            None
-        };
-        let cmd_ref = cmd_line.as_deref();
 
         // Refresh viewport matches on every draw (cheap — only scans visible lines).
         if self.find_re.is_some() {
             self.refresh_viewport_matches();
         }
+
+        let rules = lang.and_then(|l| highlight::rules_for_language(l.name));
+        self.renderer.set_syntax(rules);
+
+        // Pure reads — no more &mut self after this point.
         let find_matches = if !self.find_matches.is_empty() {
             Some(self.find_matches.as_slice())
         } else {
@@ -389,8 +387,22 @@ impl Editor {
             None
         };
 
-        let rules = lang.and_then(|l| highlight::rules_for_language(l.name));
-        self.renderer.set_syntax(rules);
+        // Avoid cloning status_msg: borrow it directly as &str.
+        let display_line_owned;
+        let cmd_ref: Option<&str> = if self.cmd_buf.active {
+            display_line_owned = self.cmd_buf.display_line();
+            Some(&display_line_owned)
+        } else if !self.status_msg.is_empty() {
+            Some(&self.status_msg)
+        } else {
+            None
+        };
+
+        // Rebuild status_left into the reused cache buffer (no allocation after warm-up).
+        let name = self.doc.filename.as_deref().unwrap_or("[scratch]");
+        Self::build_status_left(name, self.doc.dirty, lang_name, &mut self.status_left_cache);
+        let status_left = &self.status_left_cache;
+        let status_right = Self::status_right();
 
         self.renderer.render(
             out,
@@ -399,7 +411,7 @@ impl Editor {
             cursor_line,
             display_col,
             ruler_on,
-            &status_left,
+            status_left,
             status_right,
             cmd_ref,
             sel,
@@ -412,13 +424,24 @@ impl Editor {
         )
     }
 
+    fn build_status_left(name: &str, dirty: bool, lang_name: &str, out: &mut String) {
+        out.clear();
+        out.push(' ');
+        out.push_str(name);
+        if dirty {
+            out.push('*');
+        }
+        out.push_str(" [");
+        out.push_str(lang_name);
+        out.push(']');
+    }
+
+    #[cfg(test)]
     fn status_left(&self, lang_name: &str) -> String {
         let name = self.doc.filename.as_deref().unwrap_or("[scratch]");
-        if self.doc.dirty {
-            format!(" {}* [{}]", name, lang_name)
-        } else {
-            format!(" {} [{}]", name, lang_name)
-        }
+        let mut s = String::new();
+        Self::build_status_left(name, self.doc.dirty, lang_name, &mut s);
+        s
     }
 
     fn status_right() -> &'static str {
@@ -2502,6 +2525,7 @@ mod tests {
             piped_stdin: false,
             file_mtime: None,
             reload_pending: false,
+            status_left_cache: String::new(),
         }
     }
 
