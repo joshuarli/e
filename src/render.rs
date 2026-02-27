@@ -117,20 +117,21 @@ impl Renderer {
         write!(w, "\x1b[?2026h")?;
         write!(w, "\x1b[?25l")?;
 
-        // Compute per-line highlight states (cached across frames, updated incrementally)
+        // Compute per-line highlight states (lazy: only as far as the viewport needs)
         let buf_version = buf.version();
+        // One line past the last visible line — that's all we need to cover.
+        let visible_end = (view.scroll_line + text_rows + 1).min(line_count);
         if let Some(rules) = self.syntax {
             if buf_version != self.hl_cache_version {
                 let dirty = buf.take_dirty_line();
                 self.hl_dirty_from = self.hl_dirty_from.min(dirty);
-                // If cache is empty (first render or after set_syntax), rebuild all
                 if self.hl_cache.is_empty() {
                     self.hl_dirty_from = 0;
                 }
-                self.refresh_hl_cache(line_count, buf, rules);
                 self.hl_cache_version = buf_version;
-                self.hl_dirty_from = usize::MAX;
             }
+            self.refresh_hl_cache(visible_end, line_count, buf, rules);
+            self.hl_dirty_from = usize::MAX;
         } else {
             self.hl_cache.clear();
         }
@@ -434,25 +435,50 @@ impl Renderer {
         Ok(())
     }
 
+    /// Ensure `hl_cache` covers lines `0..end`, computing only what's needed.
+    ///
+    /// - Truncates stale entries if the file shrank.
+    /// - Extends to `end` lazily when the user scrolls past current coverage.
+    ///   To extend, we reprocess the last already-computed line to recover its
+    ///   output state (= input state for the next line), then continue forward.
+    /// - When `hl_dirty_from` is set (edit occurred), recomputes forward from
+    ///   that line, stopping early once the cached output state matches.
     fn refresh_hl_cache(
         &mut self,
+        end: usize,
         line_count: usize,
         buf: &mut GapBuffer,
         rules: &'static SyntaxRules,
     ) {
-        let old_len = self.hl_cache.len();
+        let end = end.min(line_count);
 
-        // Resize: truncate deleted lines, extend new lines with placeholder Normal
-        self.hl_cache.truncate(line_count);
-        self.hl_cache.resize(line_count, HlState::Normal);
+        // Truncate if the file shrank; clamp dirty marker too.
+        if self.hl_cache.len() > line_count {
+            self.hl_cache.truncate(line_count);
+            self.hl_dirty_from = self.hl_dirty_from.min(line_count);
+        }
 
-        let start = self.hl_dirty_from.min(line_count);
-        if start >= line_count {
+        let computed = self.hl_cache.len(); // valid entries before this call
+
+        // Grow to cover the viewport.
+        if computed < end {
+            self.hl_cache.resize(end, HlState::Normal);
+        }
+
+        // Where to start recomputing:
+        //   dirty_from  — explicit invalidation from an edit
+        //   computed-1  — reprocess last known line to recover its output state
+        //                 so we can extend the cache forward from there
+        let start = if computed < end {
+            self.hl_dirty_from.min(computed.saturating_sub(1))
+        } else {
+            self.hl_dirty_from.min(end)
+        };
+
+        if start >= end {
             return;
         }
 
-        // hl_cache[start] is the INPUT state for line `start`.
-        // It's valid when start > 0 and lines before start are unchanged.
         let mut state = if start == 0 {
             HlState::Normal
         } else {
@@ -460,15 +486,15 @@ impl Renderer {
         };
 
         let mut line = start;
-        while line < line_count {
+        while line < end {
             let raw = buf.line_text(line);
             let (_, next_state) = highlight::highlight_line(&raw, state, rules);
             state = next_state;
 
-            if line + 1 < line_count {
-                // Early exit: if the next slot already held real (non-extended) data
-                // and the state matches, the rest of the cache is still valid.
-                if line + 1 < old_len && self.hl_cache[line + 1] == next_state {
+            if line + 1 < end {
+                // Early exit: within the previously-computed range, stop as soon
+                // as the output state already matches what's cached.
+                if line + 1 < computed && self.hl_cache[line + 1] == next_state {
                     break;
                 }
                 self.hl_cache[line + 1] = next_state;
