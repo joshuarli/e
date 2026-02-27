@@ -470,12 +470,12 @@ Inserts `\n` + current line text after the current line end. Moves cursor to sam
 - Pre-reads all line data and byte offsets to avoid O(n^2) cache rebuilds.
 - Uses `begin_undo_group`/`end_undo_group` for atomic undo.
 - Iterates lines in reverse, inserts tab or 2 spaces at start of non-blank lines using `insert_at_byte`.
-- Adjusts cursor column by indent amount if cursor is on an indented line.
+- Tracks `cursor_added` and `anchor_added` independently. Updates `sel.cursor.col` and `sel.anchor.col` directly — does **not** call `set_cursor` — so the selection is preserved after the operation (allows repeated Tab to indent further).
 
 **Dedent** (`dedent`):
 - Same line range logic and pre-read strategy.
 - Iterates lines in reverse, removes leading `\t` (1 byte) or 2 spaces using `delete_at_byte`.
-- Adjusts cursor column by amount removed.
+- Tracks `cursor_removed` and `anchor_removed` independently. Updates `sel.cursor.col` and `sel.anchor.col` with `saturating_sub` directly — does **not** call `set_cursor` — so the selection is preserved after the operation (allows repeated Shift+Tab to dedent further).
 
 ### Comment toggle (`comment_impl`)
 
@@ -508,14 +508,18 @@ Command detection: `which <name>` with null stdout/stderr.
 
 Test-only: `internal_only()` forces Internal backend.
 
-### Smart paste (`reindent_paste`)
+### Smart paste (`paste_text` + `reindent_paste`)
 
-For multi-line pastes (>= 2 lines after splitting on `\n`):
-1. Find minimum indentation of non-empty lines in lines 2+ of the pasted text.
-2. Get current line's leading whitespace count.
-3. Target indent = cursor column if first paste line has content, else current line's indent.
-4. If target_indent == min_indent, return unchanged.
-5. Otherwise, re-indent: strip min_indent spaces from each non-empty line in lines 2+, prepend target_indent spaces.
+Indentation is treated as a **copy-time property**: the indentation in the pasted text is assumed to be correct as-is.
+
+**`paste_text`** (before calling `reindent_paste`):
+- If the paste text is multi-line and the current line is blank (all spaces/tabs), delete that whitespace and move cursor to col 0. This clears auto-indent so the paste lands at the true start of the line.
+
+**`reindent_paste`** — for the remaining case where cursor is mid-content on a non-blank line:
+1. If fewer than 2 lines, return unchanged (single-line paste).
+2. Compute `target_base`: cursor column if lines[0] has content, else current line's leading-whitespace count.
+3. If `target_base == 0`, return unchanged (paste already at correct indentation).
+4. Otherwise re-indent each non-empty continuation line: new indent = `target_base + original_indent_of_that_line`. This preserves the paste's internal structure relative to the cursor position.
 
 ## 10. Find & Replace
 

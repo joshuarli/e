@@ -1838,7 +1838,9 @@ impl Editor {
 
         let cursor_pos = self.cursor();
         self.doc.begin_undo_group();
-        let cursor_line = self.cursor().line;
+        let anchor_line = self.sel.anchor.line;
+        let cursor_line = self.sel.cursor.line;
+        let mut anchor_added = 0usize;
         let mut cursor_added = 0usize;
         for (idx, (text, line_offset)) in lines.iter().enumerate().rev() {
             let is_blank = text.iter().all(|&b| b == b' ' || b == b'\t');
@@ -1851,11 +1853,15 @@ impl Editor {
             if line_idx == cursor_line {
                 cursor_added = indent_char_len;
             }
+            if line_idx == anchor_line {
+                anchor_added = indent_char_len;
+            }
         }
         self.doc.end_undo_group();
 
-        let c = self.cursor();
-        self.set_cursor(Pos::new(c.line, c.col + cursor_added));
+        // Preserve the selection so the user can indent multiple times.
+        self.sel.cursor.col += cursor_added;
+        self.sel.anchor.col += anchor_added;
     }
 
     fn insert_newline(&mut self) {
@@ -2132,7 +2138,9 @@ impl Editor {
 
         let cursor_pos = self.cursor();
         self.doc.begin_undo_group();
-        let cursor_line = self.cursor().line;
+        let anchor_line = self.sel.anchor.line;
+        let cursor_line = self.sel.cursor.line;
+        let mut anchor_removed = 0usize;
         let mut cursor_removed = 0usize;
         for (idx, (text, line_offset)) in lines.iter().enumerate().rev() {
             let removed = if text.starts_with(b"\t") {
@@ -2150,12 +2158,15 @@ impl Editor {
             if line_idx == cursor_line {
                 cursor_removed = removed;
             }
+            if line_idx == anchor_line {
+                anchor_removed = removed;
+            }
         }
         self.doc.end_undo_group();
 
-        let c = self.cursor();
-        let new_col = c.col.saturating_sub(cursor_removed);
-        self.set_cursor(Pos::new(c.line, new_col));
+        // Preserve the selection so the user can dedent multiple times.
+        self.sel.cursor.col = self.sel.cursor.col.saturating_sub(cursor_removed);
+        self.sel.anchor.col = self.sel.anchor.col.saturating_sub(anchor_removed);
     }
 
     // -- clipboard ----------------------------------------------------------
@@ -2190,6 +2201,22 @@ impl Editor {
         if !self.sel.is_empty() {
             self.delete_selection();
         }
+        // Multi-line paste: clear any auto-indent on a blank line and anchor at
+        // col 0 so the pasted text's own indentation is used as-is.
+        // Indentation is a copy-time property, not a paste-time one.
+        if text.contains('\n') {
+            let c = self.cursor();
+            let line_text = self.doc.buf.line_text(c.line);
+            let is_blank = line_text.iter().all(|&b| b == b' ' || b == b'\t');
+            if is_blank {
+                let char_len = crate::buffer::char_count(&line_text);
+                if char_len > 0 {
+                    self.doc
+                        .delete_range(Pos::new(c.line, 0), Pos::new(c.line, char_len));
+                }
+                self.sel = Selection::caret(Pos::new(c.line, 0));
+            }
+        }
         let text = self.reindent_paste(text);
         self.doc.seal_undo();
         let pos = self
@@ -2200,20 +2227,17 @@ impl Editor {
     }
 
     /// Re-indent pasted multi-line text to match the current cursor's indent level.
+    ///
+    /// Continuation lines (lines[1..]) keep their indentation relative to lines[0]:
+    /// each line's new indent = cursor_col + original_indent_of_that_line.
+    ///
+    /// For multi-line paste on a blank line, `paste_text` already resets the cursor
+    /// to col 0, so this function is effectively a no-op in that case.
     fn reindent_paste(&mut self, text: &str) -> String {
         let lines: Vec<&str> = text.split('\n').collect();
         if lines.len() < 2 {
             return text.to_string();
         }
-
-        // Find the minimum indentation of non-empty lines in the pasted text
-        // (skip the first line since it will be placed at cursor position)
-        let min_indent = lines[1..]
-            .iter()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| l.len() - l.trim_start().len())
-            .min()
-            .unwrap_or(0);
 
         // Get the indent of the current line at cursor
         let cur_line_text = self.doc.buf.line_text(self.cursor().line);
@@ -2222,15 +2246,16 @@ impl Editor {
             .take_while(|&&b| b == b' ' || b == b'\t')
             .count();
 
-        // If the first line of paste has content, use cursor column as the base
-        // indent for subsequent lines; otherwise use the current line's indent
-        let target_indent = if !lines[0].trim().is_empty() {
+        // If lines[0] has content it lands at cursor.col; otherwise the pasted
+        // block starts on a new line relative to the current line's indent.
+        let target_base = if !lines[0].trim().is_empty() {
             self.cursor().col
         } else {
             cur_indent
         };
 
-        if target_indent == min_indent {
+        // Pasting at column 0: the text already carries correct indentation.
+        if target_base == 0 {
             return text.to_string();
         }
 
@@ -2241,11 +2266,13 @@ impl Editor {
             if line.trim().is_empty() {
                 result.push_str(line);
             } else {
-                let stripped = &line[min_indent.min(line.len())..];
-                for _ in 0..target_indent {
+                // Preserve relative indentation: new position = cursor col + original indent.
+                let ik = line.len() - line.trim_start().len();
+                let new_indent = target_base + ik;
+                for _ in 0..new_indent {
                     result.push(' ');
                 }
-                result.push_str(stripped);
+                result.push_str(line.trim_start());
             }
         }
         result
@@ -2831,6 +2858,20 @@ mod tests {
         };
         e.insert_tab();
         assert_eq!(e.test_text(), "  aaa\n  bbb\n  ccc");
+    }
+
+    #[test]
+    fn test_tab_indents_selection_preserves_selection() {
+        // Selection should remain after Tab so the user can indent multiple times.
+        let mut e = ed_named("aaa\nbbb\nccc", "test.rs");
+        e.sel = Selection {
+            anchor: Pos::new(0, 0),
+            cursor: Pos::new(2, 3),
+        };
+        e.insert_tab();
+        assert!(!e.sel.is_empty());
+        assert_eq!(e.sel.anchor, Pos::new(0, 2));
+        assert_eq!(e.sel.cursor, Pos::new(2, 5));
     }
 
     #[test]
@@ -4826,6 +4867,21 @@ mod tests {
         assert!(text.starts_with("aaa\nbbb\n"));
     }
 
+    #[test]
+    fn test_dedent_selection_preserves_selection() {
+        // Selection should remain after Shift+Tab so the user can dedent multiple times.
+        let mut e = ed_named("  aaa\n  bbb\n  ccc", "test.rs");
+        e.sel = Selection {
+            anchor: Pos::new(0, 2),
+            cursor: Pos::new(2, 5),
+        };
+        e.dedent();
+        assert_eq!(e.test_text(), "aaa\nbbb\nccc");
+        assert!(!e.sel.is_empty());
+        assert_eq!(e.sel.anchor, Pos::new(0, 0));
+        assert_eq!(e.sel.cursor, Pos::new(2, 3));
+    }
+
     // ========================================================================
     // Coverage gap: cut with no selection (line 1695)
     // ========================================================================
@@ -5663,13 +5719,15 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_smart_paste_reindents_to_cursor() {
+    fn test_smart_paste_on_blank_line_clears_autoindent() {
+        // Blank line with auto-indent is cleared before paste; pasted text's own
+        // indentation is used as-is (indentation is a copy-time property).
         let mut e = ed("    fn main() {\n        ");
         e.set_cursor(Pos::new(1, 8));
         e.paste_text("if true {\n    println!(\"hi\");\n}");
         assert_eq!(
             e.test_text(),
-            "    fn main() {\n        if true {\n            println!(\"hi\");\n        }"
+            "    fn main() {\nif true {\n    println!(\"hi\");\n}"
         );
     }
 
@@ -5682,30 +5740,21 @@ mod tests {
     }
 
     #[test]
-    fn test_smart_paste_already_correct_indent() {
+    fn test_smart_paste_blank_line_cleared() {
+        // Blank line with 2-space auto-indent is cleared; paste goes at col 0.
         let mut e = ed("  ");
         e.set_cursor(Pos::new(0, 2));
         e.paste_text("a\n  b\n  c");
-        assert_eq!(e.test_text(), "  a\n  b\n  c");
-    }
-
-    #[test]
-    fn test_smart_paste_dedents_when_needed() {
-        // Paste text indented at 8 spaces into a position at col 2
-        let mut e = ed("  ");
-        e.set_cursor(Pos::new(0, 2));
-        e.paste_text("x\n        y\n        z");
-        assert_eq!(e.test_text(), "  x\n  y\n  z");
+        assert_eq!(e.test_text(), "a\n  b\n  c");
     }
 
     #[test]
     fn test_smart_paste_preserves_relative_indent() {
+        // Blank line cleared; pasted text's internal structure is preserved.
         let mut e = ed("    ");
         e.set_cursor(Pos::new(0, 4));
         e.paste_text("if true {\n  nested\n}");
-        // min_indent of lines 1+ is 0 (the "}"), target is col 4
-        // so all continuation lines get +4
-        assert_eq!(e.test_text(), "    if true {\n      nested\n    }");
+        assert_eq!(e.test_text(), "if true {\n  nested\n}");
     }
 
     #[test]
@@ -5713,8 +5762,8 @@ mod tests {
         let mut e = ed("    ");
         e.set_cursor(Pos::new(0, 4));
         e.paste_text("a\n\nb");
-        // Empty line should be preserved as-is
-        assert_eq!(e.test_text(), "    a\n\n    b");
+        // Blank line cleared; empty lines in paste preserved as-is.
+        assert_eq!(e.test_text(), "a\n\nb");
     }
 
     #[test]
@@ -5733,8 +5782,9 @@ mod tests {
             cursor: Pos::new(0, 13),
         };
         e.paste_text("new\n    thing");
-        // selection deleted first, then pasted at col 4
-        assert_eq!(e.test_text(), "    new\n    thing\n    more old");
+        // After deleting "old stuff" the line becomes blank ("    "), which is
+        // cleared; paste goes at col 0 with its own indentation.
+        assert_eq!(e.test_text(), "new\n    thing\n    more old");
     }
 
     #[test]
@@ -5756,20 +5806,47 @@ mod tests {
 
     #[test]
     fn test_smart_paste_all_empty_continuation_lines() {
-        // When all continuation lines are empty, min_indent is 0, should not crash
+        // Blank line cleared; trailing empty lines in paste preserved as-is.
         let mut e = ed("    ");
         e.set_cursor(Pos::new(0, 4));
         e.paste_text("a\n\n\n");
-        assert_eq!(e.test_text(), "    a\n\n\n");
+        assert_eq!(e.test_text(), "a\n\n\n");
     }
 
     #[test]
     fn test_smart_paste_tabs_in_pasted_text() {
-        // Tabs in pasted text — min_indent is calculated by byte length
+        // Blank line cleared; paste with tab indentation used as-is.
         let mut e = ed("  ");
         e.set_cursor(Pos::new(0, 2));
         e.paste_text("a\n\tb");
-        // \t is 1 char of indent, target is 2, so re-indented
-        assert_eq!(e.test_text(), "  a\n  b");
+        assert_eq!(e.test_text(), "a\n\tb");
+    }
+
+    #[test]
+    fn test_smart_paste_yaml_structure_preserved() {
+        // YAML block pasted on a blank line: auto-indent cleared, structure intact.
+        let mut e = ed("  ");
+        e.set_cursor(Pos::new(0, 2));
+        e.paste_text("root:\n  child:\n    grandchild: value");
+        assert_eq!(e.test_text(), "root:\n  child:\n    grandchild: value");
+    }
+
+    #[test]
+    fn test_smart_paste_yaml_at_col_zero_unchanged() {
+        // Pasting on an empty line: structure preserved as-is.
+        let mut e = ed("");
+        e.paste_text("root:\n  child:\n    grandchild: value");
+        assert_eq!(e.test_text(), "root:\n  child:\n    grandchild: value");
+    }
+
+    #[test]
+    fn test_smart_paste_non_blank_line_uses_cursor_col() {
+        // Pasting on a non-blank line (mid-content): continuation lines are
+        // shifted to cursor.col + their original indent.
+        let mut e = ed("    prefix");
+        e.set_cursor(Pos::new(0, 10));
+        e.paste_text("key:\n  val");
+        // cursor col = 10, "  val" has ik=2 → new_indent = 10+2 = 12
+        assert_eq!(e.test_text(), "    prefixkey:\n            val");
     }
 }
