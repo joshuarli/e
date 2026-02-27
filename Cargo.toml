@@ -8,6 +8,9 @@ termion = "4"
 regex-lite = "0.1"
 libc = "0.2"
 
+[dev-dependencies]
+vt100 = "0.15"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

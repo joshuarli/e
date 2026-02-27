@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Write, stdout};
+use std::io::{self, Read, Write, stdout};
 use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -8,6 +8,26 @@ use termion::event::{Event, Key, MouseButton, MouseEvent};
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 use termion::screen::IntoAlternateScreen;
+
+/// Wraps a reader to distinguish Ctrl+J (0x0A) from Enter (0x0D).
+///
+/// Termion normalises both bytes to `Key::Char('\n')`, making them
+/// indistinguishable.  By replacing 0x0A with 0x00 *before* termion
+/// parses the stream, the editor receives `Event::Unsupported([0])`
+/// for Ctrl+J while Enter still works normally.
+struct CtrlJReader<R>(R);
+
+impl<R: Read> Read for CtrlJReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.0.read(buf)?;
+        for b in &mut buf[..n] {
+            if *b == 0x0A {
+                *b = 0x00;
+            }
+        }
+        Ok(n)
+    }
+}
 
 use crate::clipboard::Clipboard;
 use crate::command::{CommandAction, CommandRegistry};
@@ -206,10 +226,10 @@ impl Editor {
             let stdin_handle;
             let events: Box<dyn Iterator<Item = Result<Event, io::Error>>> =
                 if let Some(f) = tty_file {
-                    Box::new(f.events())
+                    Box::new(CtrlJReader(f).events())
                 } else {
                     stdin_handle = io::stdin();
-                    Box::new(stdin_handle.events())
+                    Box::new(CtrlJReader(stdin_handle.lock()).events())
                 };
             let mut in_paste = false;
             let mut paste_buf = String::new();
@@ -232,6 +252,8 @@ impl Editor {
                 if in_paste {
                     match &ev {
                         Event::Key(Key::Char(c)) => paste_buf.push(*c),
+                        // Key::Null = 0x0A (NL) remapped by CtrlJReader; restore as newline in paste.
+                        Event::Key(Key::Null) => paste_buf.push('\n'),
                         Event::Key(Key::Backspace) => paste_buf.push('\x7f'),
                         _ => {}
                     }
@@ -625,6 +647,8 @@ impl Editor {
             Key::Char('\t') => self.insert_tab(),
             Key::BackTab => self.dedent(),
             Key::Char('\n') => self.insert_newline(),
+            // Ctrl+J (0x0A) arrives as Key::Null via CtrlJReader (0x0A → 0x00).
+            Key::Null => self.duplicate_line(),
             Key::Char(c) => self.insert_char(c),
             _ => {}
         }
@@ -656,6 +680,12 @@ impl Editor {
     // -- command buffer key handling ----------------------------------------
 
     fn handle_cmd_key(&mut self, key: Key) {
+        // Key::Null = Ctrl+J (0x0A via CtrlJReader); treat as Enter in command buffer.
+        let key = if key == Key::Null {
+            Key::Char('\n')
+        } else {
+            key
+        };
         let mode = self.cmd_buf.mode;
         let result = self.cmd_buf.handle_key(key);
         self.handle_cmd_result(mode, result);
