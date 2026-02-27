@@ -60,6 +60,8 @@ pub struct Renderer {
     hl_scratch: Vec<HlType>,
     /// Scratch buffer reused each line for char-indexed highlight output.
     char_hl_scratch: Vec<HlType>,
+    /// Scratch buffer reused each line for find-range display columns.
+    find_scratch: Vec<(usize, usize, bool)>,
 }
 
 impl Renderer {
@@ -75,6 +77,7 @@ impl Renderer {
             tab_pipes_scratch: Vec::new(),
             hl_scratch: Vec::new(),
             char_hl_scratch: Vec::new(),
+            find_scratch: Vec::new(),
         }
     }
 
@@ -209,12 +212,19 @@ impl Renderer {
                     false
                 };
 
-            // Bracket match display columns for this line
-            let bracket_cols: Vec<usize> = bracket_pair
-                .iter()
-                .filter(|(_, match_pos)| match_pos.line == line_idx)
-                .map(|(_, match_pos)| display_col_for_char_col(raw_text, match_pos.col))
-                .collect();
+            // Bracket match: at most 2 display columns on this line (open + close).
+            // Using two Option<usize> locals avoids a Vec allocation entirely.
+            let mut bracket_col_0 = None::<usize>;
+            let mut bracket_col_1 = None::<usize>;
+            if let Some((open, close)) = bracket_pair {
+                if open.line == line_idx {
+                    bracket_col_0 = Some(display_col_for_char_col(raw_text, open.col));
+                }
+                if close.line == line_idx {
+                    bracket_col_1 = Some(display_col_for_char_col(raw_text, close.col));
+                }
+            }
+            let has_bracket = bracket_col_0.is_some() || bracket_col_1.is_some();
 
             // Per-character highlight info
             let need_per_char = has_sel && line_idx >= sel_start.line && line_idx <= sel_end.line;
@@ -222,7 +232,6 @@ impl Renderer {
                 m.iter()
                     .any(|(s, e)| line_idx >= s.line && line_idx <= e.line)
             });
-            let has_bracket = !bracket_cols.is_empty();
 
             // Pre-compute selection and find ranges once per logical line
             let (line_sel_start, line_sel_end) = if need_per_char {
@@ -241,29 +250,27 @@ impl Renderer {
                 (0, 0)
             };
 
-            let find_ranges: Vec<(usize, usize, bool)> = find_matches
-                .map(|matches| {
-                    matches
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, (s, e))| line_idx >= s.line && line_idx <= e.line)
-                        .map(|(idx, (s, e))| {
-                            let fs = if line_idx == s.line {
-                                display_col_for_char_col(raw_text, s.col)
-                            } else {
-                                0
-                            };
-                            let fe = if line_idx == e.line {
-                                display_col_for_char_col(raw_text, e.col)
-                            } else {
-                                char_count
-                            };
-                            let is_current = find_current == Some(idx);
-                            (fs, fe, is_current)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Build find ranges into the reusable scratch buffer (no alloc after warm-up).
+            self.find_scratch.clear();
+            if let Some(matches) = find_matches {
+                for (idx, (s, e)) in matches
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (s, e))| line_idx >= s.line && line_idx <= e.line)
+                {
+                    let fs = if line_idx == s.line {
+                        display_col_for_char_col(raw_text, s.col)
+                    } else {
+                        0
+                    };
+                    let fe = if line_idx == e.line {
+                        display_col_for_char_col(raw_text, e.col)
+                    } else {
+                        char_count
+                    };
+                    self.find_scratch.push((fs, fe, find_current == Some(idx)));
+                }
+            }
 
             for wrap in start_wrap..total_wraps {
                 if screen_row >= text_rows {
@@ -301,11 +308,14 @@ impl Renderer {
                         .skip(chunk_start)
                     {
                         let in_sel = need_per_char && i >= line_sel_start && i < line_sel_end;
-                        let find_hit = find_ranges.iter().find(|(fs, fe, _)| i >= *fs && i < *fe);
+                        let find_hit = self
+                            .find_scratch
+                            .iter()
+                            .find(|(fs, fe, _)| i >= *fs && i < *fe);
                         let is_tab_pipe = has_tabs
                             && i < self.tab_pipes_scratch.len()
                             && self.tab_pipes_scratch[i];
-                        let is_bracket_match = bracket_cols.contains(&i);
+                        let is_bracket_match = bracket_col_0 == Some(i) || bracket_col_1 == Some(i);
                         let is_trailing_ws = has_trailing && i >= trailing_ws_start;
 
                         if in_sel {
