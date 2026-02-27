@@ -155,12 +155,42 @@ fn bracket_matching() {
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
     // Cursor on '(' at col 2 (gutter=2)
     // The matching ')' at col 8 should have magenta background
-    let bg = e.cell_bg(0, 8); // ')' position
+    let bg_close = e.cell_bg(0, 8); // ')' position
     // Magenta = Idx(5)
     assert_eq!(
-        bg,
+        bg_close,
         vt100::Color::Idx(5),
         "matching bracket should have magenta background"
+    );
+    // The cursor's own '(' should NOT be highlighted — the terminal cursor
+    // already marks that position; highlighting it too causes visual confusion.
+    let bg_open = e.cell_bg(0, 2); // '(' position
+    assert_ne!(
+        bg_open,
+        vt100::Color::Idx(5),
+        "cursor's own bracket should not have magenta background"
+    );
+}
+
+#[test]
+fn quote_match_only_highlights_match() {
+    let dir = TempDir::new();
+    // Cursor starts on the opening '"' at screen col 2 (gutter=2)
+    let path = create_file(dir.path(), "test.txt", "\"hello\"\n");
+    let mut e = TestEditor::new(&[path.to_str().unwrap()]);
+    // Closing '"' is at buffer col 6, screen col 8
+    let bg_close = e.cell_bg(0, 8);
+    assert_eq!(
+        bg_close,
+        vt100::Color::Idx(5),
+        "matching quote should have magenta background"
+    );
+    // The cursor's own '"' should NOT be highlighted
+    let bg_open = e.cell_bg(0, 2);
+    assert_ne!(
+        bg_open,
+        vt100::Color::Idx(5),
+        "cursor's own quote should not have magenta background"
     );
 }
 

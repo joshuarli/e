@@ -225,19 +225,19 @@ impl Renderer {
                     false
                 };
 
-            // Bracket match: at most 2 display columns on this line (open + close).
-            // Using two Option<usize> locals avoids a Vec allocation entirely.
-            let mut bracket_col_0 = None::<usize>;
-            let mut bracket_col_1 = None::<usize>;
-            if let Some((open, close)) = bracket_pair {
-                if open.line == line_idx {
-                    bracket_col_0 = Some(display_col_for_char_col(raw_text, open.col));
-                }
+            // Bracket match: highlight only the *matching* character, not the cursor's
+            // character (the terminal cursor already shows where the cursor is).
+            // Highlighting the cursor position too causes visual confusion — e.g. when
+            // cursor is on the opening `"` of `f"uv"`, the highlighted closing `"` looks
+            // like the cursor jumped there.
+            let bracket_match_col = bracket_pair.and_then(|(_, close)| {
                 if close.line == line_idx {
-                    bracket_col_1 = Some(display_col_for_char_col(raw_text, close.col));
+                    Some(display_col_for_char_col(raw_text, close.col))
+                } else {
+                    None
                 }
-            }
-            let has_bracket = bracket_col_0.is_some() || bracket_col_1.is_some();
+            });
+            let has_bracket = bracket_match_col.is_some();
 
             // Per-character highlight info
             let need_per_char = has_sel && line_idx >= sel_start.line && line_idx <= sel_end.line;
@@ -329,7 +329,7 @@ impl Renderer {
                         let is_tab_pipe = has_tabs
                             && i < self.tab_pipes_scratch.len()
                             && self.tab_pipes_scratch[i];
-                        let is_bracket_match = bracket_col_0 == Some(i) || bracket_col_1 == Some(i);
+                        let is_bracket_match = bracket_match_col == Some(i);
                         if in_sel {
                             if is_tab_pipe {
                                 write!(w, "\x1b[7;90m{}\x1b[0m", ch)?;
