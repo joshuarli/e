@@ -29,6 +29,7 @@ impl<R: Read> Read for CtrlJReader<R> {
     }
 }
 
+use crate::buffer;
 use crate::clipboard::Clipboard;
 use crate::command::{CommandAction, CommandRegistry};
 use crate::command_buffer::{CommandBuffer, CommandBufferMode, CommandBufferResult};
@@ -887,13 +888,18 @@ impl Editor {
             Err(_) => return, // invalid regex — just don't highlight
         };
 
-        let contents = self.doc.buf.contents();
-        let text = String::from_utf8_lossy(&contents);
-        for m in re.find_iter(&text) {
-            let start = self.doc.buf.offset_to_pos(m.start());
-            let end = self.doc.buf.offset_to_pos(m.end());
-            self.find_matches
-                .push((Pos::new(start.0, start.1), Pos::new(end.0, end.1)));
+        let line_count = self.doc.buf.line_count();
+        for line_idx in 0..line_count {
+            let line = self.doc.buf.line_text(line_idx);
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            for m in re.find_iter(text) {
+                let start_col = buffer::char_count(&line[..m.start()]);
+                let end_col = buffer::char_count(&line[..m.end()]);
+                self.find_matches
+                    .push((Pos::new(line_idx, start_col), Pos::new(line_idx, end_col)));
+            }
         }
     }
 

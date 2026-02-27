@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_new_empty() {
-        let mut doc = Document::new(Vec::new(), None);
+        let doc = Document::new(Vec::new(), None);
         assert!(!doc.dirty);
         assert!(doc.filename.is_none());
         assert_eq!(doc.buf.line_count(), 1);
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_new_with_text() {
-        let mut doc = Document::new(b"hello\nworld".to_vec(), Some("test.txt".to_string()));
+        let doc = Document::new(b"hello\nworld".to_vec(), Some("test.txt".to_string()));
         assert!(!doc.dirty);
         assert_eq!(doc.filename.as_deref(), Some("test.txt"));
         assert_eq!(doc.buf.line_count(), 2);

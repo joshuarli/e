@@ -1,4 +1,4 @@
-/// Gap buffer backed by a `Vec<u8>` with a lazy line-start index.
+/// Gap buffer backed by a `Vec<u8>` with an always-valid incremental line-start index.
 ///
 /// Text is stored as UTF-8 bytes. The gap sits between `gap_start` and `gap_end`
 /// inside `data`. Insertions at the cursor just fill the gap; deletions widen it.
@@ -6,10 +6,11 @@ pub struct GapBuffer {
     data: Vec<u8>,
     gap_start: usize,
     gap_end: usize,
-    /// Cached byte offsets of line starts (each entry is the byte offset of the
-    /// first character on that line, with line 0 always == 0).  `None` means the
-    /// cache is fully invalidated and must be rebuilt.
-    line_starts: Option<Vec<usize>>,
+    /// Byte offsets of line starts (entry 0 is always 0). Always valid — updated
+    /// incrementally on every insert/delete.
+    line_starts: Vec<usize>,
+    /// Min line touched since the last `take_dirty_line()` call.
+    min_dirty_line: usize,
     /// Monotonically increasing counter, bumped on every insert/delete.
     version: u64,
 }
@@ -23,7 +24,8 @@ impl GapBuffer {
             data: vec![0; gap],
             gap_start: 0,
             gap_end: gap,
-            line_starts: None,
+            line_starts: vec![0],
+            min_dirty_line: usize::MAX,
             version: 0,
         }
     }
@@ -33,11 +35,19 @@ impl GapBuffer {
         let mut data = Vec::with_capacity(text.len() + gap);
         data.extend_from_slice(text);
         data.resize(text.len() + gap, 0);
+        let len = text.len();
+        let mut starts = vec![0usize];
+        for (i, &b) in text.iter().enumerate() {
+            if b == b'\n' && i + 1 < len {
+                starts.push(i + 1);
+            }
+        }
         Self {
             data,
             gap_start: text.len(),
             gap_end: text.len() + gap,
-            line_starts: None,
+            line_starts: starts,
+            min_dirty_line: usize::MAX,
             version: 0,
         }
     }
@@ -107,7 +117,7 @@ impl GapBuffer {
         self.ensure_gap(bytes.len());
         self.data[self.gap_start..self.gap_start + bytes.len()].copy_from_slice(bytes);
         self.gap_start += bytes.len();
-        self.invalidate_lines_from(pos);
+        self.update_line_index_insert(pos, bytes);
         self.version += 1;
     }
 
@@ -116,7 +126,7 @@ impl GapBuffer {
         assert!(pos + count <= self.len_logical());
         self.move_gap_to(pos);
         self.gap_end += count;
-        self.invalidate_lines_from(pos);
+        self.update_line_index_delete(pos, count);
         self.version += 1;
     }
 
@@ -160,53 +170,104 @@ impl GapBuffer {
 
     // -- line index ---------------------------------------------------------
 
-    fn invalidate_lines_from(&mut self, _byte_pos: usize) {
-        // Simple approach: full invalidation. A smarter version would only
-        // invalidate from `_byte_pos` downward.
-        self.line_starts = None;
-    }
-
-    fn rebuild_line_index(&mut self) {
-        let mut starts = vec![0usize];
-        let len = self.len_logical();
-        for i in 0..len {
-            if self.byte_at(i) == b'\n' && i + 1 < len {
-                starts.push(i + 1);
-            }
+    /// Incrementally update the line index after inserting `bytes` at logical offset `pos`.
+    /// Must be called after the gap buffer has been updated.
+    fn update_line_index_insert(&mut self, pos: usize, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
         }
-        self.line_starts = Some(starts);
-    }
+        let n = bytes.len();
+        let new_len = self.len_logical();
 
-    fn ensure_line_index(&mut self) {
-        if self.line_starts.is_none() {
-            self.rebuild_line_index();
+        // Line that contains pos (for min_dirty_line tracking)
+        let insert_line = match self.line_starts.binary_search(&pos) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+
+        // shift_from: first index whose start is strictly > pos
+        let shift_from = match self.line_starts.binary_search(&pos) {
+            Ok(i) => i + 1, // entry at pos itself stays put
+            Err(i) => i,
+        };
+        for j in shift_from..self.line_starts.len() {
+            self.line_starts[j] += n;
         }
+
+        // Collect new line starts from newlines in the inserted bytes
+        let new_entries: Vec<usize> = bytes
+            .iter()
+            .enumerate()
+            .filter_map(|(k, &b)| {
+                let s = pos + k + 1;
+                (b == b'\n' && s < new_len).then_some(s)
+            })
+            .collect();
+
+        if !new_entries.is_empty() {
+            let old_tail = self.line_starts[shift_from..].to_vec();
+            self.line_starts.truncate(shift_from);
+            self.line_starts.extend_from_slice(&new_entries);
+            self.line_starts.extend_from_slice(&old_tail);
+        }
+
+        self.min_dirty_line = self.min_dirty_line.min(insert_line);
     }
 
-    pub fn line_count(&mut self) -> usize {
-        self.ensure_line_index();
-        self.line_starts.as_ref().unwrap().len()
+    /// Incrementally update the line index after deleting `count` bytes at logical offset `pos`.
+    /// Must be called after the gap buffer has been updated.
+    fn update_line_index_delete(&mut self, pos: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        let affected_line = match self.line_starts.binary_search(&pos) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+
+        // Remove starts whose creating '\n' was in [pos, pos+count):
+        // that means starts S where pos < S <= pos+count
+        let lo = self.line_starts.partition_point(|&s| s <= pos);
+        let hi = self.line_starts.partition_point(|&s| s <= pos + count);
+        self.line_starts.drain(lo..hi);
+
+        // Shift surviving entries that are > pos
+        for j in lo..self.line_starts.len() {
+            self.line_starts[j] -= count;
+        }
+
+        self.min_dirty_line = self.min_dirty_line.min(affected_line);
+    }
+
+    /// Return and reset the minimum dirty line index. The renderer calls this
+    /// to learn how far back it needs to recompute syntax highlighting.
+    pub fn take_dirty_line(&mut self) -> usize {
+        let v = self.min_dirty_line;
+        self.min_dirty_line = usize::MAX;
+        v
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.line_starts.len()
     }
 
     /// Byte offset of the start of line `line` (0-indexed).
-    pub fn line_start(&mut self, line: usize) -> usize {
-        self.ensure_line_index();
-        self.line_starts.as_ref().unwrap()[line]
+    pub fn line_start(&self, line: usize) -> usize {
+        self.line_starts[line]
     }
 
     /// Byte offset one past the end of line `line` (exclusive, includes the '\n' if present).
-    pub fn line_end(&mut self, line: usize) -> usize {
-        self.ensure_line_index();
-        let starts = self.line_starts.as_ref().unwrap();
-        if line + 1 < starts.len() {
-            starts[line + 1]
+    pub fn line_end(&self, line: usize) -> usize {
+        if line + 1 < self.line_starts.len() {
+            self.line_starts[line + 1]
         } else {
             self.len_logical()
         }
     }
 
     /// Get the text of line `line` (0-indexed), without the trailing '\n'.
-    pub fn line_text(&mut self, line: usize) -> Vec<u8> {
+    pub fn line_text(&self, line: usize) -> Vec<u8> {
         let start = self.line_start(line);
         let end = self.line_end(line);
         let raw = self.slice(start, end);
@@ -218,7 +279,7 @@ impl GapBuffer {
     }
 
     /// Convert a (line, col) to a byte offset. Col is clamped to line length.
-    pub fn pos_to_offset(&mut self, line: usize, col: usize) -> usize {
+    pub fn pos_to_offset(&self, line: usize, col: usize) -> usize {
         let start = self.line_start(line);
         let text = self.line_text(line);
         // Walk UTF-8 chars to find byte offset of the col-th character
@@ -234,9 +295,8 @@ impl GapBuffer {
     }
 
     /// Convert a byte offset to (line, col). Col is character count.
-    pub fn offset_to_pos(&mut self, offset: usize) -> (usize, usize) {
-        self.ensure_line_index();
-        let starts = self.line_starts.as_ref().unwrap();
+    pub fn offset_to_pos(&self, offset: usize) -> (usize, usize) {
+        let starts = &self.line_starts;
         // binary search for the line
         let line = match starts.binary_search(&offset) {
             Ok(l) => l,
@@ -260,7 +320,7 @@ impl GapBuffer {
     }
 
     /// Return the character count of a line (0-indexed), not counting the newline.
-    pub fn line_char_len(&mut self, line: usize) -> usize {
+    pub fn line_char_len(&self, line: usize) -> usize {
         let text = self.line_text(line);
         char_count(&text)
     }
@@ -423,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_line_index() {
-        let mut buf = GapBuffer::from_text(b"line1\nline2\nline3");
+        let buf = GapBuffer::from_text(b"line1\nline2\nline3");
         assert_eq!(buf.line_count(), 3);
         assert_eq!(buf.line_text(0), b"line1");
         assert_eq!(buf.line_text(1), b"line2");
@@ -432,14 +492,14 @@ mod tests {
 
     #[test]
     fn test_single_line_no_newline() {
-        let mut buf = GapBuffer::from_text(b"hello");
+        let buf = GapBuffer::from_text(b"hello");
         assert_eq!(buf.line_count(), 1);
         assert_eq!(buf.line_text(0), b"hello");
     }
 
     #[test]
     fn test_empty_lines() {
-        let mut buf = GapBuffer::from_text(b"a\n\nb");
+        let buf = GapBuffer::from_text(b"a\n\nb");
         assert_eq!(buf.line_count(), 3);
         assert_eq!(buf.line_text(0), b"a");
         assert_eq!(buf.line_text(1), b"");
@@ -448,14 +508,14 @@ mod tests {
 
     #[test]
     fn test_trailing_newline() {
-        let mut buf = GapBuffer::from_text(b"hello\n");
+        let buf = GapBuffer::from_text(b"hello\n");
         assert_eq!(buf.line_count(), 1);
         assert_eq!(buf.line_text(0), b"hello");
     }
 
     #[test]
     fn test_only_newlines() {
-        let mut buf = GapBuffer::from_text(b"\n\n\n");
+        let buf = GapBuffer::from_text(b"\n\n\n");
         assert_eq!(buf.line_count(), 3);
         assert_eq!(buf.line_text(0), b"");
         assert_eq!(buf.line_text(1), b"");
@@ -464,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_line_start_and_end() {
-        let mut buf = GapBuffer::from_text(b"abc\ndef\nghi");
+        let buf = GapBuffer::from_text(b"abc\ndef\nghi");
         assert_eq!(buf.line_start(0), 0);
         assert_eq!(buf.line_end(0), 4); // includes \n
         assert_eq!(buf.line_start(1), 4);
@@ -475,7 +535,7 @@ mod tests {
 
     #[test]
     fn test_line_char_len() {
-        let mut buf = GapBuffer::from_text(b"abc\nde\nfghij");
+        let buf = GapBuffer::from_text(b"abc\nde\nfghij");
         assert_eq!(buf.line_char_len(0), 3);
         assert_eq!(buf.line_char_len(1), 2);
         assert_eq!(buf.line_char_len(2), 5);
@@ -508,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_pos_to_offset() {
-        let mut buf = GapBuffer::from_text(b"abc\ndef\nghi");
+        let buf = GapBuffer::from_text(b"abc\ndef\nghi");
         assert_eq!(buf.pos_to_offset(0, 0), 0);
         assert_eq!(buf.pos_to_offset(1, 0), 4);
         assert_eq!(buf.pos_to_offset(1, 2), 6);
@@ -517,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_offset_to_pos() {
-        let mut buf = GapBuffer::from_text(b"abc\ndef\nghi");
+        let buf = GapBuffer::from_text(b"abc\ndef\nghi");
         assert_eq!(buf.offset_to_pos(0), (0, 0));
         assert_eq!(buf.offset_to_pos(4), (1, 0));
         assert_eq!(buf.offset_to_pos(6), (1, 2));
@@ -525,14 +585,14 @@ mod tests {
 
     #[test]
     fn test_pos_to_offset_col_clamped() {
-        let mut buf = GapBuffer::from_text(b"ab\ncd");
+        let buf = GapBuffer::from_text(b"ab\ncd");
         // col 10 on a 2-char line should clamp to end
         assert_eq!(buf.pos_to_offset(0, 10), 2);
     }
 
     #[test]
     fn test_offset_to_pos_at_newline() {
-        let mut buf = GapBuffer::from_text(b"abc\ndef");
+        let buf = GapBuffer::from_text(b"abc\ndef");
         // Offset 3 is the newline itself, which is col 3 of line 0
         assert_eq!(buf.offset_to_pos(3), (0, 3));
     }
@@ -563,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_utf8_insert_and_line_char_len() {
-        let mut buf = GapBuffer::from_text("café".as_bytes());
+        let buf = GapBuffer::from_text("café".as_bytes());
         assert_eq!(buf.line_char_len(0), 4);
         assert_eq!(buf.line_count(), 1);
     }
@@ -571,7 +631,7 @@ mod tests {
     #[test]
     fn test_utf8_pos_to_offset() {
         // "aé" = 61 c3 a9 = 3 bytes
-        let mut buf = GapBuffer::from_text("aé".as_bytes());
+        let buf = GapBuffer::from_text("aé".as_bytes());
         assert_eq!(buf.pos_to_offset(0, 0), 0); // 'a' at byte 0
         assert_eq!(buf.pos_to_offset(0, 1), 1); // 'é' at byte 1
         assert_eq!(buf.pos_to_offset(0, 2), 3); // end
@@ -579,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_utf8_offset_to_pos() {
-        let mut buf = GapBuffer::from_text("aé".as_bytes());
+        let buf = GapBuffer::from_text("aé".as_bytes());
         assert_eq!(buf.offset_to_pos(0), (0, 0)); // 'a'
         assert_eq!(buf.offset_to_pos(1), (0, 1)); // 'é'
         assert_eq!(buf.offset_to_pos(3), (0, 2)); // end
@@ -621,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_empty_buffer_line_count() {
-        let mut buf = GapBuffer::new();
+        let buf = GapBuffer::new();
         assert_eq!(buf.line_count(), 1);
         assert_eq!(buf.line_text(0), b"");
         assert_eq!(buf.line_char_len(0), 0);
@@ -631,5 +691,76 @@ mod tests {
     fn test_contents_matches_slice_full() {
         let buf = GapBuffer::from_text(b"some text here");
         assert_eq!(buf.contents(), buf.slice(0, buf.len()));
+    }
+
+    // -- incremental line index edge cases ----------------------------------
+
+    #[test]
+    fn test_insert_newline_at_start() {
+        let mut buf = GapBuffer::from_text(b"hello");
+        buf.insert(0, b"\n");
+        // now: "\nhello"
+        assert_eq!(buf.line_count(), 2);
+        assert_eq!(buf.line_text(0), b"");
+        assert_eq!(buf.line_text(1), b"hello");
+    }
+
+    #[test]
+    fn test_delete_all_content_multiline() {
+        let mut buf = GapBuffer::from_text(b"a\nb\nc");
+        buf.delete(0, buf.len());
+        assert_eq!(buf.line_count(), 1);
+        assert_eq!(buf.line_text(0), b"");
+    }
+
+    #[test]
+    fn test_multiple_edits_then_query() {
+        let mut buf = GapBuffer::from_text(b"aa\nbb\ncc");
+        buf.insert(2, b"\nXX"); // "aa\nXX\nbb\ncc"
+        buf.delete(0, 3); // "XX\nbb\ncc"
+        assert_eq!(buf.line_count(), 3);
+        assert_eq!(buf.line_text(0), b"XX");
+        assert_eq!(buf.line_text(1), b"bb");
+        assert_eq!(buf.line_text(2), b"cc");
+    }
+
+    #[test]
+    fn test_insert_trailing_newline() {
+        // Trailing newline does NOT create a new line entry
+        let mut buf = GapBuffer::from_text(b"hello");
+        buf.insert(5, b"\n");
+        // "hello\n" — trailing newline, still 1 line
+        assert_eq!(buf.line_count(), 1);
+        assert_eq!(buf.line_text(0), b"hello");
+    }
+
+    #[test]
+    fn test_delete_newline_merges_lines() {
+        let mut buf = GapBuffer::from_text(b"foo\nbar\nbaz");
+        buf.delete(7, 1); // delete '\n' between bar and baz
+        // "foo\nbarbaz"
+        assert_eq!(buf.line_count(), 2);
+        assert_eq!(buf.line_text(0), b"foo");
+        assert_eq!(buf.line_text(1), b"barbaz");
+    }
+
+    #[test]
+    fn test_take_dirty_line_resets() {
+        let mut buf = GapBuffer::from_text(b"a\nb\nc");
+        buf.insert(2, b"X"); // dirty line 1
+        let d1 = buf.take_dirty_line();
+        assert!(d1 < usize::MAX);
+        // After take, resets to MAX
+        let d2 = buf.take_dirty_line();
+        assert_eq!(d2, usize::MAX);
+    }
+
+    #[test]
+    fn test_take_dirty_line_accumulates_min() {
+        let mut buf = GapBuffer::from_text(b"a\nb\nc\nd\ne");
+        buf.insert(6, b"X"); // line 2 (c line)
+        buf.insert(2, b"Y"); // line 1 (b line) — should be the min
+        let d = buf.take_dirty_line();
+        assert_eq!(d, 1); // min of line 2 and line 1
     }
 }

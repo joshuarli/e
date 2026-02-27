@@ -31,7 +31,7 @@ Ownership chain: `main.rs` → `Editor` → `Document` → `GapBuffer`
 src/
   main.rs            Entry point, arg parsing, file safety, file locking, piped stdin
   editor.rs          Editor struct: all state, event loop, action dispatch
-  buffer.rs          GapBuffer: Vec<u8> with gap, lazy line-start index cache
+  buffer.rs          GapBuffer: Vec<u8> with gap, incremental line-start index
   document.rs        Wraps GapBuffer + UndoStack + dirty flag + filename
   selection.rs       Pos (line, col), Selection (anchor+cursor), word boundary helpers
   operation.rs       Operation enum (Insert/Delete), OperationGroup, UndoStack with grouping
@@ -55,11 +55,12 @@ src/
 
 ```rust
 pub struct GapBuffer {
-    data: Vec<u8>,                     // Raw buffer with gap
-    gap_start: usize,                  // Start of gap
-    gap_end: usize,                    // End of gap
-    line_starts: Option<Vec<usize>>,   // Cached byte offsets of line starts (None = invalidated)
-    version: u64,                      // Monotonically increasing, bumped on every insert/delete
+    data: Vec<u8>,              // Raw buffer with gap
+    gap_start: usize,           // Start of gap
+    gap_end: usize,             // End of gap
+    line_starts: Vec<usize>,    // Always-valid byte offsets of line starts
+    min_dirty_line: usize,      // Min line touched since last take_dirty_line(); usize::MAX = clean
+    version: u64,               // Monotonically increasing, bumped on every insert/delete
 }
 ```
 
@@ -68,7 +69,9 @@ pub struct GapBuffer {
 - Insertions fill the gap. Deletions widen the gap.
 - `move_gap_to(pos)` shifts the gap to a logical byte offset using `copy_within`.
 - `ensure_gap(needed)` grows the buffer if gap is too small, shifting the tail right.
-- Line index: full invalidation on any edit (`line_starts = None`). Rebuilt lazily on access by walking all bytes and recording positions after each `\n`. A trailing `\n` does NOT create a new line entry.
+- Line index: always valid, updated incrementally on every insert/delete. `from_text()` scans bytes once at load. Each edit uses `binary_search` to locate the affected region and shifts/inserts/removes only the changed entries. A trailing `\n` does NOT create a new line entry.
+- `take_dirty_line() -> usize` — returns and resets `min_dirty_line` (used by renderer for incremental highlight invalidation).
+- All line-query methods (`line_count`, `line_start`, `line_end`, `line_text`, `pos_to_offset`, `offset_to_pos`, `line_char_len`) take `&self` — no mutable borrow needed.
 - `pos_to_offset(line, col)` walks UTF-8 chars from line start to find byte offset.
 - `offset_to_pos(offset)` binary searches `line_starts` for the line, then counts UTF-8 chars for the column.
 
@@ -516,7 +519,7 @@ For multi-line pastes (>= 2 lines after splitting on `\n`):
 1. Smart-case: case-insensitive if pattern is all lowercase.
 2. Uses `regex_lite::RegexBuilder` with `.case_insensitive(true)` for smart-case, or plain `regex_lite::Regex::new`.
 3. Invalid regex → silently ignored (no highlights).
-4. Gets full buffer contents, finds all matches, stores as `Vec<(Pos, Pos)>`.
+4. Searches line-by-line via `buf.line_text(line_idx)` — no O(file_size) allocation. Max allocation per keystroke = O(longest_line). Multi-line patterns won't match across line boundaries. Stores matches as `Vec<(Pos, Pos)>`.
 
 ### Find workflow
 
@@ -641,7 +644,8 @@ pub struct Renderer {
     pub needs_full_redraw: bool,
     syntax: Option<&'static SyntaxRules>,
     hl_cache: Vec<HlState>,     // Cached highlight state at start of each line
-    hl_cache_version: u64,       // Buffer version the cache was for
+    hl_cache_version: u64,      // Buffer version the cache was for
+    hl_dirty_from: usize,       // First line needing recompute (usize::MAX = clean)
 }
 ```
 
@@ -651,7 +655,7 @@ pub struct Renderer {
 2. Compute text area: `text_rows = view.text_rows() - completion_rows`, `text_cols = view.text_cols(gw)`.
 3. Wrap output in synchronized output protocol (`\x1b[?2026h` / `\x1b[?2026l`).
 4. Hide cursor (`\x1b[?25l`).
-5. **Syntax cache**: if buffer version changed, recompute all per-line `HlState` from scratch. Store start state for each line.
+5. **Syntax cache**: if buffer version changed, call `buf.take_dirty_line()` to get the first modified line, then `refresh_hl_cache()` to recompute only from that line forward, stopping as soon as the cached output state matches — typically O(changed_lines). On first render or after `set_syntax`, rebuilds all lines.
 6. **Wrap-aware render loop**: walk from `(scroll_line, scroll_wrap)` through logical lines:
    - Expand tabs in each line (`\t` → `|` + space, 2 display columns).
    - Convert to chars. Compute wrapped rows.

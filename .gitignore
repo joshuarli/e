@@ -1,4 +1,4 @@
 /target
-.roam/index*
+.roam/
 tests/e2e/recordings
 .DS_Store
