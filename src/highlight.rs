@@ -1380,24 +1380,47 @@ fn byte_to_char_col(line: &[u8], byte_idx: usize) -> usize {
 
 // -- Byte-to-char mapping ---------------------------------------------------
 
-/// Map byte-indexed highlights to char-indexed highlights.
+/// Map byte-indexed highlights to char-indexed highlights, writing into `out`.
 /// Tabs expand to 2 display entries, multi-byte UTF-8 collapses to 1 entry.
-pub fn byte_hl_to_char_hl(raw: &[u8], byte_hl: &[HlType]) -> Vec<HlType> {
-    let mut char_hl = Vec::with_capacity(raw.len());
+/// Clears `out` first; reuses its allocation across calls.
+pub fn byte_hl_to_char_hl_into(raw: &[u8], byte_hl: &[HlType], out: &mut Vec<HlType>) {
+    out.clear();
     let mut bi = 0;
     while bi < raw.len() {
         let ht = byte_hl[bi];
         if raw[bi] == b'\t' {
             // Tab expands to 2 display positions
-            char_hl.push(ht);
-            char_hl.push(ht);
+            out.push(ht);
+            out.push(ht);
             bi += 1;
         } else {
-            char_hl.push(ht);
+            out.push(ht);
             bi += buffer::utf8_char_len(raw[bi]);
         }
     }
-    char_hl
+}
+
+/// Allocating wrapper around `byte_hl_to_char_hl_into`. Used in tests.
+#[allow(dead_code)]
+pub fn byte_hl_to_char_hl(raw: &[u8], byte_hl: &[HlType]) -> Vec<HlType> {
+    let mut out = Vec::with_capacity(raw.len());
+    byte_hl_to_char_hl_into(raw, byte_hl, &mut out);
+    out
+}
+
+/// Like `highlight_line` but writes the per-byte highlights into `out`
+/// (clearing it first), reusing its allocation across calls.
+/// Returns only the next-line `HlState`.
+pub fn highlight_line_into(
+    line: &[u8],
+    state: HlState,
+    rules: &SyntaxRules,
+    out: &mut Vec<HlType>,
+) -> HlState {
+    let (hl, next_state) = highlight_line(line, state, rules);
+    out.clear();
+    out.extend_from_slice(&hl);
+    next_state
 }
 
 // -- Language rules ---------------------------------------------------------

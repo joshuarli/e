@@ -286,6 +286,28 @@ impl GapBuffer {
         }
     }
 
+    /// Fill `buf` with the text of line `line` (0-indexed), without the trailing '\n'.
+    /// Clears `buf` first; reuses its allocation when called repeatedly.
+    pub fn line_text_into(&self, line: usize, buf: &mut Vec<u8>) {
+        buf.clear();
+        let start = self.line_start(line);
+        let mut end = self.line_end(line);
+        // Strip trailing newline
+        if end > start && self.byte_at(end - 1) == b'\n' {
+            end -= 1;
+        }
+        // Copy in (at most) two chunks, avoiding the gap
+        if start < self.gap_start {
+            let chunk_end = end.min(self.gap_start);
+            buf.extend_from_slice(&self.data[start..chunk_end]);
+        }
+        if end > self.gap_start {
+            let phys_start = start.max(self.gap_start) + self.gap_len();
+            let phys_end = end + self.gap_len();
+            buf.extend_from_slice(&self.data[phys_start..phys_end]);
+        }
+    }
+
     /// Convert a (line, col) to a byte offset. Col is clamped to line length.
     pub fn pos_to_offset(&self, line: usize, col: usize) -> usize {
         let start = self.line_start(line);

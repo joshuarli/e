@@ -43,6 +43,12 @@ pub struct Renderer {
     hl_cache_version: u64,
     /// First line whose cached state may be stale (set by caller via dirty tracking).
     hl_dirty_from: usize,
+    /// Scratch buffer reused each line for line_text_into.
+    line_buf: Vec<u8>,
+    /// Scratch buffer reused each line for byte-indexed highlight output.
+    hl_scratch: Vec<HlType>,
+    /// Scratch buffer reused each line for char-indexed highlight output.
+    char_hl_scratch: Vec<HlType>,
 }
 
 impl Renderer {
@@ -53,6 +59,9 @@ impl Renderer {
             hl_cache: Vec::new(),
             hl_cache_version: u64::MAX,
             hl_dirty_from: 0,
+            line_buf: Vec::new(),
+            hl_scratch: Vec::new(),
+            char_hl_scratch: Vec::new(),
         }
     }
 
@@ -143,8 +152,9 @@ impl Renderer {
         let first_wrap = view.scroll_wrap;
 
         while screen_row < text_rows && line_idx < line_count {
-            let raw_text = buf.line_text(line_idx);
-            let (expanded, tab_pipes) = expand_tabs(&raw_text);
+            buf.line_text_into(line_idx, &mut self.line_buf);
+            let raw_text: &[u8] = &self.line_buf;
+            let (expanded, tab_pipes) = expand_tabs(raw_text);
             let line_str = String::from_utf8_lossy(&expanded);
             let chars: Vec<char> = line_str.chars().collect();
             let total_wraps = crate::view::wrapped_rows(chars.len(), text_cols);
@@ -154,19 +164,26 @@ impl Renderer {
                 0
             };
 
-            // Compute per-char syntax highlights for this line (once per logical line)
-            let char_hl: Option<Vec<HlType>> = self.syntax.and_then(|rules| {
-                hl_states.get(line_idx).map(|&state| {
-                    let (byte_hl, _) = highlight::highlight_line(&raw_text, state, rules);
-                    highlight::byte_hl_to_char_hl(&raw_text, &byte_hl)
-                })
-            });
+            // Compute per-char syntax highlights for this line (once per logical line).
+            // Results go into self.char_hl_scratch; has_char_hl tracks whether it's valid.
+            let has_char_hl =
+                if let (Some(rules), Some(&state)) = (self.syntax, hl_states.get(line_idx)) {
+                    highlight::highlight_line_into(raw_text, state, rules, &mut self.hl_scratch);
+                    highlight::byte_hl_to_char_hl_into(
+                        raw_text,
+                        &self.hl_scratch,
+                        &mut self.char_hl_scratch,
+                    );
+                    true
+                } else {
+                    false
+                };
 
             // Bracket match display columns for this line
             let bracket_cols: Vec<usize> = bracket_pair
                 .iter()
                 .filter(|(_, match_pos)| match_pos.line == line_idx)
-                .map(|(_, match_pos)| display_col_for_char_col(&raw_text, match_pos.col))
+                .map(|(_, match_pos)| display_col_for_char_col(raw_text, match_pos.col))
                 .collect();
 
             // Per-character highlight info
@@ -180,12 +197,12 @@ impl Renderer {
             // Pre-compute selection and find ranges once per logical line
             let (line_sel_start, line_sel_end) = if need_per_char {
                 let s = if line_idx == sel_start.line {
-                    display_col_for_char_col(&raw_text, sel_start.col)
+                    display_col_for_char_col(raw_text, sel_start.col)
                 } else {
                     0
                 };
                 let e = if line_idx == sel_end.line {
-                    display_col_for_char_col(&raw_text, sel_end.col)
+                    display_col_for_char_col(raw_text, sel_end.col)
                 } else {
                     chars.len()
                 };
@@ -202,12 +219,12 @@ impl Renderer {
                         .filter(|(_, (s, e))| line_idx >= s.line && line_idx <= e.line)
                         .map(|(idx, (s, e))| {
                             let fs = if line_idx == s.line {
-                                display_col_for_char_col(&raw_text, s.col)
+                                display_col_for_char_col(raw_text, s.col)
                             } else {
                                 0
                             };
                             let fe = if line_idx == e.line {
-                                display_col_for_char_col(&raw_text, e.col)
+                                display_col_for_char_col(raw_text, e.col)
                             } else {
                                 chars.len()
                             };
@@ -283,10 +300,14 @@ impl Renderer {
                         } else if is_tab_pipe {
                             write!(w, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
-                            let ht = char_hl
-                                .as_ref()
-                                .and_then(|h| h.get(i).copied())
-                                .unwrap_or(HlType::Normal);
+                            let ht = if has_char_hl {
+                                self.char_hl_scratch
+                                    .get(i)
+                                    .copied()
+                                    .unwrap_or(HlType::Normal)
+                            } else {
+                                HlType::Normal
+                            };
                             let code = ht.ansi_code();
                             if code.is_empty() {
                                 write!(w, "{}", ch)?;
@@ -314,10 +335,14 @@ impl Renderer {
                             }
                             write!(w, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
-                            let ht = char_hl
-                                .as_ref()
-                                .and_then(|h| h.get(i).copied())
-                                .unwrap_or(HlType::Normal);
+                            let ht = if has_char_hl {
+                                self.char_hl_scratch
+                                    .get(i)
+                                    .copied()
+                                    .unwrap_or(HlType::Normal)
+                            } else {
+                                HlType::Normal
+                            };
                             if ht != current_hl {
                                 if ht == HlType::Normal {
                                     write!(w, "\x1b[0m")?;
@@ -487,8 +512,9 @@ impl Renderer {
 
         let mut line = start;
         while line < end {
-            let raw = buf.line_text(line);
-            let (_, next_state) = highlight::highlight_line(&raw, state, rules);
+            buf.line_text_into(line, &mut self.line_buf);
+            let next_state =
+                highlight::highlight_line_into(&self.line_buf, state, rules, &mut self.hl_scratch);
             state = next_state;
 
             if line + 1 < end {
