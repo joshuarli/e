@@ -7,11 +7,13 @@ use crate::view::View;
 
 /// Compute gutter width: width of the largest line number + 1 (trailing space).
 pub fn gutter_width(line_count: usize) -> usize {
-    let digits = if line_count == 0 {
-        1
-    } else {
-        ((line_count as f64).log10().floor() as usize) + 1
-    };
+    let n = if line_count == 0 { 1 } else { line_count };
+    let mut digits = 1usize;
+    let mut v = n;
+    while v >= 10 {
+        v /= 10;
+        digits += 1;
+    }
     digits + 1
 }
 
@@ -62,6 +64,8 @@ pub struct Renderer {
     char_hl_scratch: Vec<HlType>,
     /// Scratch buffer reused each line for find-range display columns.
     find_scratch: Vec<(usize, usize, bool)>,
+    /// Frame buffer reused each draw to avoid per-frame allocation.
+    frame_buf: Vec<u8>,
 }
 
 impl Renderer {
@@ -78,6 +82,7 @@ impl Renderer {
             hl_scratch: Vec::new(),
             char_hl_scratch: Vec::new(),
             find_scratch: Vec::new(),
+            frame_buf: Vec::new(),
         }
     }
 
@@ -134,8 +139,10 @@ impl Renderer {
             .unwrap_or((Pos::zero(), Pos::zero()));
         let has_sel = selection.is_some_and(|s| !s.is_empty());
 
-        // Buffer all output, then write to terminal in one shot to avoid flicker
-        let mut frame = Vec::with_capacity(8192);
+        // Buffer all output, then write to terminal in one shot to avoid flicker.
+        // Take the frame buffer out of self so we can still call self.X methods below.
+        let mut frame = std::mem::take(&mut self.frame_buf);
+        frame.clear();
         let w = &mut frame;
 
         // Synchronized output: tell terminal to hold rendering until frame is complete
@@ -500,6 +507,7 @@ impl Renderer {
         out.write_all(&frame)?;
         out.flush()?;
         self.needs_full_redraw = false;
+        self.frame_buf = frame;
         Ok(())
     }
 

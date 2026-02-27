@@ -344,8 +344,10 @@ impl Editor {
         self.view
             .ensure_cursor_visible(cursor_line, display_col, gw, &mut line_display_width);
 
-        let status_left = self.status_left();
-        let status_right = self.status_right();
+        let lang = self.doc.filename.as_deref().and_then(language::detect);
+        let lang_name = lang.map(|l| l.name).unwrap_or("Text");
+        let status_left = self.status_left(lang_name);
+        let status_right = Self::status_right();
         let sel = if self.sel.is_empty() {
             None
         } else {
@@ -387,7 +389,6 @@ impl Editor {
             None
         };
 
-        let lang = self.doc.filename.as_deref().and_then(language::detect);
         let rules = lang.and_then(|l| highlight::rules_for_language(l.name));
         self.renderer.set_syntax(rules);
 
@@ -399,7 +400,7 @@ impl Editor {
             display_col,
             ruler_on,
             &status_left,
-            &status_right,
+            status_right,
             cmd_ref,
             sel,
             find_matches,
@@ -411,15 +412,8 @@ impl Editor {
         )
     }
 
-    fn status_left(&self) -> String {
+    fn status_left(&self, lang_name: &str) -> String {
         let name = self.doc.filename.as_deref().unwrap_or("[scratch]");
-        let lang_name = self
-            .doc
-            .filename
-            .as_deref()
-            .and_then(language::detect)
-            .map(|l| l.name)
-            .unwrap_or("Text");
         if self.doc.dirty {
             format!(" {}* [{}]", name, lang_name)
         } else {
@@ -427,8 +421,8 @@ impl Editor {
         }
     }
 
-    fn status_right(&self) -> String {
-        format!(" e v{} ", env!("CARGO_PKG_VERSION"))
+    fn status_right() -> &'static str {
+        concat!(" e v", env!("CARGO_PKG_VERSION"), " ")
     }
 
     fn center_view_on_line(&mut self, line: usize) {
@@ -450,16 +444,19 @@ impl Editor {
     fn find_matching_bracket(&mut self) -> Option<(Pos, Pos)> {
         let cursor = self.cursor();
         let line_count = self.doc.buf.line_count();
+        let mut scratch = Vec::new();
         if let Some(match_pos) = highlight::find_bracket_match(
             cursor,
-            &mut |line_idx| self.doc.buf.line_text(line_idx),
+            &mut |line_idx, buf| self.doc.buf.line_text_into(line_idx, buf),
+            &mut scratch,
             line_count,
         ) {
             return Some((cursor, match_pos));
         }
         let match_pos = highlight::find_quote_match(
             cursor,
-            &mut |line_idx| self.doc.buf.line_text(line_idx),
+            &mut |line_idx, buf| self.doc.buf.line_text_into(line_idx, buf),
+            &mut scratch,
             line_count,
         )?;
         Some((cursor, match_pos))
@@ -3723,14 +3720,21 @@ mod tests {
     #[test]
     fn test_status_left_scratch() {
         let e = ed("hello");
-        let left = e.status_left();
+        let left = e.status_left("Text");
         assert!(left.contains("[scratch]"));
     }
 
     #[test]
     fn test_status_left_named_clean() {
         let e = ed_named("hello", "test.rs");
-        let left = e.status_left();
+        let lang_name = e
+            .doc
+            .filename
+            .as_deref()
+            .and_then(language::detect)
+            .map(|l| l.name)
+            .unwrap_or("Text");
+        let left = e.status_left(lang_name);
         assert!(left.contains("test.rs"));
         assert!(left.contains("Rust"));
         assert!(!left.contains('*'));
@@ -3740,14 +3744,20 @@ mod tests {
     fn test_status_left_named_dirty() {
         let mut e = ed_named("hello", "test.rs");
         e.doc.dirty = true;
-        let left = e.status_left();
+        let lang_name = e
+            .doc
+            .filename
+            .as_deref()
+            .and_then(language::detect)
+            .map(|l| l.name)
+            .unwrap_or("Text");
+        let left = e.status_left(lang_name);
         assert!(left.contains("test.rs*"));
     }
 
     #[test]
     fn test_status_right() {
-        let e = ed("hello");
-        let right = e.status_right();
+        let right = Editor::status_right();
         assert!(right.contains("e v"));
     }
 

@@ -664,17 +664,19 @@ pub struct Renderer {
     hl_scratch: Vec<HlType>,             // Byte-indexed highlight output
     char_hl_scratch: Vec<HlType>,        // Char-indexed highlight output
     find_scratch: Vec<(usize, usize, bool)>, // Per-line find-range display columns
+    frame_buf: Vec<u8>,                  // Reused per-draw output buffer (taken via mem::take)
 }
 ```
 
 ### Render flow (`render()`)
 
-1. Compute gutter width: `floor(log10(line_count)) + 1 + 1` (digits + trailing space). 0 if ruler is off.
+1. Compute gutter width: integer digit count loop (no floating-point) + 1 trailing space. 0 if ruler is off.
 2. Compute text area: `text_rows = view.text_rows() - completion_rows`, `text_cols = view.text_cols(gw)`.
-3. Wrap output in synchronized output protocol (`\x1b[?2026h` / `\x1b[?2026l`).
-4. Hide cursor (`\x1b[?25l`).
-5. **Syntax cache** (lazy, viewport-bounded): compute `visible_end = scroll_line + text_rows + 1`. If buffer version changed, read `buf.take_dirty_line()` to get `hl_dirty_from`. Call `refresh_hl_cache(visible_end, scroll_line)` which: truncates if file shrank; extends the cache to `visible_end` if the user scrolled past the current coverage (reprocesses the last cached line to recover its output state, then continues forward); recomputes from `hl_dirty_from` on edits with early-exit when the cached state matches. **Large-jump fast path**: when `scroll_line > computed + 50` (viewport jumped far past the end of the computed cache, e.g. select-all on a 1M-line file), the intermediate gap is left as `HlState::Normal` and recomputation starts only from `scroll_line - 200`. Multi-line constructs starting in the skipped gap are cosmetically approximated as Normal. On first open of a 1M-line file only ~`text_rows` lines are highlighted — O(viewport) not O(file).
-6. **Wrap-aware render loop**: walk from `(scroll_line, scroll_wrap)` through logical lines:
+3. Take `frame_buf` out of `self` via `mem::take`, clear it, use as the output accumulator; put back before returning. No per-draw allocation after warm-up.
+4. Wrap output in synchronized output protocol (`\x1b[?2026h` / `\x1b[?2026l`).
+5. Hide cursor (`\x1b[?25l`).
+6. **Syntax cache** (lazy, viewport-bounded): compute `visible_end = scroll_line + text_rows + 1`. If buffer version changed, read `buf.take_dirty_line()` to get `hl_dirty_from`. Call `refresh_hl_cache(visible_end, scroll_line)` which: truncates if file shrank; extends the cache to `visible_end` if the user scrolled past the current coverage (reprocesses the last cached line to recover its output state, then continues forward); recomputes from `hl_dirty_from` on edits with early-exit when the cached state matches. **Large-jump fast path**: when `scroll_line > computed + 50` (viewport jumped far past the end of the computed cache, e.g. select-all on a 1M-line file), the intermediate gap is left as `HlState::Normal` and recomputation starts only from `scroll_line - 200`. Multi-line constructs starting in the skipped gap are cosmetically approximated as Normal. On first open of a 1M-line file only ~`text_rows` lines are highlighted — O(viewport) not O(file).
+7. **Wrap-aware render loop**: walk from `(scroll_line, scroll_wrap)` through logical lines:
    - Expand tabs in each line (`\t` → `|` + space, 2 display columns).
    - Convert to chars. Compute wrapped rows.
    - For each wrapped chunk:
@@ -683,11 +685,11 @@ pub struct Renderer {
        - **Slow path** (selection, find matches, or bracket matches present): per-character rendering with priority: selection (reverse video `\x1b[7m`) > find match (yellow bg `\x1b[43;30m`, current match green bg `\x1b[42;30m`) > bracket match (magenta bg `\x1b[45;30m`) > trailing whitespace (red bg `\x1b[41m`) > tab pipe (dark grey `\x1b[90m`) > syntax highlight.
        - **Fast path** (no overlays): streaming syntax highlighting with minimal escape changes. Trailing whitespace and tab pipes handled inline.
      - Reset and erase to end of line: `\x1b[0m\x1b[K`.
-7. Fill remaining rows with empty lines (blank gutters if ruler on).
-8. **Completions**: dim text (`\x1b[2m`) on rows above status bar.
-9. **Status bar**: reverse video (`\x1b[0;7m`). Left: `" filename* [Language]"` (or `" [scratch]"`, `*` only if dirty). Right: `" e vVERSION "` (from `env!("CARGO_PKG_VERSION")`). Padded with spaces to fill width.
-10. **Command line**: if active, yellow bg black text (`\x1b[30;43m`) + erase to end. If status message, display it. Otherwise blank.
-11. **Cursor positioning**:
+8. Fill remaining rows with empty lines (blank gutters if ruler on).
+9. **Completions**: dim text (`\x1b[2m`) on rows above status bar.
+10. **Status bar**: reverse video (`\x1b[0;7m`). Left: `" filename* [Language]"` (or `" [scratch]"`, `*` only if dirty). Right: `" e vVERSION "` (`&'static str` via `concat!`, no per-frame allocation). Padded with spaces to fill width.
+11. **Command line**: if active, yellow bg black text (`\x1b[30;43m`) + erase to end. If status message, display it. Otherwise blank.
+12. **Cursor positioning**:
     - If `find_active` or selection active: cursor stays hidden.
     - If command buffer active: position cursor in command line at `prompt.len() + cursor`, show cursor.
     - Otherwise: compute cursor screen position accounting for soft-wrap (col % text_cols + gutter for column, count wrapped rows from scroll position for row using `line_text_into` + `display_col_for_char_col` — no allocation), show cursor.
@@ -789,16 +791,22 @@ Post-pass on every highlighted line. Finds patterns like `v1.2.3` or `0.3.5-beta
 
 ### Bracket matching (`find_bracket_match`)
 
+Signature: `find_bracket_match(pos, get_line: &mut impl FnMut(usize, &mut Vec<u8>), scratch: &mut Vec<u8>, line_count) -> Option<Pos>`.
+
+`get_line(idx, buf)` fills `buf` with raw bytes for line `idx` (no allocation). `scratch` is a reused buffer supplied by the caller — eliminates the up-to-1000 per-line `Vec<u8>` allocations the previous `FnMut(usize) -> Vec<u8>` design incurred on deep bracket searches.
+
 Given cursor position on a bracket `()[]{}`:
-1. Determines target bracket and direction.
-2. Scans forward or backward counting depth.
+1. Loads the initial line into `scratch`, extracts target bracket and direction.
+2. Scans forward or backward counting depth, reloading `scratch` at each line boundary.
 3. Limit: 1000 lines.
 4. Returns matching bracket position or None.
 
 ### Quote matching (`find_quote_match`)
 
-For `"` or `'` at cursor:
-1. Collects all unescaped positions of same quote char on same line.
+Signature: `find_quote_match(pos, get_line: &mut impl FnMut(usize, &mut Vec<u8>), scratch: &mut Vec<u8>, line_count) -> Option<Pos>`.
+
+Same scratch-buffer pattern as `find_bracket_match`. For `"` or `'` at cursor:
+1. Loads the line into `scratch`. Collects all unescaped positions of same quote char.
 2. Pairs sequentially: 0↔1, 2↔3, etc.
 3. Returns the paired position if cursor is on one.
 

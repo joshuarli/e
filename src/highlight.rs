@@ -1225,20 +1225,22 @@ fn bracket_pair(ch: u8) -> Option<(u8, bool)> {
 }
 
 /// Find the matching bracket for the bracket at `pos`.
-/// `get_line` returns the raw bytes for a given line index.
+/// `get_line(idx, buf)` fills `buf` with the raw bytes for line `idx`.
+/// `scratch` is a caller-supplied buffer reused across calls (avoids per-line allocation).
 /// Returns the position of the matching bracket, or None.
 pub fn find_bracket_match(
     pos: Pos,
-    get_line: &mut impl FnMut(usize) -> Vec<u8>,
+    get_line: &mut impl FnMut(usize, &mut Vec<u8>),
+    scratch: &mut Vec<u8>,
     line_count: usize,
 ) -> Option<Pos> {
-    let line = get_line(pos.line);
+    get_line(pos.line, scratch);
     // Convert char col to byte index
-    let byte_idx = char_col_to_byte(&line, pos.col)?;
-    if byte_idx >= line.len() {
+    let byte_idx = char_col_to_byte(scratch, pos.col)?;
+    if byte_idx >= scratch.len() {
         return None;
     }
-    let ch = line[byte_idx];
+    let ch = scratch[byte_idx];
     let (target, forward) = bracket_pair(ch)?;
 
     let mut depth: i32 = 0;
@@ -1249,14 +1251,13 @@ pub fn find_bracket_match(
         let mut bi = byte_idx;
         let mut lines_scanned = 0;
         loop {
-            let cur = get_line(l);
-            while bi < cur.len() {
-                if cur[bi] == ch {
+            while bi < scratch.len() {
+                if scratch[bi] == ch {
                     depth += 1;
-                } else if cur[bi] == target {
+                } else if scratch[bi] == target {
                     depth -= 1;
                     if depth == 0 {
-                        let col = byte_to_char_col(&cur, bi);
+                        let col = byte_to_char_col(scratch, bi);
                         return Some(Pos::new(l, col));
                     }
                 }
@@ -1268,21 +1269,21 @@ pub fn find_bracket_match(
                 return None;
             }
             bi = 0;
+            get_line(l, scratch);
         }
     } else {
         let mut l = pos.line;
         let mut bi = byte_idx as i64;
         let mut lines_scanned = 0;
         loop {
-            let cur = get_line(l);
             while bi >= 0 {
                 let b = bi as usize;
-                if cur[b] == ch {
+                if scratch[b] == ch {
                     depth += 1;
-                } else if cur[b] == target {
+                } else if scratch[b] == target {
                     depth -= 1;
                     if depth == 0 {
-                        let col = byte_to_char_col(&cur, b);
+                        let col = byte_to_char_col(scratch, b);
                         return Some(Pos::new(l, col));
                     }
                 }
@@ -1296,8 +1297,8 @@ pub fn find_bracket_match(
             if lines_scanned >= max_lines {
                 return None;
             }
-            let prev = get_line(l);
-            bi = prev.len() as i64 - 1;
+            get_line(l, scratch);
+            bi = scratch.len() as i64 - 1;
         }
     }
 }
@@ -1318,25 +1319,26 @@ fn is_escaped(line: &[u8], idx: usize) -> bool {
 
 pub fn find_quote_match(
     pos: Pos,
-    get_line: &mut impl FnMut(usize) -> Vec<u8>,
+    get_line: &mut impl FnMut(usize, &mut Vec<u8>),
+    scratch: &mut Vec<u8>,
     _line_count: usize,
 ) -> Option<Pos> {
-    let line = get_line(pos.line);
-    let byte_idx = char_col_to_byte(&line, pos.col)?;
-    if byte_idx >= line.len() {
+    get_line(pos.line, scratch);
+    let byte_idx = char_col_to_byte(scratch, pos.col)?;
+    if byte_idx >= scratch.len() {
         return None;
     }
-    let ch = line[byte_idx];
+    let ch = scratch[byte_idx];
     if ch != b'"' && ch != b'\'' {
         return None;
     }
-    if is_escaped(&line, byte_idx) {
+    if is_escaped(scratch, byte_idx) {
         return None;
     }
     // Collect all unescaped positions of this quote char on this line
     let mut positions = Vec::new();
-    for i in 0..line.len() {
-        if line[i] == ch && !is_escaped(&line, i) {
+    for i in 0..scratch.len() {
+        if scratch[i] == ch && !is_escaped(scratch, i) {
             positions.push(i);
         }
     }
@@ -1346,11 +1348,11 @@ pub fn find_quote_match(
         let open = positions[pair_idx];
         let close = positions[pair_idx + 1];
         if byte_idx == open {
-            let col = byte_to_char_col(&line, close);
+            let col = byte_to_char_col(scratch, close);
             return Some(Pos::new(pos.line, col));
         }
         if byte_idx == close {
-            let col = byte_to_char_col(&line, open);
+            let col = byte_to_char_col(scratch, open);
             return Some(Pos::new(pos.line, col));
         }
         pair_idx += 2;
@@ -2705,36 +2707,72 @@ mod tests {
         ];
         let line_count = lines.len();
         let get = |i: usize| lines[i].clone();
+        let mut scratch = Vec::new();
 
         // Opening { on line 0 col 48 → closing } on line 8 col 0
         let open_brace = lines[0].iter().rposition(|&b| b == b'{').unwrap();
-        let result = find_bracket_match(Pos::new(0, open_brace), &mut |i| get(i), line_count);
+        let result = find_bracket_match(
+            Pos::new(0, open_brace),
+            &mut |i, b| *b = get(i),
+            &mut scratch,
+            line_count,
+        );
         assert_eq!(result, Some(Pos::new(8, 0)));
 
         // Closing } on line 8 → back to opening { on line 0
-        let result = find_bracket_match(Pos::new(8, 0), &mut |i| get(i), line_count);
+        let result = find_bracket_match(
+            Pos::new(8, 0),
+            &mut |i, b| *b = get(i),
+            &mut scratch,
+            line_count,
+        );
         assert_eq!(result, Some(Pos::new(0, open_brace)));
 
         // Inner if { on line 1 → } on line 3
         let if_brace = lines[1].iter().rposition(|&b| b == b'{').unwrap();
-        let result = find_bracket_match(Pos::new(1, if_brace), &mut |i| get(i), line_count);
+        let result = find_bracket_match(
+            Pos::new(1, if_brace),
+            &mut |i, b| *b = get(i),
+            &mut scratch,
+            line_count,
+        );
         assert_eq!(result, Some(Pos::new(3, 4)));
 
         // ( on line 0 col 10 → ) matching
-        let result = find_bracket_match(Pos::new(0, 10), &mut |i| get(i), line_count);
+        let result = find_bracket_match(
+            Pos::new(0, 10),
+            &mut |i, b| *b = get(i),
+            &mut scratch,
+            line_count,
+        );
         assert_eq!(result, Some(Pos::new(0, 24)));
 
         // Nested (()) on line 7: Ok(()) — outer ( matches outer )
         let ok_paren = lines[7].iter().position(|&b| b == b'(').unwrap();
-        let result = find_bracket_match(Pos::new(7, ok_paren), &mut |i| get(i), line_count);
+        let result = find_bracket_match(
+            Pos::new(7, ok_paren),
+            &mut |i, b| *b = get(i),
+            &mut scratch,
+            line_count,
+        );
         assert_eq!(result, Some(Pos::new(7, ok_paren + 3)));
 
         // Cursor on non-bracket char → None
-        let result = find_bracket_match(Pos::new(0, 0), &mut |i| get(i), line_count);
+        let result = find_bracket_match(
+            Pos::new(0, 0),
+            &mut |i, b| *b = get(i),
+            &mut scratch,
+            line_count,
+        );
         assert_eq!(result, None);
 
         // Unmatched: if we only pass first line, { has no match
-        let result = find_bracket_match(Pos::new(0, open_brace), &mut |i| get(i), 1);
+        let result = find_bracket_match(
+            Pos::new(0, open_brace),
+            &mut |i, b| *b = get(i),
+            &mut scratch,
+            1,
+        );
         assert_eq!(result, None);
     }
 
@@ -2743,15 +2781,19 @@ mod tests {
     #[test]
     fn test_quote_match_double_basic() {
         let line = b"\"hello\"";
-        let mut get = |_: usize| line.to_vec();
+        let mut scratch = Vec::new();
+        let mut get = |_: usize, b: &mut Vec<u8>| {
+            b.clear();
+            b.extend_from_slice(line);
+        };
         // Cursor on opening " → match closing
         assert_eq!(
-            find_quote_match(Pos::new(0, 0), &mut get, 1),
+            find_quote_match(Pos::new(0, 0), &mut get, &mut scratch, 1),
             Some(Pos::new(0, 6))
         );
         // Cursor on closing " → match opening
         assert_eq!(
-            find_quote_match(Pos::new(0, 6), &mut get, 1),
+            find_quote_match(Pos::new(0, 6), &mut get, &mut scratch, 1),
             Some(Pos::new(0, 0))
         );
     }
@@ -2759,13 +2801,17 @@ mod tests {
     #[test]
     fn test_quote_match_single_basic() {
         let line = b"'hello'";
-        let mut get = |_: usize| line.to_vec();
+        let mut scratch = Vec::new();
+        let mut get = |_: usize, b: &mut Vec<u8>| {
+            b.clear();
+            b.extend_from_slice(line);
+        };
         assert_eq!(
-            find_quote_match(Pos::new(0, 0), &mut get, 1),
+            find_quote_match(Pos::new(0, 0), &mut get, &mut scratch, 1),
             Some(Pos::new(0, 6))
         );
         assert_eq!(
-            find_quote_match(Pos::new(0, 6), &mut get, 1),
+            find_quote_match(Pos::new(0, 6), &mut get, &mut scratch, 1),
             Some(Pos::new(0, 0))
         );
     }
@@ -2775,13 +2821,17 @@ mod tests {
         // "\"foo\"" — bytes: " \ " f o o \ " " (9 bytes)
         // Unescaped quotes at byte 0 and 8, escaped at 2 and 7
         let line = br#""\"foo\"""#;
-        let mut get = |_: usize| line.to_vec();
+        let mut scratch = Vec::new();
+        let mut get = |_: usize, b: &mut Vec<u8>| {
+            b.clear();
+            b.extend_from_slice(line);
+        };
         assert_eq!(
-            find_quote_match(Pos::new(0, 0), &mut get, 1),
+            find_quote_match(Pos::new(0, 0), &mut get, &mut scratch, 1),
             Some(Pos::new(0, 8))
         );
         assert_eq!(
-            find_quote_match(Pos::new(0, 8), &mut get, 1),
+            find_quote_match(Pos::new(0, 8), &mut get, &mut scratch, 1),
             Some(Pos::new(0, 0))
         );
     }
@@ -2789,23 +2839,27 @@ mod tests {
     #[test]
     fn test_quote_match_multiple_pairs() {
         let line = br#""a" "b""#;
-        let mut get = |_: usize| line.to_vec();
+        let mut scratch = Vec::new();
+        let mut get = |_: usize, b: &mut Vec<u8>| {
+            b.clear();
+            b.extend_from_slice(line);
+        };
         // First pair: 0↔2
         assert_eq!(
-            find_quote_match(Pos::new(0, 0), &mut get, 1),
+            find_quote_match(Pos::new(0, 0), &mut get, &mut scratch, 1),
             Some(Pos::new(0, 2))
         );
         assert_eq!(
-            find_quote_match(Pos::new(0, 2), &mut get, 1),
+            find_quote_match(Pos::new(0, 2), &mut get, &mut scratch, 1),
             Some(Pos::new(0, 0))
         );
         // Second pair: 4↔6
         assert_eq!(
-            find_quote_match(Pos::new(0, 4), &mut get, 1),
+            find_quote_match(Pos::new(0, 4), &mut get, &mut scratch, 1),
             Some(Pos::new(0, 6))
         );
         assert_eq!(
-            find_quote_match(Pos::new(0, 6), &mut get, 1),
+            find_quote_match(Pos::new(0, 6), &mut get, &mut scratch, 1),
             Some(Pos::new(0, 4))
         );
     }
@@ -2814,38 +2868,63 @@ mod tests {
     fn test_quote_match_unmatched() {
         // Odd number of quotes → last one has no pair
         let line = br#""a" ""#;
-        let mut get = |_: usize| line.to_vec();
-        assert_eq!(find_quote_match(Pos::new(0, 4), &mut get, 1), None);
+        let mut scratch = Vec::new();
+        let mut get = |_: usize, b: &mut Vec<u8>| {
+            b.clear();
+            b.extend_from_slice(line);
+        };
+        assert_eq!(
+            find_quote_match(Pos::new(0, 4), &mut get, &mut scratch, 1),
+            None
+        );
     }
 
     #[test]
     fn test_quote_match_not_on_quote() {
         let line = b"hello";
-        let mut get = |_: usize| line.to_vec();
-        assert_eq!(find_quote_match(Pos::new(0, 2), &mut get, 1), None);
+        let mut scratch = Vec::new();
+        let mut get = |_: usize, b: &mut Vec<u8>| {
+            b.clear();
+            b.extend_from_slice(line);
+        };
+        assert_eq!(
+            find_quote_match(Pos::new(0, 2), &mut get, &mut scratch, 1),
+            None
+        );
     }
 
     #[test]
     fn test_quote_match_escaped_under_cursor() {
         // Cursor on an escaped quote → no match
         let line = br#""\""#;
-        let mut get = |_: usize| line.to_vec();
+        let mut scratch = Vec::new();
+        let mut get = |_: usize, b: &mut Vec<u8>| {
+            b.clear();
+            b.extend_from_slice(line);
+        };
         // byte 1 is \, byte 2 is escaped "
-        assert_eq!(find_quote_match(Pos::new(0, 2), &mut get, 1), None);
+        assert_eq!(
+            find_quote_match(Pos::new(0, 2), &mut get, &mut scratch, 1),
+            None
+        );
     }
 
     #[test]
     fn test_quote_match_double_backslash() {
         // \\" — two backslashes then quote; even backslashes = not escaped
         let line = br##""\\""##;
-        let mut get = |_: usize| line.to_vec();
+        let mut scratch = Vec::new();
+        let mut get = |_: usize, b: &mut Vec<u8>| {
+            b.clear();
+            b.extend_from_slice(line);
+        };
         // bytes: " \ \ " — positions 0 and 3 are unescaped quotes
         assert_eq!(
-            find_quote_match(Pos::new(0, 0), &mut get, 1),
+            find_quote_match(Pos::new(0, 0), &mut get, &mut scratch, 1),
             Some(Pos::new(0, 3))
         );
         assert_eq!(
-            find_quote_match(Pos::new(0, 3), &mut get, 1),
+            find_quote_match(Pos::new(0, 3), &mut get, &mut scratch, 1),
             Some(Pos::new(0, 0))
         );
     }
