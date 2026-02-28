@@ -20,11 +20,15 @@ use std::path::Path;
 use std::process;
 
 fn confirm(prompt: &str) -> bool {
-    eprint!("{} (y/n) ", prompt);
+    // Use alternate screen so the prompt doesn't pollute terminal history
+    eprint!("\x1b[?1049h\x1b[2J\x1b[H{} (y/n) ", prompt);
     io::stderr().flush().unwrap();
     let mut buf = String::new();
     io::stdin().read_line(&mut buf).unwrap();
-    buf.trim().eq_ignore_ascii_case("y")
+    let result = buf.trim().eq_ignore_ascii_case("y");
+    eprint!("\x1b[?1049l");
+    io::stderr().flush().unwrap();
+    result
 }
 
 type LoadResult = Result<Option<(Vec<u8>, Option<String>)>, String>;

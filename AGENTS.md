@@ -232,7 +232,7 @@ Usage: e [file]
 ```
 
 - More than 1 argument after the binary name → error with `"Usage: e [file]"`.
-- If file exists: check size (>5MB prompts y/n confirmation via stderr), read file, check for binary content (null bytes in first 8KB → prompts y/n).
+- If file exists: check size (>5MB prompts y/n confirmation), read file, check for binary content (null bytes in first 8KB → prompts y/n). Both confirmations are shown in the alternate screen buffer (`\x1b[?1049h`/`\x1b[?1049l`) so they don't pollute terminal history.
 - If file doesn't exist: empty buffer with filename set.
 - No file argument + piped stdin: read all stdin data, create unnamed buffer.
 - No file argument + no pipe: empty unnamed buffer.
