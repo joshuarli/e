@@ -41,10 +41,10 @@ fn strip_trailing_whitespace_and_ensure_newline(data: &[u8]) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// Directory for lock files and future buffer backups: `~/.config/e/buffers/`
-fn buffers_dir() -> PathBuf {
+/// Directory for lock files: `~/.config/e/locks/`
+fn locks_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".config/e/buffers")
+    PathBuf::from(home).join(".config/e/locks")
 }
 
 /// Encode an absolute file path for use as a filename.
@@ -62,9 +62,9 @@ fn encode_path(path: &Path) -> String {
     out
 }
 
-/// Compute lock file path: `~/.config/e/buffers/<encoded_path>.elock`
+/// Compute lock file path: `~/.config/e/locks/<encoded_path>.elock`
 pub fn lock_path(path: &Path) -> PathBuf {
-    buffers_dir().join(format!("{}.elock", encode_path(path)))
+    locks_dir().join(format!("{}.elock", encode_path(path)))
 }
 
 /// Resolve a path to absolute. Uses canonicalize if the file exists,
@@ -94,8 +94,8 @@ pub fn acquire_lock(path: &Path) -> Result<(), String> {
             lock.display()
         ));
     }
-    let dir = buffers_dir();
-    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create buffers dir: {}", e))?;
+    let dir = locks_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create locks dir: {}", e))?;
     fs::File::create(&lock).map_err(|e| format!("Failed to create lock file: {}", e))?;
     Ok(())
 }
@@ -1142,7 +1142,7 @@ mod tests {
         let lp = lock_path(path);
         let s = lp.to_string_lossy();
         assert!(s.ends_with(".elock"));
-        assert!(s.contains("buffers"));
+        assert!(s.contains("locks"));
     }
 
     #[test]

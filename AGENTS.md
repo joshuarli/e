@@ -243,7 +243,7 @@ Uses `libc::isatty(0) == 0`. If piped, reads all stdin data into `Vec<u8>` befor
 
 ### File locking
 
-Before creating the Editor, acquires a file lock via `file_io::acquire_lock()`. On exit, releases via `file_io::release_lock()`. Lock files live at `~/.config/e/buffers/<encoded_path>.elock` where path encoding replaces `/` with `%2F` and `%` with `%25`.
+Before creating the Editor, acquires a file lock via `file_io::acquire_lock()`. On exit, releases via `file_io::release_lock()`. Lock files live at `~/.config/e/locks/<encoded_path>.elock` where path encoding replaces `/` with `%2F` and `%` with `%25`. If a lock already exists, a prompt is shown in the alternate screen asking whether to delete the stale lock and open anyway; answering `n` exits cleanly.
 
 ## 5. Event Loop
 
@@ -873,10 +873,10 @@ Languages include (with comment syntax): Rust (//), C (//), C++ (//), Go (//), J
 
 ### File locking
 
-- Lock directory: `~/.config/e/buffers/`
+- Lock directory: `~/.config/e/locks/`
 - `encode_path(path) -> String`: `/` → `%2F`, `%` → `%25`.
 - `resolve_absolute(path)`: canonicalizes, or canonicalizes parent + filename for non-existent files.
-- `acquire_lock(path) -> Result<(), String>`: creates `<encoded_abs_path>.elock` in buffers dir. Errors if file already exists.
+- `acquire_lock(path) -> Result<(), String>`: creates `<encoded_abs_path>.elock` in locks dir. Errors if file already exists.
 - `release_lock(path)`: removes lock file, ignores errors.
 
 ### Persistent undo history
@@ -1034,7 +1034,7 @@ Reverse video (`\x1b[0;7m`). Full width.
 | `~/.config/e/keybindings.ini` | Keybinding overrides |
 | `~/.config/e/undo.bin` | Persistent undo history (all files) |
 | `~/.config/e/cursor.bin` | Cursor position persistence (all files) |
-| `~/.config/e/buffers/<encoded>.elock` | File lock files |
+| `~/.config/e/locks/<encoded>.elock` | File lock files |
 
 ## 23. Indent Rules
 

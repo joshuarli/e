@@ -110,9 +110,18 @@ fn main() {
     // Acquire file lock
     if let Some(ref name) = filename {
         let path = Path::new(name);
-        if let Err(msg) = file_io::acquire_lock(path) {
-            eprintln!("e: {}", msg);
-            process::exit(1);
+        if file_io::acquire_lock(path).is_err() {
+            if !confirm(&format!(
+                "e: {} is already open in another instance. Delete lock and open anyway?",
+                name
+            )) {
+                process::exit(0);
+            }
+            file_io::release_lock(path);
+            if let Err(e) = file_io::acquire_lock(path) {
+                eprintln!("e: {}", e);
+                process::exit(1);
+            }
         }
     }
 

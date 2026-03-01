@@ -29,7 +29,7 @@ e [file]
 
 ### File locking
 
-When opening a named file, acquire a lock file at `~/.config/e/buffers/<encoded_path>.elock`. If the lock already exists, print an error and exit. The path is encoded by replacing `/` with `%2F` and `%` with `%25`. On exit, the lock is released.
+When opening a named file, acquire a lock file at `~/.config/e/locks/<encoded_path>.elock`. If the lock already exists, a prompt is shown in the alternate screen asking whether to delete the stale lock and open anyway. The path is encoded by replacing `/` with `%2F` and `%` with `%25`. On exit, the lock is released.
 
 ### Restored state
 
@@ -441,7 +441,7 @@ All persistent data is stored under `~/.config/e/`.
 | `keybindings.ini` | User keybinding overrides |
 | `undo.bin` | Undo history for all files (single binary database) |
 | `cursor.bin` | Last cursor position per file |
-| `buffers/<path>.elock` | File lock files |
+| `locks/<path>.elock` | File lock files |
 
 ### Undo history format
 
