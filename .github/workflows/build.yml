@@ -1,0 +1,52 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal --target aarch64-apple-darwin
+          rustup default nightly-2026-03-01
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache Zig
+        id: cache-zig
+        uses: actions/cache@v4
+        with:
+          path: zig-linux-x86_64-0.15.2
+          key: zig-0.15.2
+
+      - name: Install Zig
+        if: steps.cache-zig.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz | tar -xJ
+          echo "$PWD/zig-linux-x86_64-0.15.2" >> $GITHUB_PATH
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild
+
+      - name: Test
+        run: cargo test
+
+      - name: Build
+        run: cargo zigbuild --target aarch64-apple-darwin --release
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" "target/aarch64-apple-darwin/release/e#e-${{ github.ref_name }}-aarch64-apple-darwin" --title "${{ github.ref_name }}"
