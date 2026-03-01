@@ -1,5 +1,8 @@
 name: Build
 
+# gh api repos/joshuarli/e/actions/permissions/workflow --method PUT
+#   --field default_workflow_permissions=write
+
 on:
   push:
     tags:
