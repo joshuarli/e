@@ -844,6 +844,8 @@ impl Editor {
             CommandAction::CommentOff => self.set_comment(false),
             CommandAction::SelectAll => self.select_all(),
             CommandAction::Trim => self.strip_trailing_whitespace(),
+            CommandAction::TabsToSpaces => self.tabs_to_spaces(),
+            CommandAction::SpacesToTabs => self.spaces_to_tabs(),
             CommandAction::StatusMsg(msg) => self.set_status(msg),
         }
     }
@@ -2320,6 +2322,74 @@ impl Editor {
         if c.col > line_len {
             self.set_cursor(Pos::new(c.line, line_len));
         }
+    }
+
+    fn tabs_to_spaces(&mut self) {
+        let line_count = self.doc.buf.line_count();
+        self.doc.seal_undo();
+        for line_idx in 0..line_count {
+            let text = self.doc.buf.line_text(line_idx);
+            if !text.contains(&b'\t') {
+                continue;
+            }
+            let mut new_text = Vec::with_capacity(text.len() * 2);
+            for &b in &text {
+                if b == b'\t' {
+                    new_text.extend_from_slice(b"  ");
+                } else {
+                    new_text.push(b);
+                }
+            }
+            let char_len = crate::buffer::char_count(&text);
+            self.doc
+                .delete_range(Pos::new(line_idx, 0), Pos::new(line_idx, char_len));
+            self.doc.insert(line_idx, 0, &new_text);
+        }
+        self.doc.seal_undo();
+        let c = self.cursor();
+        let line_len = self.doc.buf.line_char_len(c.line);
+        if c.col > line_len {
+            self.set_cursor(Pos::new(c.line, line_len));
+        }
+        self.set_status("Converted tabs to spaces".to_string());
+    }
+
+    fn spaces_to_tabs(&mut self) {
+        let line_count = self.doc.buf.line_count();
+        self.doc.seal_undo();
+        for line_idx in 0..line_count {
+            let text = self.doc.buf.line_text(line_idx);
+            // Only convert leading whitespace (indentation)
+            let mut new_text = Vec::with_capacity(text.len());
+            let mut i = 0;
+            while i < text.len() {
+                if text[i] == b'\t' {
+                    new_text.push(b'\t');
+                    i += 1;
+                } else if i + 1 < text.len() && text[i] == b' ' && text[i + 1] == b' ' {
+                    new_text.push(b'\t');
+                    i += 2;
+                } else {
+                    // End of leading whitespace (or lone space): copy rest verbatim
+                    new_text.extend_from_slice(&text[i..]);
+                    break;
+                }
+            }
+            if new_text == text {
+                continue;
+            }
+            let char_len = crate::buffer::char_count(&text);
+            self.doc
+                .delete_range(Pos::new(line_idx, 0), Pos::new(line_idx, char_len));
+            self.doc.insert(line_idx, 0, &new_text);
+        }
+        self.doc.seal_undo();
+        let c = self.cursor();
+        let line_len = self.doc.buf.line_char_len(c.line);
+        if c.col > line_len {
+            self.set_cursor(Pos::new(c.line, line_len));
+        }
+        self.set_status("Converted spaces to tabs".to_string());
     }
 
     fn check_external_modification(&mut self) {
@@ -3810,6 +3880,34 @@ mod tests {
         assert_eq!(e.test_text(), "hello\nworld");
         // Cursor should be clamped
         assert!(e.cursor().col <= 5);
+    }
+
+    #[test]
+    fn test_tabs_to_spaces() {
+        let mut e = ed("\thello\n\t\tworld");
+        e.tabs_to_spaces();
+        assert_eq!(e.test_text(), "  hello\n    world");
+    }
+
+    #[test]
+    fn test_tabs_to_spaces_mid_line() {
+        let mut e = ed("a\tb");
+        e.tabs_to_spaces();
+        assert_eq!(e.test_text(), "a  b");
+    }
+
+    #[test]
+    fn test_spaces_to_tabs_leading_only() {
+        let mut e = ed("    hello  world");
+        e.spaces_to_tabs();
+        assert_eq!(e.test_text(), "\t\thello  world");
+    }
+
+    #[test]
+    fn test_spaces_to_tabs_odd_spaces() {
+        let mut e = ed("   hello");
+        e.spaces_to_tabs();
+        assert_eq!(e.test_text(), "\t hello");
     }
 
     #[test]

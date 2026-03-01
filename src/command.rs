@@ -66,6 +66,8 @@ pub enum CommandAction {
     Find(String),
     SelectAll,
     Trim,
+    TabsToSpaces,
+    SpacesToTabs,
     StatusMsg(String),
 }
 
@@ -87,6 +89,8 @@ impl CommandRegistry {
         commands.insert("comment".to_string(), cmd_comment);
         commands.insert("selectall".to_string(), cmd_selectall);
         commands.insert("trim".to_string(), cmd_trim);
+        commands.insert("tabstospaces".to_string(), cmd_tabstospaces);
+        commands.insert("spacestotabs".to_string(), cmd_spacestotabs);
 
         Self { commands }
     }
@@ -184,6 +188,14 @@ fn cmd_selectall(_args: &str, ctx: &mut CommandContext) {
 
 fn cmd_trim(_args: &str, ctx: &mut CommandContext) {
     ctx.action = CommandAction::Trim;
+}
+
+fn cmd_tabstospaces(_args: &str, ctx: &mut CommandContext) {
+    ctx.action = CommandAction::TabsToSpaces;
+}
+
+fn cmd_spacestotabs(_args: &str, ctx: &mut CommandContext) {
+    ctx.action = CommandAction::SpacesToTabs;
 }
 
 #[cfg(test)]
