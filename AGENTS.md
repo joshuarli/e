@@ -689,6 +689,7 @@ pub struct Renderer {
      - **Content**: two paths:
        - **Slow path** (selection, find matches, or bracket matches present): per-character rendering with priority: selection (reverse video `\x1b[7m`) > find match (yellow bg `\x1b[43;30m`, current match green bg `\x1b[42;30m`) > bracket match (magenta bg `\x1b[45;30m`) > tab pipe (dark grey `\x1b[90m`) > syntax highlight. Bracket match highlights only the *matching* character (not the cursor's character — the terminal cursor already shows the cursor position).
        - **Fast path** (no overlays): streaming syntax highlighting with minimal escape changes. Tab pipes handled inline.
+       - **`CtrlSafe(char)`**: all character writes (both paths, except tab-pipe spaces) go through this `Display` wrapper. Control characters U+0000–U+001F (excluding tab/newline, which are pre-expanded or absent) and U+007F are rendered as `^X` notation in reverse video (`\x1b[7m^X\x1b[27m`) rather than being written raw, which would inject stray escape sequences into the terminal output.
      - Reset and erase to end of line: `\x1b[0m\x1b[K`.
 8. Fill remaining rows with empty lines (blank gutters if ruler on).
 9. **Completions**: dim text (`\x1b[2m`) on rows above status bar.

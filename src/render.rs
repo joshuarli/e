@@ -5,6 +5,22 @@ use crate::highlight::{self, HlState, HlType, SyntaxRules};
 use crate::selection::{Pos, Selection};
 use crate::view::View;
 
+/// Wraps a `char` for safe terminal output.
+/// Control characters (U+0000–U+001F except tab/newline, and U+007F) are
+/// rendered as `^X` notation in reverse video instead of being written raw,
+/// which would corrupt the terminal by injecting stray escape sequences.
+struct CtrlSafe(char);
+
+impl std::fmt::Display for CtrlSafe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 as u32 {
+            0..=8 | 11..=31 => write!(f, "\x1b[7m^{}\x1b[27m", char::from(b'@' + self.0 as u8)),
+            127 => f.write_str("\x1b[7m^?\x1b[27m"),
+            _ => write!(f, "{}", self.0),
+        }
+    }
+}
+
 /// Compute gutter width: width of the largest line number + 1 (trailing space).
 pub fn gutter_width(line_count: usize) -> usize {
     let n = if line_count == 0 { 1 } else { line_count };
@@ -334,16 +350,16 @@ impl Renderer {
                             if is_tab_pipe {
                                 write!(w, "\x1b[7;90m{}\x1b[0m", ch)?;
                             } else {
-                                write!(w, "\x1b[7m{}\x1b[0m", ch)?;
+                                write!(w, "\x1b[7m{}\x1b[0m", CtrlSafe(ch))?;
                             }
                         } else if let Some((_, _, is_current)) = find_hit {
                             if *is_current {
-                                write!(w, "\x1b[42;30m{}\x1b[0m", ch)?;
+                                write!(w, "\x1b[42;30m{}\x1b[0m", CtrlSafe(ch))?;
                             } else {
-                                write!(w, "\x1b[43;30m{}\x1b[0m", ch)?;
+                                write!(w, "\x1b[43;30m{}\x1b[0m", CtrlSafe(ch))?;
                             }
                         } else if is_bracket_match {
-                            write!(w, "\x1b[45;30m{}\x1b[0m", ch)?;
+                            write!(w, "\x1b[45;30m{}\x1b[0m", CtrlSafe(ch))?;
                         } else if is_tab_pipe {
                             write!(w, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
@@ -357,9 +373,9 @@ impl Renderer {
                             };
                             let code = ht.ansi_code();
                             if code.is_empty() {
-                                write!(w, "{}", ch)?;
+                                write!(w, "{}", CtrlSafe(ch))?;
                             } else {
-                                write!(w, "{}{}\x1b[0m", code, ch)?;
+                                write!(w, "{}{}\x1b[0m", code, CtrlSafe(ch))?;
                             }
                         }
                     }
@@ -398,7 +414,7 @@ impl Renderer {
                                 }
                                 current_hl = ht;
                             }
-                            write!(w, "{}", ch)?;
+                            write!(w, "{}", CtrlSafe(ch))?;
                         }
                     }
                     if current_hl != HlType::Normal {
