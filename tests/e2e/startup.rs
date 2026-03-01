@@ -131,7 +131,7 @@ fn version_in_status_bar() {
     let mut e = TestEditor::new(&[]);
     let sb = e.status_bar();
     assert!(
-        sb.contains("e v0.1.0"),
+        sb.contains(concat!("e v", env!("CARGO_PKG_VERSION"))),
         "status bar should show version, got: {sb}"
     );
 }

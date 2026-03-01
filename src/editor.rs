@@ -1096,7 +1096,13 @@ impl Editor {
     }
 
     fn set_find_status(&mut self) {
-        self.status_msg = format!("Find: {}", self.find_pattern);
+        let n = self.find_matches.len();
+        self.status_msg = format!(
+            "Find: {} ({} match{})",
+            self.find_pattern,
+            n,
+            if n == 1 { "" } else { "es" }
+        );
         self.status_time = None; // don't auto-expire while browsing
     }
 

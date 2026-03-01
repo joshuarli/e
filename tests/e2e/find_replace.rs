@@ -110,11 +110,11 @@ fn find_smart_case() {
     // Lowercase pattern → case-insensitive
     e.type_text("hello");
     e.enter();
-    let sb = e.status_bar();
-    // Should find all 3 matches
+    let cl = e.command_line();
+    // Should find all 3 matches — match count visible in command line
     assert!(
-        sb.contains("3"),
-        "lowercase 'hello' should match all 3 case-insensitively, got: {sb}"
+        cl.contains("3"),
+        "lowercase 'hello' should match all 3 case-insensitively, got: {cl}"
     );
     e.escape();
 }

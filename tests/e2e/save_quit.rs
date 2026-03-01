@@ -112,10 +112,10 @@ fn quit_dirty_prompts() {
     e.type_text("x"); // make dirty
     e.ctrl('q');
     // Should show quit confirmation
-    let sb = e.status_bar();
+    let cl = e.command_line();
     assert!(
-        sb.contains("Save") || sb.contains("save") || sb.contains("(y/n)"),
-        "should show save confirmation, got: {sb}"
+        cl.contains("Save") || cl.contains("save") || cl.contains("(y/n)"),
+        "should show save confirmation, got: {cl}"
     );
     // Answer 'n' to not save
     e.send_raw(b"n");
