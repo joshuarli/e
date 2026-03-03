@@ -21,8 +21,8 @@ release:
 install: release
   sudo cp target/{{target}}/release/{{ name }} /usr/local/bin/{{ name }}
 
-test:
-  cargo test --test e2e -- --test-threads=4
+test *args:
+  cargo test -- --test-threads=4
 
 # Record e2e tests as asciicast .cast files (single-threaded for clean capture)
 record:

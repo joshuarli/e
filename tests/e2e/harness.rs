@@ -339,14 +339,14 @@ impl TestEditor {
             Ok(data) => self.process_output(&data),
             Err(_) => panic!("Editor produced no output during startup"),
         }
-        self.drain_timeout(Duration::from_millis(100));
+        self.drain_timeout(Duration::from_millis(30));
     }
 
     // --- sending input ------------------------------------------------------
 
     /// Wait for the editor to finish rendering after an action.
     pub fn wait(&mut self) {
-        self.drain_timeout(Duration::from_millis(80));
+        self.drain_timeout(Duration::from_millis(15));
     }
 
     /// Send raw bytes to the editor's stdin.
