@@ -67,12 +67,13 @@ fn auto_close_char(c: char, lang_name: Option<&str>) -> Option<char> {
         // Skip single-quote autoclose for plain Text and Markdown: apostrophes
         // and contractions make it far too noisy there.
         '\'' if lang_name.is_some_and(|n| n != "Markdown") => Some('\''),
+        '`' => Some('`'),
         _ => None,
     }
 }
 
 fn is_close_char(c: char) -> bool {
-    matches!(c, ')' | ']' | '}' | '"' | '\'')
+    matches!(c, ')' | ']' | '}' | '"' | '\'' | '`')
 }
 
 fn is_paste_start(ev: &Event) -> bool {
@@ -1876,12 +1877,49 @@ impl Editor {
         if !self.sel.is_empty() {
             self.delete_selection();
         }
-        let line_text = self.doc.buf.line_text(self.cursor().line);
+        let c = self.cursor();
+        let line_text = self.doc.buf.line_text(c.line);
         let indent: Vec<u8> = line_text
             .iter()
             .take_while(|&&b| b == b' ' || b == b'\t')
             .copied()
             .collect();
+
+        // Between bracket pairs ({|}, (|), [|]): split with extra indent level.
+        if c.col > 0 {
+            let ls = self.doc.buf.line_start(c.line);
+            let le = self.doc.buf.line_end(c.line);
+            let prev = self.doc.buf.byte_at(ls + c.col - 1);
+            let close_opt = match prev {
+                b'(' => Some(b')'),
+                b'[' => Some(b']'),
+                b'{' => Some(b'}'),
+                _ => None,
+            };
+            if let Some(close) = close_opt
+                && ls + c.col < le
+                && self.doc.buf.byte_at(ls + c.col) == close
+            {
+                let use_tab = self.doc.filename.as_ref().is_some_and(|f| {
+                    f.ends_with(".c")
+                        || f.ends_with(".h")
+                        || f.ends_with(".go")
+                        || f.contains("Makefile")
+                });
+                let extra: &[u8] = if use_tab { b"\t" } else { b"  " };
+                let mut split = vec![b'\n'];
+                split.extend_from_slice(&indent);
+                split.extend_from_slice(extra);
+                let cursor_col = indent.len() + extra.len();
+                split.push(b'\n');
+                split.extend_from_slice(&indent);
+                self.doc.seal_undo();
+                self.doc.insert(c.line, c.col, &split);
+                self.doc.seal_undo();
+                self.set_cursor(Pos::new(c.line + 1, cursor_col));
+                return;
+            }
+        }
 
         let mut newline = vec![b'\n'];
         newline.extend_from_slice(&indent);
@@ -2968,6 +3006,52 @@ mod tests {
         };
         e.insert_newline();
         assert_eq!(e.test_text(), "hello\n");
+    }
+
+    #[test]
+    fn test_insert_newline_between_braces() {
+        let mut e = ed("{}");
+        e.set_cursor(Pos::new(0, 1));
+        e.insert_newline();
+        assert_eq!(e.test_text(), "{\n  \n}");
+        assert_eq!(e.cursor(), Pos::new(1, 2));
+    }
+
+    #[test]
+    fn test_insert_newline_between_parens() {
+        let mut e = ed("()");
+        e.set_cursor(Pos::new(0, 1));
+        e.insert_newline();
+        assert_eq!(e.test_text(), "(\n  \n)");
+        assert_eq!(e.cursor(), Pos::new(1, 2));
+    }
+
+    #[test]
+    fn test_insert_newline_between_brackets() {
+        let mut e = ed("[]");
+        e.set_cursor(Pos::new(0, 1));
+        e.insert_newline();
+        assert_eq!(e.test_text(), "[\n  \n]");
+        assert_eq!(e.cursor(), Pos::new(1, 2));
+    }
+
+    #[test]
+    fn test_insert_newline_between_braces_preserves_indent() {
+        let mut e = ed("  {}");
+        e.set_cursor(Pos::new(0, 3));
+        e.insert_newline();
+        assert_eq!(e.test_text(), "  {\n    \n  }");
+        assert_eq!(e.cursor(), Pos::new(1, 4));
+    }
+
+    #[test]
+    fn test_insert_newline_not_between_pair_no_split() {
+        // Cursor after `{` but no closing `}` immediately after — normal newline.
+        let mut e = ed("{hello}");
+        e.set_cursor(Pos::new(0, 1));
+        e.insert_newline();
+        assert_eq!(e.test_text(), "{\nhello}");
+        assert_eq!(e.cursor(), Pos::new(1, 0));
     }
 
     #[test]
@@ -5647,6 +5731,31 @@ mod tests {
     fn test_autoclose_backspace_deletes_single_quote_pair() {
         let mut e = ed("");
         e.insert_char('\'');
+        e.backspace();
+        assert_eq!(e.test_text(), "");
+    }
+
+    #[test]
+    fn test_autoclose_backtick() {
+        let mut e = ed("");
+        e.insert_char('`');
+        assert_eq!(e.test_text(), "``");
+        assert_eq!(e.cursor(), Pos::new(0, 1));
+    }
+
+    #[test]
+    fn test_autoclose_skip_closing_backtick() {
+        let mut e = ed("");
+        e.insert_char('`');
+        e.insert_char('`');
+        assert_eq!(e.test_text(), "``");
+        assert_eq!(e.cursor(), Pos::new(0, 2));
+    }
+
+    #[test]
+    fn test_autoclose_backspace_deletes_backtick_pair() {
+        let mut e = ed("");
+        e.insert_char('`');
         e.backspace();
         assert_eq!(e.test_text(), "");
     }

@@ -394,11 +394,11 @@ ctrl+q = quit
 
 1. If selection active and char has auto-close pair: wrap selection with pair chars. E.g., selecting `foo` and typing `(` → `(foo)` with inner text selected.
 2. If selection active otherwise: delete selection first.
-3. **Skip-over**: if char is a closing char (`)]}"'`) and the next char in buffer matches → just advance cursor (don't insert).
+3. **Skip-over**: if char is a closing char (`)]}"'\``) and the next char in buffer matches → just advance cursor (don't insert).
 4. **Auto-close**: if char has auto-close pair and next char is a boundary (space, tab, close-char, or end-of-line) → insert both chars, place cursor between them.
 5. Otherwise: insert character normally.
 
-Auto-close pairs: `(→)`, `[→]`, `{→}`, `"→"`, `'→'`. Exception: single-quote autoclose is suppressed for plain Text (no detected language) and Markdown, where apostrophes and contractions make it too noisy.
+Auto-close pairs: `(→)`, `[→]`, `{→}`, `"→"`, `'→'`, `` `→` ``. Exception: single-quote autoclose is suppressed for plain Text (no detected language) and Markdown, where apostrophes and contractions make it too noisy.
 
 ### Insert tab (`insert_tab`)
 
@@ -409,14 +409,15 @@ Auto-close pairs: `(→)`, `[→]`, `{→}`, `"→"`, `'→'`. Exception: single
 
 1. Delete selection if active.
 2. Copy leading whitespace (spaces + tabs) from current line.
-3. Insert `\n` + copied indent.
-4. Seal undo before and after.
+3. **Bracket-split**: if the character immediately before the cursor is `{`, `(`, or `[` and the character at the cursor is its matching close, insert `\n<indent><extra>\n<indent>` and place the cursor on the inner indented line (pushing the closing bracket to its own line at the original indent). Uses the same tab/spaces heuristic as `insert_tab`.
+4. Otherwise: insert `\n` + copied indent.
+5. Seal undo before and after.
 
 ### Backspace
 
 1. If selection active: delete selection.
 2. If in leading whitespace, col >= 2, col is even, all spaces before cursor: delete 2 spaces (smart dedent).
-3. If cursor is between an auto-close pair (prev char's close matches next char): delete both characters.
+3. If cursor is between an auto-close pair (prev char's auto-close matches next char, covering all pairs including `` ` ``): delete both characters.
 4. Otherwise: delete one character backward.
 5. At column 0: join with previous line (delete the newline at end of previous line).
 
