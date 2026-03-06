@@ -354,3 +354,16 @@ fn tab_indents_selection() {
     assert!(r0.contains("  line one"), "should indent line 1, got: {r0}");
     assert!(r1.contains("  line two"), "should indent line 2, got: {r1}");
 }
+
+#[test]
+fn enter_on_empty_buffer_moves_cursor_down() {
+    let mut e = TestEditor::new(&[]);
+    let (r0, _) = e.cursor();
+    e.enter();
+    let (r1, _) = e.cursor();
+    assert_eq!(
+        r1,
+        r0 + 1,
+        "Enter on empty buffer should move cursor down one row; was {r0} -> {r1}"
+    );
+}

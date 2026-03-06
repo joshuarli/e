@@ -490,10 +490,12 @@ impl TestEditor {
         self.parser.screen().cursor_position()
     }
 
-    /// Whether the cursor is currently visible.
+    /// Whether the software cursor is visible (drawn as bold+reverse at cursor pos).
     pub fn cursor_visible(&mut self) -> bool {
         self.drain_available();
-        !self.parser.screen().hide_cursor()
+        let (row, col) = self.parser.screen().cursor_position();
+        let cell = self.parser.screen().cell(row, col);
+        cell.is_some_and(|c| c.bold() && c.inverse())
     }
 
     /// The status bar row (second-to-last).

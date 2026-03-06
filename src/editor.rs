@@ -221,7 +221,7 @@ impl Editor {
 
         write!(
             stdout,
-            "\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1004h"
+            "\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1004h\x1b[?25l"
         )?;
         stdout.flush()?;
 
@@ -316,7 +316,7 @@ impl Editor {
 
         write!(
             stdout,
-            "\x1b[?1004l\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l"
+            "\x1b[?1004l\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h"
         )?;
         stdout.flush()?;
         Ok(())
@@ -4207,6 +4207,16 @@ mod tests {
         e.set_cursor(Pos::new(0, 5));
         e.handle_key(Key::Char('\n'));
         assert_eq!(e.test_text(), "hello\n");
+        assert_eq!(e.cursor(), Pos::new(1, 0));
+    }
+
+    #[test]
+    fn test_newline_empty_buffer() {
+        let mut e = ed("");
+        assert_eq!(e.cursor(), Pos::new(0, 0));
+        e.handle_key(Key::Char('\n'));
+        assert_eq!(e.test_text(), "\n");
+        assert_eq!(e.cursor(), Pos::new(1, 0), "cursor should move to line 1");
     }
 
     #[test]

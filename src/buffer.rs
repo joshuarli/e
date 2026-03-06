@@ -193,7 +193,6 @@ impl GapBuffer {
             return;
         }
         let n = bytes.len();
-        let new_len = self.len_logical();
 
         // Line that contains pos (for min_dirty_line tracking)
         let insert_line = match self.line_starts.binary_search(&pos) {
@@ -215,7 +214,7 @@ impl GapBuffer {
             shift_from..shift_from,
             bytes.iter().enumerate().filter_map(|(k, &b)| {
                 let s = pos + k + 1;
-                (b == b'\n' && s < new_len).then_some(s)
+                (b == b'\n').then_some(s)
             }),
         );
 
@@ -812,12 +811,13 @@ mod tests {
 
     #[test]
     fn test_insert_trailing_newline() {
-        // Trailing newline does NOT create a new line entry
+        // Inserting \n at end of buffer creates a new (empty) line
         let mut buf = GapBuffer::from_text(b"hello");
         buf.insert(5, b"\n");
-        // "hello\n" — trailing newline, still 1 line
-        assert_eq!(buf.line_count(), 1);
+        // "hello\n" — 2 lines: "hello" and ""
+        assert_eq!(buf.line_count(), 2);
         assert_eq!(buf.line_text(0), b"hello");
+        assert_eq!(buf.line_text(1), b"");
     }
 
     #[test]

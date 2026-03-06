@@ -170,6 +170,8 @@ impl Renderer {
             .map(|s| s.ordered())
             .unwrap_or((Pos::zero(), Pos::zero()));
         let has_sel = selection.is_some_and(|s| !s.is_empty());
+        // Software cursor: draw reverse-video block when no selection/find/command cursor
+        let draw_cursor = !find_active && !has_sel && cmd_cursor.is_none();
 
         // Buffer all output, then write to terminal in one shot to avoid flicker.
         // Take the frame buffer out of self so we can still call self.X methods below.
@@ -179,7 +181,6 @@ impl Renderer {
 
         // Synchronized output: tell terminal to hold rendering until frame is complete
         write!(w, "\x1b[?2026h")?;
-        write!(w, "\x1b[?25l")?;
 
         // Compute per-line highlight states (lazy: only as far as the viewport needs)
         let buf_version = buf.version();
@@ -330,13 +331,17 @@ impl Renderer {
                 let chunk_start = wrap * text_cols;
                 let chunk_end = ((wrap + 1) * text_cols).min(char_count);
 
-                if need_per_char || has_find || has_bracket {
+                // Is the software cursor on this line?
+                let cursor_on_line = draw_cursor && line_idx == cursor_line;
+
+                if need_per_char || has_find || has_bracket || cursor_on_line {
                     for (i, ch) in line_str
                         .chars()
                         .enumerate()
                         .take(chunk_end)
                         .skip(chunk_start)
                     {
+                        let is_cursor = cursor_on_line && i == cursor_col;
                         let in_sel = need_per_char && i >= line_sel_start && i < line_sel_end;
                         let find_hit = self
                             .find_scratch
@@ -346,7 +351,18 @@ impl Renderer {
                             && i < self.tab_pipes_scratch.len()
                             && self.tab_pipes_scratch[i];
                         let is_bracket_match = bracket_match_col == Some(i);
-                        if in_sel {
+                        if is_cursor {
+                            let ht = if has_char_hl {
+                                self.char_hl_scratch
+                                    .get(i)
+                                    .copied()
+                                    .unwrap_or(HlType::Normal)
+                            } else {
+                                HlType::Normal
+                            };
+                            let code = ht.ansi_code();
+                            write!(w, "{}\x1b[1;7m{}\x1b[0m", code, CtrlSafe(ch))?;
+                        } else if in_sel {
                             if is_tab_pipe {
                                 write!(w, "\x1b[7;90m{}\x1b[0m", ch)?;
                             } else {
@@ -380,7 +396,7 @@ impl Renderer {
                         }
                     }
                 } else {
-                    // Fast path: syntax highlighting only
+                    // Fast path: syntax highlighting only (no cursor on this line)
                     let mut current_hl = HlType::Normal;
                     for (i, ch) in line_str
                         .chars()
@@ -420,6 +436,11 @@ impl Renderer {
                     if current_hl != HlType::Normal {
                         write!(w, "\x1b[0m")?;
                     }
+                }
+
+                // End-of-line cursor: draw reverse-video space when cursor is past last char
+                if cursor_on_line && cursor_col == chunk_end && chunk_end == char_count {
+                    write!(w, "\x1b[1;7m \x1b[0m")?;
                 }
 
                 write!(w, "\x1b[0m\x1b[K")?;
@@ -474,24 +495,25 @@ impl Renderer {
             write!(w, "\x1b[K")?;
         }
 
-        // Position cursor
-        if find_active || has_sel {
-            // Hide cursor while browsing find results or when selection is active
-            write!(w, "\x1b[?25l")?;
-        } else if let Some(col) = cmd_cursor {
-            // Blinking cursor in command buffer
+        // Position the virtual cursor for the vt parser (the real terminal cursor
+        // is permanently hidden; the software cursor is drawn inline above).
+        if let Some(col) = cmd_cursor
+            && !(find_active || has_sel)
+        {
+            // Software cursor in command line
             write!(w, "\x1b[{};{}H", cmd_row, col + 1)?;
-            write!(w, "\x1b[?25h")?;
-        } else {
+            let ch = command_line.and_then(|s| s.chars().nth(col)).unwrap_or(' ');
+            write!(w, "\x1b[1;7m{}\x1b[0m", ch)?;
+        }
+        // Always emit cursor position so the vt parser tracks it
+        {
             let screen_col = (cursor_col % text_cols.max(1)) + gw;
-            // Count screen rows from scroll position to cursor
             let cursor_wrap = cursor_col / text_cols.max(1);
             let screen_row = {
                 let mut sr = 0usize;
                 if cursor_line == view.scroll_line {
                     sr = cursor_wrap.saturating_sub(view.scroll_wrap);
                 } else {
-                    // Remaining wraps of scroll_line
                     buf.line_text_into(view.scroll_line, &mut self.line_buf);
                     let first_wraps = crate::view::wrapped_rows(
                         display_col_for_char_col(&self.line_buf, usize::MAX),
@@ -510,7 +532,6 @@ impl Renderer {
                 sr
             };
             write!(w, "\x1b[{};{}H", screen_row + 1, screen_col + 1)?;
-            write!(w, "\x1b[?25h")?;
         }
 
         // End synchronized output
@@ -814,7 +835,8 @@ mod tests {
         .unwrap();
 
         let s = String::from_utf8_lossy(&output);
-        assert!(s.contains("hello"));
+        // 'h' is rendered as software cursor (reverse video), rest follows
+        assert!(s.contains("ello"));
         assert!(s.contains("world"));
         assert!(s.contains("test.txt"));
         assert!(s.contains("Ln 1, Col 1"));
@@ -848,7 +870,8 @@ mod tests {
         .unwrap();
 
         let s = String::from_utf8_lossy(&output);
-        assert!(s.contains("hello"));
+        // 'h' is rendered as software cursor (reverse video), rest follows
+        assert!(s.contains("ello"));
         // No line numbers should appear
         // (gutter_width is 0 when ruler is off)
     }
@@ -1083,8 +1106,8 @@ mod tests {
         .unwrap();
 
         let s = String::from_utf8_lossy(&output);
-        // Cursor shown in command line area
-        assert!(s.contains("\x1b[?25h"));
+        // Software cursor drawn as bold+reverse in command line area
+        assert!(s.contains("\x1b[1;7m"));
     }
 
     #[test]
@@ -1114,11 +1137,9 @@ mod tests {
         )
         .unwrap();
 
-        // find_active=true should hide cursor
+        // find_active=true: no software cursor (no bold+reverse)
         let s = String::from_utf8_lossy(&output);
-        assert!(s.contains("\x1b[?25l"));
-        // And NOT contain show cursor at the end positioning
-        // (the only ?25h should not appear because find_active is true)
+        assert!(!s.contains("\x1b[1;7m"));
     }
 
     #[test]
