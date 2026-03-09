@@ -5,9 +5,11 @@ mod command_buffer;
 mod document;
 mod editor;
 mod file_io;
+mod find;
 mod highlight;
 mod keybind;
 mod language;
+mod mouse;
 mod operation;
 mod render;
 mod selection;
@@ -15,7 +17,7 @@ mod selection;
 mod signal;
 mod view;
 
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process;
 
@@ -85,7 +87,7 @@ fn load(
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let piped_stdin = unsafe { libc::isatty(0) } == 0;
+    let piped_stdin = !io::stdin().is_terminal();
 
     let stdin_data = if piped_stdin {
         let mut buf = Vec::new();

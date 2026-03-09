@@ -7,9 +7,15 @@ extern "C" fn sigwinch_handler(_: libc::c_int) {
 }
 
 pub fn register_sigwinch() {
+    // SAFETY: `sigaction` struct is zeroed (valid for this POD type), then populated with:
+    // - `sa_sigaction`: a valid `extern "C" fn(c_int)` cast to `sighandler_t`. The handler
+    //   only writes to an `AtomicBool`, which is async-signal-safe.
+    // - `sa_flags`: SA_RESTART so interrupted syscalls are transparently restarted.
+    // - `sa_mask`: zeroed, meaning no additional signals are blocked during the handler.
+    // The old action is discarded (null_mut) since we never need to restore it.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sigwinch_handler as *const () as usize;
+        sa.sa_sigaction = sigwinch_handler as *const () as libc::sighandler_t;
         sa.sa_flags = libc::SA_RESTART;
         libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
     }

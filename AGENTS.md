@@ -5,7 +5,7 @@ A performant, minimalist, intuitive terminal text editor in Rust.
 ## 1. Constraints
 
 - Rust 2024 edition
-- Exactly 3 dependencies: `termion` (4), `regex-lite` (0.1), `libc` (0.2)
+- 3 dependencies: `termion` (4), `regex-lite` (0.1), `libc` (0.2, signal handling only)
 - Single-file editing only — no tabs, no file browser, no split panes
 - macOS and Linux only (no Windows)
 - Binary name: `e`, package version: `0.1.0`
@@ -30,7 +30,9 @@ Ownership chain: `main.rs` → `Editor` → `Document` → `GapBuffer`
 ```
 src/
   main.rs            Entry point, arg parsing, file safety, file locking, piped stdin
-  editor.rs          Editor struct: all state, event loop, action dispatch
+  editor.rs          Editor struct: event loop, action dispatch, editing/movement/commands
+  find.rs            FindState: regex compilation, viewport match scanning, forward/backward search
+  mouse.rs           MouseState: multi-click detection, screen-to-buffer coordinate mapping
   buffer.rs          GapBuffer: Vec<u8> with gap, incremental line-start index
   document.rs        Wraps GapBuffer + UndoStack + dirty flag + filename
   selection.rs       Pos (line, col), Selection (anchor+cursor), word boundary helpers
@@ -41,10 +43,10 @@ src/
   command.rs         CommandRegistry: HashMap<String, CommandFn>, built-in commands
   command_buffer.rs  Modal mini-editor for command palette, find, goto, save-as, sudo password
   clipboard.rs       Platform-detected clipboard: pbcopy/wl-copy/xclip/xsel/internal fallback
-  file_io.rs         File read/write, CRLF normalization, binary detection, file locking,
+  file_io.rs         File read/write, CRLF normalization, binary detection, file locking (std::fs),
                      persistent undo (~/.config/e/undo.bin), cursor persistence (~/.config/e/cursor.bin)
   language.rs        Language detection by file extension (~45 languages), comment syntax
-  signal.rs          SIGWINCH handler via libc::sigaction + AtomicBool polling
+  signal.rs          SIGWINCH handler via libc::sigaction + AtomicBool polling (sole unsafe block)
   highlight.rs       Syntax highlighting: byte-by-byte highlighter, 16 language rule sets,
                      bracket/quote matching, semver detection
 ```
@@ -206,15 +208,8 @@ pub struct Editor {
     status_time: Option<Instant>,
     running: bool,
     quit_pending: bool,                // Waiting for y/n on dirty quit
-    last_click_time: Option<Instant>,  // For double/triple click detection
-    last_click_pos: Option<(u16, u16)>,
-    click_count: u8,                   // 1=single, 2=double, 3=triple
-    dragging: bool,
-    find_pattern: String,
-    find_matches: Vec<(Pos, Pos)>,     // Viewport-only matches, refreshed each draw()
-    find_re: Option<regex_lite::Regex>, // Compiled regex cached across keystrokes
-    find_current: Option<(Pos, Pos)>,  // Currently-navigated match
-    find_active: bool,                 // Browsing find results
+    mouse: MouseState,                 // Click detection, drag state (see mouse.rs)
+    find: FindState,                   // Search pattern, matches, regex (see find.rs)
     sudo_save_tmp: Option<String>,
     piped_stdin: bool,
     file_mtime: Option<SystemTime>,
@@ -239,7 +234,7 @@ Usage: e [file]
 
 ### Piped stdin detection
 
-Uses `libc::isatty(0) == 0`. If piped, reads all stdin data into `Vec<u8>` before anything else. The editor's background input thread then reads from `/dev/tty` instead of stdin.
+Uses `std::io::IsTerminal` to detect piped stdin. If piped, reads all stdin data into `Vec<u8>` before anything else. The editor's background input thread then reads from `/dev/tty` instead of stdin.
 
 ### File locking
 
@@ -320,7 +315,7 @@ Uses `termion::raw::IntoRawMode` and `termion::screen::IntoAlternateScreen`.
 `handle_key(key)` flow:
 1. **Quit pending check** — if `quit_pending`: `y`/`Y` → save and quit (if no filename, opens "Save as:" prompt and defers quit until prompt is confirmed); `n`/`N` → save undo history and quit; anything else → cancel.
 2. **Reload pending check** — if `reload_pending`: `y`/`Y` → reload file; anything else → dismiss.
-3. **Find active check** — if `find_active`: Up → find_prev; Down → find_next; Esc → exit find and clear selection; anything else → exit find and fall through.
+3. **Find active check** — if `find.active`: Up → find_prev; Down → find_next; Esc → exit find and clear selection; anything else → exit find and fall through.
 4. **Desired column reset** — preserved only for Up/Down/PageUp/PageDown; reset to None for all other keys.
 5. **Keybinding table lookup** — check configurable bindings.
 6. **Non-configurable keys** — Shift+arrows, arrows, Home, End, Esc, Delete, Backspace, Tab, BackTab, Enter, printable chars.
@@ -529,27 +524,27 @@ Indentation is treated as a **copy-time property**: the indentation in the paste
 **Design**: never scans the whole file on a keystroke. O(viewport) highlighting; O(lines_to_first_match) initial jump.
 
 1. Smart-case: case-insensitive if pattern is all lowercase.
-2. Compiles regex once and caches it in `find_re: Option<regex_lite::Regex>`. Invalid regex → silently ignored.
-3. Calls `refresh_viewport_matches()` to populate `find_matches` with only the visible lines' matches (scroll_line..scroll_line + text_rows + 4).
-4. Sets `find_current` to the first viewport match at/after cursor; if none, calls `search_forward` to scan forward through the file until the first match is found.
+2. Compiles regex once and caches it in `find.re`. Invalid regex → silently ignored.
+3. Calls `find.refresh_viewport_matches()` to populate `find.matches` with only the visible lines' matches (scroll_line..scroll_line + text_rows + 4).
+4. Sets `find.current` to the first viewport match at/after cursor; if none, calls `FindState::search_forward` to scan forward through the file until the first match is found.
 5. Multi-line patterns won't match across line boundaries. Stores matches as `Vec<(Pos, Pos)>`.
 
-`refresh_viewport_matches()`: uses `take/restore` on `find_re` to satisfy the borrow checker while calling `buf.line_text_into`. Repopulates `find_matches` from scratch; called every `draw()` so highlights stay correct after scrolling.
+`find.refresh_viewport_matches()`: uses `take/restore` on `find.re` to satisfy the borrow checker while calling `buf.line_text_into`. Repopulates `find.matches` from scratch; called every `draw()` so highlights stay correct after scrolling.
 
 ### Find workflow
 
-1. **Ctrl+F**: opens find command buffer. Prefills from selection if <= 100 chars. Clears `find_re`, `find_current`.
-2. **As user types** (`Changed` result): `update_find_highlights` runs. If `find_current` found, jumps to it and centers viewport. Status shows "Find: {pattern}".
-3. **Enter**: activates find browse mode (`find_active = true`). Up/Down navigate matches (wrapping). Status stays "Find: {pattern}".
-4. **Esc while browsing**: exits find mode (`exit_find_mode`), selects current match. Clears `find_re`, `find_current`, `find_matches`, status.
-5. **Cancel (Esc while command buffer open)**: clears `find_re`, `find_current`, `find_matches`, status.
+1. **Ctrl+F**: opens find command buffer. Prefills from selection if <= 100 chars. Calls `find.clear()`.
+2. **As user types** (`Changed` result): `update_find_highlights` runs. If `find.current` found, jumps to it and centers viewport. Status shows "Find: {pattern}".
+3. **Enter**: activates find browse mode (`find.active = true`). Up/Down navigate matches (wrapping). Status stays "Find: {pattern}".
+4. **Esc while browsing**: `find.exit()` returns current match for selection. Clears all find state + status.
+5. **Cancel (Esc while command buffer open)**: calls `find.clear()`, clears status.
 6. **Any other key while browsing**: exits find mode, processes key normally.
 
 ### Find next/prev
 
-- `find_next`: takes `find_re`, calls `search_forward(buf, re, cursor)` which scans forward from cursor (wrapping around end of file). Updates `find_current`. O(lines_to_next_match).
-- `find_prev`: takes `find_re`, calls `search_backward(buf, re, cursor)` which scans backward from cursor (wrapping around start of file), returning the last match on each line. O(lines_to_prev_match).
-- Both use `take/restore` on `find_re` to avoid borrow conflicts.
+- `find.find_next(buf, cursor)`: calls `FindState::search_forward` which scans forward from cursor (wrapping around end of file). Updates `find.current`. O(lines_to_next_match).
+- `find.find_prev(buf, cursor)`: calls `FindState::search_backward` which scans backward from cursor (wrapping around start of file), returning the last match on each line. O(lines_to_prev_match).
+- Both use `take/restore` on `find.re` to avoid borrow conflicts.
 
 ### Replace all (`replace_all`)
 
@@ -697,7 +692,7 @@ pub struct Renderer {
 10. **Status bar**: reverse video (`\x1b[0;7m`). Left: built by `build_status_left()` into `Editor::status_left_cache` (reused `String`, filled with `push`/`push_str` — no `format!` allocation after warm-up); the `&str` is passed to `render()`. Right: `" e vVERSION "` (`&'static str` via `concat!`, no per-frame allocation). Padded with spaces to fill width.
 11. **Command line**: if active, yellow bg black text (`\x1b[30;43m`) + erase to end. If status message, display it. Otherwise blank.
 12. **Cursor positioning**:
-    - If `find_active` or selection active: cursor stays hidden.
+    - If `find.active` or selection active: cursor stays hidden.
     - If command buffer active: position cursor in command line at `prompt.len() + cursor`, show cursor.
     - Otherwise: compute cursor screen position accounting for soft-wrap (col % text_cols + gutter for column, count wrapped rows from scroll position for row using `line_text_into` + `display_col_for_char_col` — no allocation), show cursor.
 13. Write entire frame buffer via single `write_all`.
@@ -910,7 +905,7 @@ For each entry:
 
 Constants: `MAX_GROUPS = 100_000`, `MAX_ENTRIES = 10_000`.
 
-Concurrency: uses `libc::flock` (exclusive for write, shared for read).
+Concurrency: uses `std::fs::File::lock`/`lock_shared`/`unlock` (exclusive for write, shared for read).
 
 **Save**: reads existing DB, keeps entries for other paths whose files still exist and mtimes still match (raw byte copy, no deserialization), replaces/adds entry for current path.
 

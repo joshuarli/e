@@ -140,26 +140,19 @@ fn undo_db_path() -> PathBuf {
     PathBuf::from(home).join(".config/e/undo.bin")
 }
 
-/// Acquire an exclusive flock on an open file. Returns false if it fails.
+/// Acquire an exclusive lock on an open file. Returns false if it fails.
 fn flock_exclusive(file: &fs::File) -> bool {
-    use std::os::unix::io::AsRawFd;
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) == 0 }
+    file.lock().is_ok()
 }
 
-/// Acquire a shared flock on an open file.
+/// Acquire a shared lock on an open file.
 fn flock_shared(file: &fs::File) {
-    use std::os::unix::io::AsRawFd;
-    unsafe {
-        libc::flock(file.as_raw_fd(), libc::LOCK_SH);
-    }
+    let _ = file.lock_shared();
 }
 
-/// Release flock on an open file.
+/// Release lock on an open file.
 fn flock_unlock(file: &fs::File) {
-    use std::os::unix::io::AsRawFd;
-    unsafe {
-        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-    }
+    let _ = file.unlock();
 }
 
 // Binary encoding helpers
