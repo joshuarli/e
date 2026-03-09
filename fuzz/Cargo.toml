@@ -1,0 +1,38 @@
+[package]
+name = "e-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.e]
+path = ".."
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_gap_buffer"
+path = "fuzz_targets/fuzz_gap_buffer.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_undo_deserialize"
+path = "fuzz_targets/fuzz_undo_deserialize.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_cursor_deserialize"
+path = "fuzz_targets/fuzz_cursor_deserialize.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_highlight"
+path = "fuzz_targets/fuzz_highlight.rs"
+doc = false

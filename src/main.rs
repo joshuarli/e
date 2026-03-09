@@ -1,25 +1,8 @@
-mod buffer;
-mod clipboard;
-mod command;
-mod command_buffer;
-mod document;
-mod editor;
-mod file_io;
-mod find;
-mod highlight;
-mod keybind;
-mod language;
-mod mouse;
-mod operation;
-mod render;
-mod selection;
-#[allow(unused)]
-mod signal;
-mod view;
-
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process;
+
+use e::{editor, file_io};
 
 fn confirm(prompt: &str) -> bool {
     // Use alternate screen so the prompt doesn't pollute terminal history

@@ -652,6 +652,28 @@ fn collect_cursor_entries<'a>(data: &'a [u8], exclude_path: &[u8]) -> Vec<&'a [u
     kept
 }
 
+/// Fuzz-friendly entry points for the binary deserializers.
+/// These accept arbitrary bytes and must never panic.
+pub mod fuzz {
+    use super::*;
+
+    /// Try to deserialize undo groups from arbitrary bytes.
+    pub fn fuzz_deserialize_undo(data: &[u8]) -> Option<Vec<OperationGroup>> {
+        let mut pos = 0;
+        deserialize_groups(data, &mut pos)
+    }
+
+    /// Try to parse an undo db blob, collecting kept entries.
+    pub fn fuzz_collect_undo_entries(data: &[u8]) {
+        collect_kept_entries(data, b"/nonexistent");
+    }
+
+    /// Try to parse a cursor db blob, collecting kept entries.
+    pub fn fuzz_collect_cursor_entries(data: &[u8]) {
+        collect_cursor_entries(data, b"/nonexistent");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

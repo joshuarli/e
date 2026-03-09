@@ -81,7 +81,7 @@ pub struct GapBuffer {
 - `char_col_from_display(line, target_display) -> usize` — inverse of `display_col_at`: maps a display column back to a char column. Does not allocate.
 
 Free functions:
-- `utf8_char_len(first_byte: u8) -> usize` — returns 1-4 based on leading byte.
+- `utf8_char_len(first_byte: u8) -> usize` — returns 1-4 based on leading byte. Continuation bytes (0x80-0xBF) return 1 (treated as single invalid bytes). Walking functions (`pos_to_offset`, `char_count_in_range`) cap multi-byte advances to never cross range boundaries, handling invalid UTF-8 gracefully.
 - `char_count(bytes: &[u8]) -> usize` — counts UTF-8 characters.
 
 ### 3.2 Document (`document.rs`)
@@ -1023,6 +1023,9 @@ Reverse video (`\x1b[0;7m`). Full width.
 - Integration tests use `std::env::temp_dir()` for file I/O, clean up with `remove_dir_all`.
 - Coverage: `cargo tarpaulin`.
 - Philosophy: prefer integration-style scenario tests over tiny unit tests.
+- **Property tests** (proptest): `buffer::proptests` module has 7 properties covering GapBuffer invariants — contents match reference, line index partitions, pos/offset roundtrip, insert/delete roundtrip, display col roundtrip, etc.
+- **Fuzz targets** (`fuzz/`): cargo-fuzz setup with 4 targets — `fuzz_gap_buffer` (arbitrary edit sequences), `fuzz_undo_deserialize`, `fuzz_cursor_deserialize`, `fuzz_highlight` (all languages on arbitrary bytes). Run with `cargo +nightly fuzz run <target>`.
+- **Crate structure**: `lib.rs` re-exports all modules publicly so fuzz targets can import them. `main.rs` imports from `e::*`.
 
 ## 22. Configuration Paths Summary
 

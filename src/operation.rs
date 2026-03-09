@@ -54,6 +54,12 @@ pub struct UndoStack {
     force_group: bool,
 }
 
+impl Default for UndoStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UndoStack {
     pub fn new() -> Self {
         Self {

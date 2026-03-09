@@ -14,6 +14,12 @@ pub struct FindState {
     pub active: bool,
 }
 
+impl Default for FindState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FindState {
     pub fn new() -> Self {
         FindState {

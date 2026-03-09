@@ -100,6 +100,12 @@ pub struct Renderer {
     frame_buf: Vec<u8>,
 }
 
+impl Default for Renderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Renderer {
     pub fn new() -> Self {
         Self {

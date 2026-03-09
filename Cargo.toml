@@ -10,6 +10,7 @@ libc = "0.2"
 
 [dev-dependencies]
 vt100 = "0.15"
+proptest = "1"
 
 [profile.release]
 opt-level = 3

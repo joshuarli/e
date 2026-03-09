@@ -75,6 +75,12 @@ pub struct CommandRegistry {
     commands: HashMap<String, CommandFn>,
 }
 
+impl Default for CommandRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CommandRegistry {
     pub fn new() -> Self {
         let mut commands: HashMap<String, CommandFn> = HashMap::new();

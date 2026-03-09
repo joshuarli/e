@@ -17,6 +17,12 @@ pub struct GapBuffer {
 
 const MIN_GAP: usize = 128;
 
+impl Default for GapBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GapBuffer {
     pub fn new() -> Self {
         let gap = MIN_GAP;
@@ -367,7 +373,9 @@ impl GapBuffer {
         let mut byte_off = 0;
         let mut char_idx = 0;
         while char_idx < col && start + byte_off < limit {
-            byte_off += utf8_char_len(self.byte_at(start + byte_off));
+            let advance =
+                utf8_char_len(self.byte_at(start + byte_off)).min(limit - (start + byte_off));
+            byte_off += advance;
             char_idx += 1;
         }
         start + byte_off
@@ -392,7 +400,7 @@ impl GapBuffer {
         let mut i = from;
         while i < to {
             let b = self.byte_at(i);
-            i += utf8_char_len(b);
+            i += utf8_char_len(b).min(to - i);
             count += 1;
         }
         count
@@ -412,8 +420,8 @@ impl GapBuffer {
 }
 
 pub fn utf8_char_len(first_byte: u8) -> usize {
-    if first_byte < 0x80 {
-        1
+    if first_byte < 0xC0 {
+        1 // ASCII (0x00-0x7F) or continuation byte (0x80-0xBF)
     } else if first_byte < 0xE0 {
         2
     } else if first_byte < 0xF0 {
@@ -848,5 +856,194 @@ mod tests {
         buf.insert(2, b"Y"); // line 1 (b line) — should be the min
         let d = buf.take_dirty_line();
         assert_eq!(d, 1); // min of line 2 and line 1
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// An edit operation for property testing.
+    #[derive(Debug, Clone)]
+    enum EditOp {
+        Insert { pos_frac: f64, data: Vec<u8> },
+        Delete { pos_frac: f64, len_frac: f64 },
+    }
+
+    fn arb_edit_op() -> impl Strategy<Value = EditOp> {
+        prop_oneof![
+            (any::<f64>(), prop::collection::vec(any::<u8>(), 0..32))
+                .prop_map(|(pos_frac, data)| EditOp::Insert { pos_frac, data }),
+            (any::<f64>(), any::<f64>())
+                .prop_map(|(pos_frac, len_frac)| EditOp::Delete { pos_frac, len_frac }),
+        ]
+    }
+
+    /// Apply an edit op to both a GapBuffer and a reference Vec<u8>.
+    fn apply_op(buf: &mut GapBuffer, reference: &mut Vec<u8>, op: &EditOp) {
+        match op {
+            EditOp::Insert { pos_frac, data } => {
+                if data.is_empty() {
+                    return;
+                }
+                let pos = if reference.is_empty() {
+                    0
+                } else {
+                    (pos_frac.abs().fract() * reference.len() as f64) as usize
+                        % (reference.len() + 1)
+                };
+                buf.insert(pos, data);
+                reference.splice(pos..pos, data.iter().copied());
+            }
+            EditOp::Delete { pos_frac, len_frac } => {
+                if reference.is_empty() {
+                    return;
+                }
+                let pos =
+                    (pos_frac.abs().fract() * reference.len() as f64) as usize % reference.len();
+                let max_len = reference.len() - pos;
+                if max_len == 0 {
+                    return;
+                }
+                let count = ((len_frac.abs().fract() * max_len as f64) as usize)
+                    .max(1)
+                    .min(max_len);
+                buf.delete(pos, count);
+                reference.drain(pos..pos + count);
+            }
+        }
+    }
+
+    proptest! {
+        /// After any sequence of edits, contents() matches the reference.
+        #[test]
+        fn contents_match_reference(
+            initial in prop::collection::vec(any::<u8>(), 0..256),
+            ops in prop::collection::vec(arb_edit_op(), 0..50),
+        ) {
+            let mut buf = GapBuffer::from_vec(initial.clone());
+            let mut reference = initial;
+            for op in &ops {
+                apply_op(&mut buf, &mut reference, op);
+            }
+            prop_assert_eq!(buf.contents(), reference);
+        }
+
+        /// The line index correctly partitions the buffer: line ranges
+        /// are contiguous, cover the entire buffer, and slice() for each
+        /// line range reconstructs the original content.
+        #[test]
+        fn line_index_partitions_buffer(
+            initial in prop::collection::vec(any::<u8>(), 0..256),
+            ops in prop::collection::vec(arb_edit_op(), 0..50),
+        ) {
+            let mut buf = GapBuffer::from_vec(initial.clone());
+            let mut reference = initial;
+            for op in &ops {
+                apply_op(&mut buf, &mut reference, op);
+            }
+            let contents = buf.contents();
+            let lc = buf.line_count();
+            prop_assert!(lc >= 1, "always at least 1 line");
+            prop_assert_eq!(buf.line_start(0), 0, "first line starts at 0");
+            prop_assert_eq!(buf.line_end(lc - 1), contents.len(), "last line ends at len");
+
+            // Lines are contiguous and reconstruct the full content.
+            let mut reconstructed = Vec::new();
+            for i in 0..lc {
+                if i + 1 < lc {
+                    prop_assert_eq!(buf.line_end(i), buf.line_start(i + 1),
+                        "gap between line {} end and line {} start", i, i + 1);
+                }
+                reconstructed.extend_from_slice(&buf.slice(buf.line_start(i), buf.line_end(i)));
+            }
+            prop_assert_eq!(reconstructed, contents);
+        }
+
+        /// pos_to_offset and offset_to_pos are inverses for valid positions.
+        #[test]
+        fn pos_offset_roundtrip(
+            text in prop::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let buf = GapBuffer::from_vec(text);
+            for line in 0..buf.line_count() {
+                let char_len = buf.line_char_len(line);
+                for col in 0..=char_len {
+                    let offset = buf.pos_to_offset(line, col);
+                    let (rt_line, rt_col) = buf.offset_to_pos(offset);
+                    prop_assert_eq!((rt_line, rt_col), (line, col),
+                        "roundtrip failed for ({}, {}): offset={}, got ({}, {})",
+                        line, col, offset, rt_line, rt_col);
+                }
+            }
+        }
+
+        /// line_start(n+1) == line_end(n) for adjacent lines (lines end with '\n').
+        #[test]
+        fn line_boundaries_contiguous(
+            text in prop::collection::vec(any::<u8>(), 1..256),
+        ) {
+            let buf = GapBuffer::from_vec(text);
+            let lc = buf.line_count();
+            for line in 0..lc.saturating_sub(1) {
+                prop_assert_eq!(
+                    buf.line_start(line + 1),
+                    buf.line_end(line),
+                    "gap between line {} end and line {} start", line, line + 1
+                );
+            }
+        }
+
+        /// len() is always consistent with contents().len().
+        #[test]
+        fn len_matches_contents(
+            initial in prop::collection::vec(any::<u8>(), 0..256),
+            ops in prop::collection::vec(arb_edit_op(), 0..50),
+        ) {
+            let mut buf = GapBuffer::from_vec(initial.clone());
+            let mut reference = initial;
+            for op in &ops {
+                apply_op(&mut buf, &mut reference, op);
+            }
+            prop_assert_eq!(buf.len(), buf.contents().len());
+            prop_assert_eq!(buf.len(), reference.len());
+        }
+
+        /// Insert then delete at the same position restores original content.
+        #[test]
+        fn insert_delete_roundtrip(
+            initial in prop::collection::vec(any::<u8>(), 0..128),
+            insert_data in prop::collection::vec(any::<u8>(), 1..32),
+            pos_frac in 0.0f64..1.0,
+        ) {
+            let mut buf = GapBuffer::from_vec(initial.clone());
+            let pos = if initial.is_empty() {
+                0
+            } else {
+                (pos_frac * initial.len() as f64) as usize % (initial.len() + 1)
+            };
+            buf.insert(pos, &insert_data);
+            buf.delete(pos, insert_data.len());
+            prop_assert_eq!(buf.contents(), initial);
+        }
+
+        /// display_col_at round-trips through char_col_from_display for ASCII.
+        #[test]
+        fn display_col_roundtrip_ascii(
+            text in "[a-z\t ]{0,80}\n[a-z\t ]{0,80}",
+        ) {
+            let buf = GapBuffer::from_vec(text.into_bytes());
+            for line in 0..buf.line_count() {
+                let char_len = buf.line_char_len(line);
+                for col in 0..=char_len {
+                    let dcol = buf.display_col_at(line, col);
+                    let rt_col = buf.char_col_from_display(line, dcol);
+                    prop_assert_eq!(rt_col, col,
+                        "display roundtrip failed on line {} col {}: dcol={} rt={}",
+                        line, col, dcol, rt_col);
+                }
+            }
+        }
     }
 }
