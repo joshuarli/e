@@ -70,6 +70,12 @@ fn load(
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    if args.len() == 2 && (args[1] == "-V" || args[1] == "--version") {
+        println!("e {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     let piped_stdin = !io::stdin().is_terminal();
 
     let stdin_data = if piped_stdin {

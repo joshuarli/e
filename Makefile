@@ -2,7 +2,7 @@ NAME   := e
 UNAME  := $(shell uname -m)
 TARGET := $(UNAME)-apple-darwin
 
-.PHONY: setup build-dev release install test test-ci record gifs pc
+.PHONY: setup build-dev release install test test-ci record gifs pc bump-version
 
 setup:
 	rustup show active-toolchain
@@ -43,3 +43,16 @@ gifs:
 
 pc:
 	prek run --all-files
+
+# Usage: make bump-version [V=x.y.z]
+# Without V, increments the patch version.
+bump-version:
+ifndef V
+	$(eval OLD := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml))
+	$(eval V := $(shell echo "$(OLD)" | awk -F. '{printf "%d.%d.%d", $$1, $$2, $$3+1}'))
+endif
+	sed -i '' 's/^version = ".*"/version = "$(V)"/' Cargo.toml
+	cargo check --quiet 2>/dev/null
+	git add Cargo.toml Cargo.lock
+	git commit -m "bump version to v$(V)"
+	git tag "v$(V)"
