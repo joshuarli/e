@@ -240,3 +240,7 @@ b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	alloc_audit
 12c67da	bump version to 0.1.5	[alloc] line_text_all_1k		1000	34406	43
 12c67da	bump version to 0.1.5	[alloc] search_forward_miss_1k		11	1024	1024
 12c67da	bump version to 0.1.5	[alloc] search_backward_miss_1k		3	76	76
+496196d	Add render benchmarks, faster criterion config, event coalescing	render/frame_80x24_1k_syntax	50112.82			
+496196d	Add render benchmarks, faster criterion config, event coalescing	render/frame_120x40_10k_syntax	85811.60			
+496196d	Add render benchmarks, faster criterion config, event coalescing	render/frame_120x40_10k_selection	87772.90			
+496196d	Add render benchmarks, faster criterion config, event coalescing	render/frame_120x40_10k_plain	20925.74			

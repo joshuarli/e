@@ -5,13 +5,14 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use e::buffer::GapBuffer;
 use e::document::Document;
 use e::find::FindState;
-use e::highlight::{self, HlState};
+use e::highlight::{self, HlState, SyntaxRules};
 use e::selection::Pos;
 use e::view::{self, View};
 
@@ -553,14 +554,246 @@ fn bench_alloc_counts(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Render benchmarks
+// ---------------------------------------------------------------------------
+
+use e::render::Renderer;
+use e::selection::Selection;
+
+/// Helper: set up a Renderer + GapBuffer + View for a given terminal size and
+/// file, with the cursor at the middle of the document.
+fn render_setup(
+    data: &[u8],
+    width: u16,
+    height: u16,
+    syntax: Option<&'static SyntaxRules>,
+) -> (Renderer, GapBuffer, View) {
+    let mut r = Renderer::new();
+    r.set_syntax(syntax);
+    let buf = GapBuffer::from_vec(data.to_vec());
+    let mut v = View::new(width, height);
+    // Scroll to middle of file so we're not benchmarking a trivial top-of-file case
+    v.scroll_line = buf.line_count() / 2;
+    (r, buf, v)
+}
+
+fn bench_render(c: &mut Criterion) {
+    let mut group = c.benchmark_group("render");
+
+    let rust_1k = make_rust_source(1_000);
+    let rust_10k = make_rust_source(10_000);
+    let rust_rules = highlight::rules_for_language("Rust").unwrap();
+
+    // Full frame, 80x24 terminal, 1k-line file, syntax highlighted
+    group.bench_function("frame_80x24_1k_syntax", |b| {
+        let (mut r, mut buf, view) = render_setup(&rust_1k, 80, 24, Some(rust_rules));
+        let cursor_line = view.scroll_line;
+        let mut sink = Vec::with_capacity(16 * 1024);
+        b.iter(|| {
+            sink.clear();
+            r.needs_full_redraw = true;
+            r.render(
+                &mut sink,
+                &mut buf,
+                &view,
+                cursor_line,
+                0,
+                true,
+                " test.rs",
+                " e v0.1.5 ",
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            black_box(&sink);
+        });
+    });
+
+    // Full frame, 120x40 terminal (common modern size), 10k-line file
+    group.bench_function("frame_120x40_10k_syntax", |b| {
+        let (mut r, mut buf, view) = render_setup(&rust_10k, 120, 40, Some(rust_rules));
+        let cursor_line = view.scroll_line;
+        let mut sink = Vec::with_capacity(32 * 1024);
+        b.iter(|| {
+            sink.clear();
+            r.needs_full_redraw = true;
+            r.render(
+                &mut sink,
+                &mut buf,
+                &view,
+                cursor_line,
+                0,
+                true,
+                " test.rs",
+                " e v0.1.5 ",
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            black_box(&sink);
+        });
+    });
+
+    // With active selection (triggers slow per-character path)
+    group.bench_function("frame_120x40_10k_selection", |b| {
+        let (mut r, mut buf, view) = render_setup(&rust_10k, 120, 40, Some(rust_rules));
+        let cursor_line = view.scroll_line;
+        let sel = Selection {
+            anchor: Pos::new(cursor_line, 0),
+            cursor: Pos::new(cursor_line + 5, 10),
+        };
+        let mut sink = Vec::with_capacity(32 * 1024);
+        b.iter(|| {
+            sink.clear();
+            r.needs_full_redraw = true;
+            r.render(
+                &mut sink,
+                &mut buf,
+                &view,
+                cursor_line,
+                0,
+                true,
+                " test.rs",
+                " e v0.1.5 ",
+                None,
+                Some(sel),
+                None,
+                None,
+                &[],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            black_box(&sink);
+        });
+    });
+
+    // No syntax highlighting (plain text)
+    group.bench_function("frame_120x40_10k_plain", |b| {
+        let (mut r, mut buf, view) = render_setup(&rust_10k, 120, 40, None);
+        let cursor_line = view.scroll_line;
+        let mut sink = Vec::with_capacity(32 * 1024);
+        b.iter(|| {
+            sink.clear();
+            r.needs_full_redraw = true;
+            r.render(
+                &mut sink,
+                &mut buf,
+                &view,
+                cursor_line,
+                0,
+                true,
+                " test.rs",
+                " e v0.1.5 ",
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            black_box(&sink);
+        });
+    });
+
+    // Measure output bytes per frame (allocation audit style)
+    {
+        let (mut r, mut buf, view) = render_setup(&rust_10k, 120, 40, Some(rust_rules));
+        let cursor_line = view.scroll_line;
+        let mut sink = Vec::with_capacity(32 * 1024);
+        r.needs_full_redraw = true;
+        r.render(
+            &mut sink,
+            &mut buf,
+            &view,
+            cursor_line,
+            0,
+            true,
+            " test.rs",
+            " e v0.1.5 ",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        eprintln!();
+        eprintln!("  ── render output size (120x40, 10k-line Rust, syntax on) ──");
+        eprintln!(
+            "  [bytes] frame: {} B ({:.1} KiB)",
+            sink.len(),
+            sink.len() as f64 / 1024.0
+        );
+
+        let stats = measure_allocs(|| {
+            sink.clear();
+            r.needs_full_redraw = true;
+            r.render(
+                &mut sink,
+                &mut buf,
+                &view,
+                cursor_line,
+                0,
+                true,
+                " test.rs",
+                " e v0.1.5 ",
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        });
+        eprintln!("  [alloc] render_frame_120x40:       {stats}");
+        eprintln!();
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+
+fn fast_config() -> Criterion {
+    Criterion::default()
+        .sample_size(50)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(2))
+}
 
 criterion_group!(
-    benches,
-    bench_gap_buffer,
-    bench_highlight,
-    bench_document,
-    bench_search,
-    bench_viewport,
-    bench_alloc_counts,
+    name = benches;
+    config = fast_config();
+    targets =
+        bench_gap_buffer,
+        bench_highlight,
+        bench_document,
+        bench_search,
+        bench_viewport,
+        bench_alloc_counts,
+        bench_render,
 );
 criterion_main!(benches);
