@@ -670,6 +670,11 @@ pub struct Renderer {
     char_hl_scratch: Vec<HlType>,        // Char-indexed highlight output
     find_scratch: Vec<(usize, usize, bool)>, // Per-line find-range display columns
     frame_buf: Vec<u8>,                  // Reused per-draw output buffer (taken via mem::take)
+    row_buf: Vec<u8>,                    // Scratch for rendering one screen row (dirty-line tracking)
+    prev_rows: Vec<Vec<u8>>,             // Cached content per screen row from previous frame
+    prev_scroll_line: usize,             // Previous frame's scroll position (scroll-region delta)
+    prev_scroll_wrap: usize,
+    prev_text_rows: usize,               // Previous text_rows (detect completions/resize changes)
 }
 ```
 
@@ -679,9 +684,11 @@ pub struct Renderer {
 2. Compute text area: `text_rows = view.text_rows() - completion_rows`, `text_cols = view.text_cols(gw)`.
 3. Take `frame_buf` out of `self` via `mem::take`, clear it, use as the output accumulator; put back before returning. No per-draw allocation after warm-up.
 4. Wrap output in synchronized output protocol (`\x1b[?2026h` / `\x1b[?2026l`).
-5. Hide cursor (`\x1b[?25l`).
-6. **Syntax cache** (lazy, viewport-bounded): compute `visible_end = scroll_line + text_rows + 1`. If buffer version changed, read `buf.take_dirty_line()` to get `hl_dirty_from`. Call `refresh_hl_cache(visible_end, scroll_line)` which: truncates if file shrank; extends the cache to `visible_end` if the user scrolled past the current coverage (reprocesses the last cached line to recover its output state, then continues forward); recomputes from `hl_dirty_from` on edits with early-exit when the cached state matches. **Large-jump fast path**: when `scroll_line > computed + 50` (viewport jumped far past the end of the computed cache, e.g. select-all on a 1M-line file), the intermediate gap is left as `HlState::Normal` and recomputation starts only from `scroll_line - 200`. Multi-line constructs starting in the skipped gap are cosmetically approximated as Normal. On first open of a 1M-line file only ~`text_rows` lines are highlighted — O(viewport) not O(file).
-7. **Wrap-aware render loop**: walk from `(scroll_line, scroll_wrap)` through logical lines:
+5. **Scroll region optimization**: if `text_rows` changed or `prev_rows` needs resizing, force full redraw. Otherwise, `compute_scroll_delta()` walks from old `(scroll_line, scroll_wrap)` to new position counting screen rows (capped at `text_rows` to avoid O(N) on huge jumps). If `0 < |delta| < text_rows`: set scroll region `\x1b[1;{text_rows}r`, emit `\x1b[{n}S` (scroll up) or `\x1b[{n}T` (scroll down), reset region `\x1b[r`, then rotate `prev_rows` and clear newly-revealed entries.
+6. **Dirty-line tracking**: each screen row is rendered into `row_buf` (without cursor-positioning prefix). Compared against `prev_rows[screen_row]`. If identical (and not full redraw), the row is skipped — no bytes emitted to the terminal. If different, cursor-position + content are emitted, and `row_buf` is swapped into `prev_rows[screen_row]`. This applies to all rows: text, completions, status bar, command line.
+7. Hide cursor (`\x1b[?25l`).
+8. **Syntax cache** (lazy, viewport-bounded): compute `visible_end = scroll_line + text_rows + 1`. If buffer version changed, read `buf.take_dirty_line()` to get `hl_dirty_from`. Call `refresh_hl_cache(visible_end, scroll_line)` which: truncates if file shrank; extends the cache to `visible_end` if the user scrolled past the current coverage (reprocesses the last cached line to recover its output state, then continues forward); recomputes from `hl_dirty_from` on edits with early-exit when the cached state matches. **Large-jump fast path**: when `scroll_line > computed + 50` (viewport jumped far past the end of the computed cache, e.g. select-all on a 1M-line file), the intermediate gap is left as `HlState::Normal` and recomputation starts only from `scroll_line - 200`. Multi-line constructs starting in the skipped gap are cosmetically approximated as Normal. On first open of a 1M-line file only ~`text_rows` lines are highlighted — O(viewport) not O(file).
+9. **Wrap-aware render loop**: walk from `(scroll_line, scroll_wrap)` through logical lines:
    - Expand tabs in each line (`\t` → `|` + space, 2 display columns).
    - Convert to chars. Compute wrapped rows.
    - For each wrapped chunk:
@@ -691,15 +698,17 @@ pub struct Renderer {
        - **Fast path** (no overlays): streaming syntax highlighting with minimal escape changes. Tab pipes handled inline.
        - **`CtrlSafe(char)`**: all character writes (both paths, except tab-pipe spaces) go through this `Display` wrapper. Control characters U+0000–U+001F (excluding tab/newline, which are pre-expanded or absent) and U+007F are rendered as `^X` notation in reverse video (`\x1b[7m^X\x1b[27m`) rather than being written raw, which would inject stray escape sequences into the terminal output.
      - Reset and erase to end of line: `\x1b[0m\x1b[K`.
-8. Fill remaining rows with empty lines (blank gutters if ruler on).
-9. **Completions**: dim text (`\x1b[2m`) on rows above status bar.
-10. **Status bar**: dark grey background (`\x1b[0;100m`). Left: built by `build_status_left()` into `Editor::status_left_cache` (reused `String`, filled with `push`/`push_str` — no `format!` allocation after warm-up); the `&str` is passed to `render()`. Right: `" e vVERSION "` (`&'static str` via `concat!`, no per-frame allocation). Padded with spaces to fill width.
-11. **Command line**: if active, yellow bg black text (`\x1b[30;43m`) + erase to end. If status message, display it. Otherwise blank.
-12. **Cursor positioning**:
+     - **Dirty check**: compare `row_buf` against `prev_rows[screen_row]`; skip emit if identical.
+10. Fill remaining rows with empty lines (blank gutters if ruler on). Dirty-checked.
+11. **Completions**: dim text (`\x1b[2m`) on rows above status bar. Dirty-checked.
+12. **Status bar**: dark grey background (`\x1b[0;100m`). Left: built by `build_status_left()` into `Editor::status_left_cache` (reused `String`, filled with `push`/`push_str` — no `format!` allocation after warm-up); the `&str` is passed to `render()`. Right: `" e vVERSION "` (`&'static str` via `concat!`, no per-frame allocation). Padded with spaces to fill width. Dirty-checked.
+13. **Command line**: if active, yellow bg black text (`\x1b[30;43m`) + erase to end. If status message, display it. Otherwise blank. Dirty-checked.
+14. **Cursor positioning**:
     - If `find.active` or selection active: cursor stays hidden.
     - If command buffer active: position cursor in command line at `prompt.len() + cursor`, show cursor.
     - Otherwise: compute cursor screen position accounting for soft-wrap (col % text_cols + gutter for column, count wrapped rows from scroll position for row using `line_text_into` + `display_col_for_char_col` — no allocation), show cursor.
-13. Write entire frame buffer via single `write_all`.
+15. Save `scroll_line`, `scroll_wrap`, `text_rows` for next frame's delta detection.
+16. Write entire frame buffer via single `write_all`.
 
 ### Display column conversion
 

@@ -1,4 +1,5 @@
 /// Viewport: tracks scroll offsets and maps cursor position to screen coordinates.
+#[derive(Clone)]
 pub struct View {
     /// First visible line (0-indexed logical line).
     pub scroll_line: usize,

@@ -712,6 +712,188 @@ fn bench_render(c: &mut Criterion) {
         });
     });
 
+    // Incremental: no-op redraw (identical state — should skip all rows)
+    group.bench_function("incr_noop_120x40", |b| {
+        let (mut r, mut buf, view) = render_setup(&rust_10k, 120, 40, Some(rust_rules));
+        let cursor_line = view.scroll_line;
+        let mut sink = Vec::with_capacity(32 * 1024);
+        // Prime the cache with a full frame
+        r.needs_full_redraw = true;
+        r.render(
+            &mut sink,
+            &mut buf,
+            &view,
+            cursor_line,
+            0,
+            true,
+            " test.rs",
+            " e v0.1.5 ",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        b.iter(|| {
+            sink.clear();
+            // NOT setting needs_full_redraw — incremental path
+            r.render(
+                &mut sink,
+                &mut buf,
+                &view,
+                cursor_line,
+                0,
+                true,
+                " test.rs",
+                " e v0.1.5 ",
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            black_box(&sink);
+        });
+    });
+
+    // Incremental: cursor moved down 1 line (old + new cursor lines change)
+    group.bench_function("incr_cursor_move_120x40", |b| {
+        let (mut r, mut buf, view) = render_setup(&rust_10k, 120, 40, Some(rust_rules));
+        let cursor_line = view.scroll_line;
+        let mut sink = Vec::with_capacity(32 * 1024);
+        r.needs_full_redraw = true;
+        r.render(
+            &mut sink,
+            &mut buf,
+            &view,
+            cursor_line,
+            0,
+            true,
+            " test.rs",
+            " e v0.1.5 ",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let mut cur = cursor_line;
+        b.iter(|| {
+            sink.clear();
+            // Alternate cursor between two lines
+            cur = if cur == cursor_line {
+                cursor_line + 1
+            } else {
+                cursor_line
+            };
+            r.render(
+                &mut sink,
+                &mut buf,
+                &view,
+                cur,
+                0,
+                true,
+                " test.rs",
+                " e v0.1.5 ",
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            black_box(&sink);
+        });
+    });
+
+    // Incremental: scroll down by 3 rows (scroll region shifts, only 3 new rows drawn)
+    group.bench_function("incr_scroll_120x40", |b| {
+        let (mut r, mut buf, view) = render_setup(&rust_10k, 120, 40, Some(rust_rules));
+        let cursor_line = view.scroll_line;
+        let mut sink = Vec::with_capacity(32 * 1024);
+        r.needs_full_redraw = true;
+        r.render(
+            &mut sink,
+            &mut buf,
+            &view,
+            cursor_line,
+            0,
+            true,
+            " test.rs",
+            " e v0.1.5 ",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        b.iter(|| {
+            sink.clear();
+            // Simulate scroll down then back up (so state resets each pair)
+            let mut v = view.clone();
+            v.scroll_line += 3;
+            r.render(
+                &mut sink,
+                &mut buf,
+                &v,
+                cursor_line + 3,
+                0,
+                true,
+                " test.rs",
+                " e v0.1.5 ",
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            sink.clear();
+            r.render(
+                &mut sink,
+                &mut buf,
+                &view,
+                cursor_line,
+                0,
+                true,
+                " test.rs",
+                " e v0.1.5 ",
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            black_box(&sink);
+        });
+    });
+
     // Measure output bytes per frame (allocation audit style)
     {
         let (mut r, mut buf, view) = render_setup(&rust_10k, 120, 40, Some(rust_rules));
@@ -769,6 +951,78 @@ fn bench_render(c: &mut Criterion) {
             .unwrap();
         });
         eprintln!("  [alloc] render_frame_120x40:       {stats}");
+
+        // Incremental byte counts — the real TTY bandwidth savings
+        // No-op: same state, should emit only sync markers + cursor
+        sink.clear();
+        r.render(
+            &mut sink,
+            &mut buf,
+            &view,
+            cursor_line,
+            0,
+            true,
+            " test.rs",
+            " e v0.1.5 ",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        eprintln!("  [bytes] incr_noop: {} B", sink.len());
+
+        // Cursor move: 2 rows change (old + new cursor line) + status bar
+        sink.clear();
+        r.render(
+            &mut sink,
+            &mut buf,
+            &view,
+            cursor_line + 1,
+            0,
+            true,
+            " test.rs",
+            " e v0.1.5 ",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        eprintln!("  [bytes] incr_cursor_move: {} B", sink.len());
+
+        // Scroll down 3: scroll region + 3 new rows
+        sink.clear();
+        let mut v2 = view.clone();
+        v2.scroll_line += 3;
+        r.render(
+            &mut sink,
+            &mut buf,
+            &v2,
+            cursor_line + 3,
+            0,
+            true,
+            " test.rs",
+            " e v0.1.5 ",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        eprintln!("  [bytes] incr_scroll_3: {} B", sink.len());
         eprintln!();
     }
 

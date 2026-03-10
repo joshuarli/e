@@ -100,6 +100,16 @@ pub struct Renderer {
     find_scratch: Vec<(usize, usize, bool)>,
     /// Frame buffer reused each draw to avoid per-frame allocation.
     frame_buf: Vec<u8>,
+    /// Scratch buffer for rendering a single screen row (dirty-line tracking).
+    row_buf: Vec<u8>,
+    /// Cached content of each screen row from the previous frame.
+    /// Used for dirty-line comparison: if row_buf matches prev_rows[i], skip emit.
+    prev_rows: Vec<Vec<u8>>,
+    /// Previous frame's scroll position for scroll-region delta detection.
+    prev_scroll_line: usize,
+    prev_scroll_wrap: usize,
+    /// Previous frame's text_rows (to detect completions/resize changes).
+    prev_text_rows: usize,
 }
 
 impl Default for Renderer {
@@ -123,6 +133,11 @@ impl Renderer {
             char_hl_scratch: Vec::new(),
             find_scratch: Vec::new(),
             frame_buf: Vec::new(),
+            row_buf: Vec::new(),
+            prev_rows: Vec::new(),
+            prev_scroll_line: usize::MAX,
+            prev_scroll_wrap: usize::MAX,
+            prev_text_rows: 0,
         }
     }
 
@@ -190,6 +205,45 @@ impl Renderer {
         // Synchronized output: tell terminal to hold rendering until frame is complete
         write!(w, "\x1b[?2026h")?;
 
+        // -- Scroll region optimization --
+        // If text_rows changed (resize/completions), force full redraw.
+        if text_rows != self.prev_text_rows {
+            self.needs_full_redraw = true;
+        }
+        // Ensure prev_rows is sized to cover all rows we'll compare (text + completions + 2).
+        let total_rows = text_rows + completion_rows + 2;
+        if self.prev_rows.len() != total_rows {
+            self.prev_rows.resize_with(total_rows, Vec::new);
+            self.needs_full_redraw = true;
+        }
+        // Detect scroll delta and use scroll regions to shift existing content.
+        if !self.needs_full_redraw && self.prev_scroll_line != usize::MAX && text_rows > 1 {
+            let delta = self.compute_scroll_delta(view, buf, text_cols, text_rows);
+            if delta != 0 && (delta.unsigned_abs()) < text_rows {
+                let n = delta.unsigned_abs();
+                // Set scroll region to text area only
+                write!(w, "\x1b[1;{}r", text_rows)?;
+                if delta > 0 {
+                    // Scrolled down: shift content up, new lines at bottom
+                    write!(w, "\x1b[{}S", n)?;
+                    // Rotate prev_rows: drop top n, blank bottom n
+                    self.prev_rows[..text_rows].rotate_left(n);
+                    for row in &mut self.prev_rows[text_rows - n..text_rows] {
+                        row.clear();
+                    }
+                } else {
+                    // Scrolled up: shift content down, new lines at top
+                    write!(w, "\x1b[{}T", n)?;
+                    self.prev_rows[..text_rows].rotate_right(n);
+                    for row in &mut self.prev_rows[..n] {
+                        row.clear();
+                    }
+                }
+                // Reset scroll region to full terminal
+                write!(w, "\x1b[r")?;
+            }
+        }
+
         // Compute per-line highlight states (lazy: only as far as the viewport needs)
         let buf_version = buf.version();
         // One line past the last visible line — that's all we need to cover.
@@ -214,6 +268,7 @@ impl Renderer {
         let mut screen_row: usize = 0;
         let mut line_idx = view.scroll_line;
         let first_wrap = view.scroll_wrap;
+        let full = self.needs_full_redraw;
 
         while screen_row < text_rows && line_idx < line_count {
             buf.line_text_into(line_idx, &mut self.line_buf);
@@ -252,9 +307,6 @@ impl Renderer {
 
             // Bracket match: highlight only the *matching* character, not the cursor's
             // character (the terminal cursor already shows where the cursor is).
-            // Highlighting the cursor position too causes visual confusion — e.g. when
-            // cursor is on the opening `"` of `f"uv"`, the highlighted closing `"` looks
-            // like the cursor jumped there.
             let bracket_match_col = bracket_pair.and_then(|(_, close)| {
                 if close.line == line_idx {
                     Some(display_col_for_char_col(raw_text, close.col))
@@ -315,7 +367,9 @@ impl Renderer {
                     break;
                 }
 
-                write!(w, "\x1b[{};1H", screen_row + 1)?;
+                // Render row content into row_buf (without cursor-positioning prefix)
+                self.row_buf.clear();
+                let rb = &mut self.row_buf;
 
                 // Gutter: line number on first wrap row, blank on continuations
                 if ruler_on {
@@ -325,14 +379,14 @@ impl Renderer {
                         let num_str = write_line_num(line_idx + 1, &mut num_buf);
                         let pad = gw - 1;
                         if is_cursor_line {
-                            write!(w, "\x1b[0;47;30m{:>width$}\x1b[0m ", num_str, width = pad)?;
+                            write!(rb, "\x1b[0;47;30m{:>width$}\x1b[0m ", num_str, width = pad)?;
                         } else {
-                            write!(w, "\x1b[0;90m{:>width$} \x1b[0m", num_str, width = pad)?;
+                            write!(rb, "\x1b[0;90m{:>width$} \x1b[0m", num_str, width = pad)?;
                         }
                     } else if is_cursor_line {
-                        write!(w, "\x1b[0;47;30m{:>width$}\x1b[0m ", "", width = gw - 1)?;
+                        write!(rb, "\x1b[0;47;30m{:>width$}\x1b[0m ", "", width = gw - 1)?;
                     } else {
-                        write!(w, "\x1b[0;90m{:>width$} \x1b[0m", "", width = gw - 1)?;
+                        write!(rb, "\x1b[0;90m{:>width$} \x1b[0m", "", width = gw - 1)?;
                     }
                 }
 
@@ -369,23 +423,23 @@ impl Renderer {
                                 HlType::Normal
                             };
                             let code = ht.ansi_code();
-                            write!(w, "{}\x1b[1;7m{}\x1b[0m", code, CtrlSafe(ch))?;
+                            write!(rb, "{}\x1b[1;7m{}\x1b[0m", code, CtrlSafe(ch))?;
                         } else if in_sel {
                             if is_tab_pipe {
-                                write!(w, "\x1b[7;90m{}\x1b[0m", ch)?;
+                                write!(rb, "\x1b[7;90m{}\x1b[0m", ch)?;
                             } else {
-                                write!(w, "\x1b[7m{}\x1b[0m", CtrlSafe(ch))?;
+                                write!(rb, "\x1b[7m{}\x1b[0m", CtrlSafe(ch))?;
                             }
                         } else if let Some((_, _, is_current)) = find_hit {
                             if *is_current {
-                                write!(w, "\x1b[42;30m{}\x1b[0m", CtrlSafe(ch))?;
+                                write!(rb, "\x1b[42;30m{}\x1b[0m", CtrlSafe(ch))?;
                             } else {
-                                write!(w, "\x1b[43;30m{}\x1b[0m", CtrlSafe(ch))?;
+                                write!(rb, "\x1b[43;30m{}\x1b[0m", CtrlSafe(ch))?;
                             }
                         } else if is_bracket_match {
-                            write!(w, "\x1b[45;30m{}\x1b[0m", CtrlSafe(ch))?;
+                            write!(rb, "\x1b[45;30m{}\x1b[0m", CtrlSafe(ch))?;
                         } else if is_tab_pipe {
-                            write!(w, "\x1b[90m{}\x1b[0m", ch)?;
+                            write!(rb, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
                             let ht = if has_char_hl {
                                 self.char_hl_scratch
@@ -397,9 +451,9 @@ impl Renderer {
                             };
                             let code = ht.ansi_code();
                             if code.is_empty() {
-                                write!(w, "{}", CtrlSafe(ch))?;
+                                write!(rb, "{}", CtrlSafe(ch))?;
                             } else {
-                                write!(w, "{}{}\x1b[0m", code, CtrlSafe(ch))?;
+                                write!(rb, "{}{}\x1b[0m", code, CtrlSafe(ch))?;
                             }
                         }
                     }
@@ -417,10 +471,10 @@ impl Renderer {
                             && self.tab_pipes_scratch[i];
                         if is_tab_pipe {
                             if current_hl != HlType::Normal {
-                                write!(w, "\x1b[0m")?;
+                                write!(rb, "\x1b[0m")?;
                                 current_hl = HlType::Normal;
                             }
-                            write!(w, "\x1b[90m{}\x1b[0m", ch)?;
+                            write!(rb, "\x1b[90m{}\x1b[0m", ch)?;
                         } else {
                             let ht = if has_char_hl {
                                 self.char_hl_scratch
@@ -432,26 +486,33 @@ impl Renderer {
                             };
                             if ht != current_hl {
                                 if ht == HlType::Normal {
-                                    write!(w, "\x1b[0m")?;
+                                    write!(rb, "\x1b[0m")?;
                                 } else {
-                                    write!(w, "{}", ht.ansi_code())?;
+                                    write!(rb, "{}", ht.ansi_code())?;
                                 }
                                 current_hl = ht;
                             }
-                            write!(w, "{}", CtrlSafe(ch))?;
+                            write!(rb, "{}", CtrlSafe(ch))?;
                         }
                     }
                     if current_hl != HlType::Normal {
-                        write!(w, "\x1b[0m")?;
+                        write!(rb, "\x1b[0m")?;
                     }
                 }
 
                 // End-of-line cursor: draw reverse-video space when cursor is past last char
                 if cursor_on_line && cursor_col == chunk_end && chunk_end == char_count {
-                    write!(w, "\x1b[1;7m \x1b[0m")?;
+                    write!(rb, "\x1b[1;7m \x1b[0m")?;
                 }
 
-                write!(w, "\x1b[0m\x1b[K")?;
+                write!(rb, "\x1b[0m\x1b[K")?;
+
+                // Dirty-line check: only emit this row if it changed from the previous frame
+                if full || self.prev_rows[screen_row] != self.row_buf {
+                    write!(w, "\x1b[{};1H", screen_row + 1)?;
+                    w.write_all(&self.row_buf)?;
+                    std::mem::swap(&mut self.prev_rows[screen_row], &mut self.row_buf);
+                }
                 screen_row += 1;
             }
 
@@ -460,47 +521,71 @@ impl Renderer {
 
         // Fill remaining screen rows with empty lines
         while screen_row < text_rows {
-            write!(w, "\x1b[{};1H", screen_row + 1)?;
+            self.row_buf.clear();
+            let rb = &mut self.row_buf;
             if ruler_on {
                 let pad = gw - 1;
-                write!(w, "\x1b[0;2m{:>width$} \x1b[0m\x1b[K", "", width = pad)?;
+                write!(rb, "\x1b[0;2m{:>width$} \x1b[0m\x1b[K", "", width = pad)?;
             } else {
-                write!(w, "\x1b[K")?;
+                write!(rb, "\x1b[K")?;
+            }
+            if full || self.prev_rows[screen_row] != self.row_buf {
+                write!(w, "\x1b[{};1H", screen_row + 1)?;
+                w.write_all(&self.row_buf)?;
+                std::mem::swap(&mut self.prev_rows[screen_row], &mut self.row_buf);
             }
             screen_row += 1;
         }
 
         // Completions area
         for (i, comp) in completions.iter().enumerate() {
-            let row = text_rows + i + 1;
-            write!(w, "\x1b[{};1H", row)?;
-            write!(w, "\x1b[2m  {}\x1b[0m\x1b[K", comp)?;
+            let idx = text_rows + i;
+            self.row_buf.clear();
+            write!(&mut self.row_buf, "\x1b[2m  {}\x1b[0m\x1b[K", comp)?;
+            if full || self.prev_rows[idx] != self.row_buf {
+                write!(w, "\x1b[{};1H", idx + 1)?;
+                w.write_all(&self.row_buf)?;
+                std::mem::swap(&mut self.prev_rows[idx], &mut self.row_buf);
+            }
         }
 
         // Status bar
-        let status_row = text_rows + completion_rows + 1;
-        write!(w, "\x1b[{};1H", status_row)?;
-        write!(w, "\x1b[0;100m")?;
-        let width = view.width as usize;
-        let left_len = status_left.len().min(width);
-        let right_len = status_right.len();
-        let padding = width.saturating_sub(left_len + right_len);
-        write!(
-            w,
-            "{}{}{}",
-            &status_left[..left_len],
-            " ".repeat(padding),
-            status_right,
-        )?;
-        write!(w, "\x1b[0m")?;
+        let status_idx = text_rows + completion_rows;
+        self.row_buf.clear();
+        {
+            let rb = &mut self.row_buf;
+            write!(rb, "\x1b[0;100m")?;
+            let width = view.width as usize;
+            let left_len = status_left.len().min(width);
+            let right_len = status_right.len();
+            let padding = width.saturating_sub(left_len + right_len);
+            write!(
+                rb,
+                "{}{}{}",
+                &status_left[..left_len],
+                " ".repeat(padding),
+                status_right,
+            )?;
+            write!(rb, "\x1b[0m")?;
+        }
+        if full || self.prev_rows[status_idx] != self.row_buf {
+            write!(w, "\x1b[{};1H", status_idx + 1)?;
+            w.write_all(&self.row_buf)?;
+            std::mem::swap(&mut self.prev_rows[status_idx], &mut self.row_buf);
+        }
 
         // Command line
-        let cmd_row = text_rows + completion_rows + 2;
-        write!(w, "\x1b[{};1H", cmd_row)?;
+        let cmd_idx = text_rows + completion_rows + 1;
+        self.row_buf.clear();
         if let Some(cmd) = command_line {
-            write!(w, "\x1b[30;43m{}\x1b[K\x1b[0m", cmd)?;
+            write!(&mut self.row_buf, "\x1b[30;43m{}\x1b[K\x1b[0m", cmd)?;
         } else {
-            write!(w, "\x1b[K")?;
+            write!(&mut self.row_buf, "\x1b[K")?;
+        }
+        if full || self.prev_rows[cmd_idx] != self.row_buf {
+            write!(w, "\x1b[{};1H", cmd_idx + 1)?;
+            w.write_all(&self.row_buf)?;
+            std::mem::swap(&mut self.prev_rows[cmd_idx], &mut self.row_buf);
         }
 
         // Position the virtual cursor for the vt parser (the real terminal cursor
@@ -509,7 +594,7 @@ impl Renderer {
             && !(find_active || has_sel)
         {
             // Software cursor in command line
-            write!(w, "\x1b[{};{}H", cmd_row, col + 1)?;
+            write!(w, "\x1b[{};{}H", cmd_idx + 1, col + 1)?;
             let ch = command_line.and_then(|s| s.chars().nth(col)).unwrap_or(' ');
             write!(w, "\x1b[1;7m{}\x1b[0m", ch)?;
         }
@@ -548,8 +633,61 @@ impl Renderer {
         out.write_all(&frame)?;
         out.flush()?;
         self.needs_full_redraw = false;
+        self.prev_scroll_line = view.scroll_line;
+        self.prev_scroll_wrap = view.scroll_wrap;
+        self.prev_text_rows = text_rows;
         self.frame_buf = frame;
         Ok(())
+    }
+
+    /// Compute screen-row scroll delta between previous and current frame.
+    /// Positive = scrolled down, negative = scrolled up. Returns 0 if unknown.
+    fn compute_scroll_delta(
+        &mut self,
+        view: &View,
+        buf: &mut GapBuffer,
+        text_cols: usize,
+        text_rows: usize,
+    ) -> isize {
+        let (old_line, old_wrap) = (self.prev_scroll_line, self.prev_scroll_wrap);
+        let (new_line, new_wrap) = (view.scroll_line, view.scroll_wrap);
+        if old_line == new_line && old_wrap == new_wrap {
+            return 0;
+        }
+        // Walk forward from old to new (scrolled down) or new to old (scrolled up),
+        // counting screen rows. Cap the walk to avoid O(N) on huge jumps.
+        let (from_line, from_wrap, to_line, to_wrap, sign) =
+            if (new_line, new_wrap) > (old_line, old_wrap) {
+                (old_line, old_wrap, new_line, new_wrap, 1isize)
+            } else {
+                (new_line, new_wrap, old_line, old_wrap, -1isize)
+            };
+
+        let line_count = buf.line_count();
+        let mut rows = 0isize;
+        let mut line = from_line;
+        let mut wrap = from_wrap;
+        let limit = text_rows as isize;
+
+        while (line, wrap) < (to_line, to_wrap) && line < line_count {
+            buf.line_text_into(line, &mut self.line_buf);
+            let dw = display_col_for_char_col(&self.line_buf, usize::MAX);
+            let total_wraps = crate::view::wrapped_rows(dw, text_cols);
+            let remaining_in_line = total_wraps.saturating_sub(wrap);
+
+            if line == to_line {
+                // Same line, just advancing wraps
+                rows += (to_wrap - wrap) as isize;
+                break;
+            }
+            rows += remaining_in_line as isize;
+            if rows >= limit {
+                return 0; // Too far — treat as full redraw
+            }
+            line += 1;
+            wrap = 0;
+        }
+        rows * sign
     }
 
     /// Ensure `hl_cache` covers lines `0..end`, computing only what's needed.
