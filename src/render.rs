@@ -650,16 +650,23 @@ impl Renderer {
 
 pub(crate) fn display_col_for_char_col(raw_text: &[u8], char_col: usize) -> usize {
     let mut display = 0;
-    let mut ci = 0;
-    let mut bi = 0;
-    while ci < char_col && bi < raw_text.len() {
-        if raw_text[bi] == b'\t' {
-            display += 2;
-        } else {
-            display += 1;
+    if raw_text.is_ascii() {
+        let end = char_col.min(raw_text.len());
+        for &b in &raw_text[..end] {
+            display += if b == b'\t' { 2 } else { 1 };
         }
-        bi += buffer::utf8_char_len(raw_text[bi]);
-        ci += 1;
+    } else {
+        let mut ci = 0;
+        let mut bi = 0;
+        while ci < char_col && bi < raw_text.len() {
+            if raw_text[bi] == b'\t' {
+                display += 2;
+            } else {
+                display += 1;
+            }
+            bi += buffer::utf8_char_len(raw_text[bi]);
+            ci += 1;
+        }
     }
     display
 }

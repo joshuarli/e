@@ -9,6 +9,10 @@ pub struct GapBuffer {
     /// Byte offsets of line starts (entry 0 is always 0). Always valid — updated
     /// incrementally on every insert/delete.
     line_starts: Vec<usize>,
+    /// Per-line ASCII flag (parallel to `line_starts`). When true, every byte on
+    /// that line is < 0x80, so char_count == byte_len and char/byte offsets are
+    /// identical — all UTF-8 walking can be skipped.
+    line_ascii: Vec<bool>,
     /// Min line touched since the last `take_dirty_line()` call.
     min_dirty_line: usize,
     /// Monotonically increasing counter, bumped on every insert/delete.
@@ -31,6 +35,7 @@ impl GapBuffer {
             gap_start: 0,
             gap_end: gap,
             line_starts: vec![0],
+            line_ascii: vec![true],
             min_dirty_line: usize::MAX,
             version: 0,
         }
@@ -50,18 +55,27 @@ impl GapBuffer {
         // Heuristic: typical source lines are ~20 bytes; pre-allocate to avoid
         // the ~20 doublings that Vec would otherwise do for 1M-line files.
         let mut starts = Vec::with_capacity(content_len / 20 + 16);
+        let mut ascii = Vec::with_capacity(content_len / 20 + 16);
         starts.push(0usize);
+        let mut line_is_ascii = true;
         for (i, &b) in data.iter().enumerate() {
+            if b >= 0x80 {
+                line_is_ascii = false;
+            }
             if b == b'\n' && i + 1 < content_len {
                 starts.push(i + 1);
+                ascii.push(line_is_ascii);
+                line_is_ascii = true;
             }
         }
+        ascii.push(line_is_ascii); // last line
         data.resize(content_len + gap, 0);
         Self {
             data,
             gap_start: content_len,
             gap_end: content_len + gap,
             line_starts: starts,
+            line_ascii: ascii,
             min_dirty_line: usize::MAX,
             version: 0,
         }
@@ -224,6 +238,36 @@ impl GapBuffer {
             }),
         );
 
+        // Maintain per-line ASCII flags.
+        let was_ascii = self.line_ascii[insert_line];
+        let inserted_ascii = bytes.is_ascii();
+        let has_newlines = bytes.contains(&b'\n');
+        if !has_newlines {
+            // Common case: no line splits — just taint if non-ASCII
+            if !inserted_ascii {
+                self.line_ascii[insert_line] = false;
+            }
+        } else {
+            // Build per-segment ASCII flags with a single pass
+            let mut new_flags: Vec<bool> = Vec::new();
+            let mut seg_ascii = true;
+            for &b in bytes {
+                if b == b'\n' {
+                    new_flags.push(seg_ascii);
+                    seg_ascii = true;
+                } else if b >= 0x80 {
+                    seg_ascii = false;
+                }
+            }
+            // First segment merges with old line prefix
+            self.line_ascii[insert_line] = was_ascii && new_flags[0];
+            // Middle segments are purely from inserted bytes; last merges with old suffix
+            let last = new_flags.len();
+            new_flags.push(was_ascii && seg_ascii);
+            self.line_ascii
+                .splice(shift_from..shift_from, new_flags[1..=last].iter().copied());
+        }
+
         self.min_dirty_line = self.min_dirty_line.min(insert_line);
     }
 
@@ -243,6 +287,13 @@ impl GapBuffer {
         // that means starts S where pos < S <= pos+count
         let lo = self.line_starts.partition_point(|&s| s <= pos);
         let hi = self.line_starts.partition_point(|&s| s <= pos + count);
+
+        // Merged line is ASCII only if all merging lines were ASCII
+        let merged_ascii =
+            self.line_ascii[affected_line] && self.line_ascii[lo..hi].iter().all(|&a| a);
+        self.line_ascii.drain(lo..hi);
+        self.line_ascii[affected_line] = merged_ascii;
+
         self.line_starts.drain(lo..hi);
 
         // Shift surviving entries that are > pos
@@ -259,6 +310,11 @@ impl GapBuffer {
         let v = self.min_dirty_line;
         self.min_dirty_line = usize::MAX;
         v
+    }
+
+    /// Returns true if every byte on `line` is ASCII (< 0x80).
+    pub fn line_is_ascii(&self, line: usize) -> bool {
+        self.line_ascii[line]
     }
 
     pub fn line_count(&self) -> usize {
@@ -316,16 +372,27 @@ impl GapBuffer {
         let ls = self.line_start(line);
         let le = self.line_end(line);
         let mut display = 0usize;
-        let mut ci = 0usize;
-        let mut bi = ls;
-        while ci < char_col && bi < le {
-            let b = self.byte_at(bi);
-            if b == b'\n' {
-                break;
+        if self.line_ascii[line] {
+            let end = ls.saturating_add(char_col).min(le);
+            for bi in ls..end {
+                let b = self.byte_at(bi);
+                if b == b'\n' {
+                    break;
+                }
+                display += if b == b'\t' { 2 } else { 1 };
             }
-            display += if b == b'\t' { 2 } else { 1 };
-            bi += utf8_char_len(b);
-            ci += 1;
+        } else {
+            let mut ci = 0usize;
+            let mut bi = ls;
+            while ci < char_col && bi < le {
+                let b = self.byte_at(bi);
+                if b == b'\n' {
+                    break;
+                }
+                display += if b == b'\t' { 2 } else { 1 };
+                bi += utf8_char_len(b);
+                ci += 1;
+            }
         }
         display
     }
@@ -338,19 +405,34 @@ impl GapBuffer {
         let le = self.line_end(line);
         let mut display = 0usize;
         let mut ci = 0usize;
-        let mut bi = ls;
-        while bi < le {
-            let b = self.byte_at(bi);
-            if b == b'\n' {
-                break;
+        if self.line_ascii[line] {
+            for bi in ls..le {
+                let b = self.byte_at(bi);
+                if b == b'\n' {
+                    break;
+                }
+                let w = if b == b'\t' { 2 } else { 1 };
+                if display + w > target_display {
+                    break;
+                }
+                display += w;
+                ci += 1;
             }
-            let w = if b == b'\t' { 2 } else { 1 };
-            if display + w > target_display {
-                break;
+        } else {
+            let mut bi = ls;
+            while bi < le {
+                let b = self.byte_at(bi);
+                if b == b'\n' {
+                    break;
+                }
+                let w = if b == b'\t' { 2 } else { 1 };
+                if display + w > target_display {
+                    break;
+                }
+                display += w;
+                bi += utf8_char_len(b);
+                ci += 1;
             }
-            display += w;
-            bi += utf8_char_len(b);
-            ci += 1;
         }
         ci
     }
@@ -365,15 +447,19 @@ impl GapBuffer {
         } else {
             end
         };
-        let mut byte_off = 0;
-        let mut char_idx = 0;
-        while char_idx < col && start + byte_off < limit {
-            let advance =
-                utf8_char_len(self.byte_at(start + byte_off)).min(limit - (start + byte_off));
-            byte_off += advance;
-            char_idx += 1;
+        if self.line_ascii[line] {
+            start + col.min(limit - start)
+        } else {
+            let mut byte_off = 0;
+            let mut char_idx = 0;
+            while char_idx < col && start + byte_off < limit {
+                let advance =
+                    utf8_char_len(self.byte_at(start + byte_off)).min(limit - (start + byte_off));
+                byte_off += advance;
+                char_idx += 1;
+            }
+            start + byte_off
         }
-        start + byte_off
     }
 
     /// Convert a byte offset to (line, col). Col is character count.
@@ -385,9 +471,12 @@ impl GapBuffer {
             Err(l) => l.saturating_sub(1),
         };
         let line_start = starts[line];
-        // count chars from line_start to offset
-        let col = self.char_count_in_range(line_start, offset);
-        (line, col)
+        if self.line_ascii[line] {
+            (line, offset - line_start)
+        } else {
+            let col = self.char_count_in_range(line_start, offset);
+            (line, col)
+        }
     }
 
     fn char_count_in_range(&self, from: usize, to: usize) -> usize {
@@ -410,7 +499,11 @@ impl GapBuffer {
         } else {
             end
         };
-        self.char_count_in_range(start, end)
+        if self.line_ascii[line] {
+            end - start
+        } else {
+            self.char_count_in_range(start, end)
+        }
     }
 }
 
@@ -427,6 +520,9 @@ pub fn utf8_char_len(first_byte: u8) -> usize {
 }
 
 pub fn char_count(bytes: &[u8]) -> usize {
+    if bytes.is_ascii() {
+        return bytes.len();
+    }
     let mut count = 0;
     let mut i = 0;
     while i < bytes.len() {
@@ -439,6 +535,9 @@ pub fn char_count(bytes: &[u8]) -> usize {
 /// Convert a char column index to a byte offset in a UTF-8 byte slice.
 /// Returns `bytes.len()` if `char_col` is past the end.
 pub fn char_to_byte(bytes: &[u8], char_col: usize) -> usize {
+    if bytes.is_ascii() {
+        return char_col.min(bytes.len());
+    }
     let mut bi = 0;
     let mut ci = 0;
     while ci < char_col && bi < bytes.len() {
@@ -863,6 +962,95 @@ mod tests {
         buf.insert(2, b"Y"); // line 1 (b line) — should be the min
         let d = buf.take_dirty_line();
         assert_eq!(d, 1); // min of line 2 and line 1
+    }
+
+    // -- line_ascii flag -------------------------------------------------------
+
+    #[test]
+    fn test_ascii_flag_pure_ascii() {
+        let buf = GapBuffer::from_text(b"hello\nworld\n");
+        assert!(buf.line_is_ascii(0));
+        assert!(buf.line_is_ascii(1));
+    }
+
+    #[test]
+    fn test_ascii_flag_utf8_line() {
+        let buf = GapBuffer::from_text("hello\ncaf\u{e9}\nworld".as_bytes());
+        assert!(buf.line_is_ascii(0));
+        assert!(!buf.line_is_ascii(1)); // "café" has non-ASCII
+        assert!(buf.line_is_ascii(2));
+    }
+
+    #[test]
+    fn test_ascii_flag_insert_ascii() {
+        let mut buf = GapBuffer::from_text(b"ab\ncd");
+        assert!(buf.line_is_ascii(0));
+        buf.insert(1, b"X");
+        assert!(buf.line_is_ascii(0)); // still ASCII
+    }
+
+    #[test]
+    fn test_ascii_flag_insert_utf8() {
+        let mut buf = GapBuffer::from_text(b"ab\ncd");
+        assert!(buf.line_is_ascii(0));
+        buf.insert(1, "\u{e9}".as_bytes()); // insert é
+        assert!(!buf.line_is_ascii(0)); // now non-ASCII
+        assert!(buf.line_is_ascii(1)); // other line unaffected
+    }
+
+    #[test]
+    fn test_ascii_flag_insert_newline_splits() {
+        let mut buf = GapBuffer::from_text(b"abcd");
+        assert_eq!(buf.line_count(), 1);
+        buf.insert(2, b"\n"); // split into "ab" and "cd"
+        assert_eq!(buf.line_count(), 2);
+        assert!(buf.line_is_ascii(0));
+        assert!(buf.line_is_ascii(1));
+    }
+
+    #[test]
+    fn test_ascii_flag_insert_newline_with_utf8() {
+        let mut buf = GapBuffer::from_text(b"abcd");
+        buf.insert(2, "x\u{e9}\ny".as_bytes()); // insert "xé\ny"
+        assert_eq!(buf.line_count(), 2);
+        assert!(!buf.line_is_ascii(0)); // "abxé" has non-ASCII
+        assert!(buf.line_is_ascii(1)); // "ycd" is ASCII
+    }
+
+    #[test]
+    fn test_ascii_flag_delete_merges_lines() {
+        let mut buf = GapBuffer::from_text(b"ab\ncd");
+        assert!(buf.line_is_ascii(0));
+        assert!(buf.line_is_ascii(1));
+        buf.delete(2, 1); // delete the \n, merging into "abcd"
+        assert_eq!(buf.line_count(), 1);
+        assert!(buf.line_is_ascii(0));
+    }
+
+    #[test]
+    fn test_ascii_flag_delete_merge_preserves_non_ascii() {
+        let mut buf = GapBuffer::from_text("ab\ncaf\u{e9}".as_bytes());
+        assert!(buf.line_is_ascii(0));
+        assert!(!buf.line_is_ascii(1));
+        buf.delete(2, 1); // delete \n, merge into "abcafé"
+        assert_eq!(buf.line_count(), 1);
+        assert!(!buf.line_is_ascii(0)); // merged line is non-ASCII
+    }
+
+    #[test]
+    fn test_ascii_fast_path_line_char_len() {
+        let buf = GapBuffer::from_text("hello\ncaf\u{e9}".as_bytes());
+        assert_eq!(buf.line_char_len(0), 5); // ASCII: fast path
+        assert_eq!(buf.line_char_len(1), 4); // "café" = 4 chars, 5 bytes
+    }
+
+    #[test]
+    fn test_ascii_fast_path_pos_to_offset() {
+        let buf = GapBuffer::from_text("hello\ncaf\u{e9}".as_bytes());
+        // ASCII line: col == byte offset from line start
+        assert_eq!(buf.pos_to_offset(0, 3), 3);
+        // UTF-8 line: col 3 → byte offset for 'é' (byte 9)
+        assert_eq!(buf.pos_to_offset(1, 3), 9);
     }
 }
 

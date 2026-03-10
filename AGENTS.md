@@ -61,6 +61,7 @@ pub struct GapBuffer {
     gap_start: usize,           // Start of gap
     gap_end: usize,             // End of gap
     line_starts: Vec<usize>,    // Always-valid byte offsets of line starts
+    line_ascii: Vec<bool>,      // Per-line ASCII flag (parallel to line_starts)
     min_dirty_line: usize,      // Min line touched since last take_dirty_line(); usize::MAX = clean
     version: u64,               // Monotonically increasing, bumped on every insert/delete
 }
@@ -71,19 +72,20 @@ pub struct GapBuffer {
 - Insertions fill the gap. Deletions widen the gap.
 - `move_gap_to(pos)` shifts the gap to a logical byte offset using `copy_within`.
 - `ensure_gap(needed)` grows the buffer if gap is too small, shifting the tail right.
-- `from_vec(data: Vec<u8>) -> Self` — production fast path: takes ownership of the data Vec, pre-allocates `line_starts` with heuristic `content_len / 20 + 16` (avoids ~20 growth doublings for large files), extends the Vec in-place for the gap. Only one allocation total for the whole file-open path.
+- `from_vec(data: Vec<u8>) -> Self` — production fast path: takes ownership of the data Vec, pre-allocates `line_starts` and `line_ascii` with heuristic `content_len / 20 + 16`, extends the Vec in-place for the gap. Builds ASCII flags in the same byte-scan pass as line starts (zero extra cost).
 - Line index: always valid, updated incrementally on every insert/delete. `from_vec()` scans bytes once at load. Each edit uses `binary_search` to locate the affected region and shifts/inserts/removes only the changed entries. A trailing `\n` does NOT create a new line entry.
+- **ASCII fast path**: `line_ascii[i]` is true when every byte on line `i` is < 0x80. Maintained incrementally: inserts taint the line if non-ASCII bytes are introduced; deletes that merge lines AND the flags (conservative — a line marked non-ASCII stays non-ASCII even if the non-ASCII byte is later deleted). When a line is ASCII, `line_char_len` = O(1), `pos_to_offset` = O(1), `offset_to_pos` col = O(1), and display-column mapping skips `utf8_char_len` calls.
 - `take_dirty_line() -> usize` — returns and resets `min_dirty_line` (used by renderer for incremental highlight invalidation).
-- All line-query methods (`line_count`, `line_start`, `line_end`, `line_text`, `pos_to_offset`, `offset_to_pos`, `line_char_len`) take `&self` — no mutable borrow needed.
-- `pos_to_offset(line, col)` walks UTF-8 chars from line start to find byte offset.
-- `offset_to_pos(offset)` binary searches `line_starts` for the line, then counts UTF-8 chars for the column.
-- `display_col_at(line, char_col) -> usize` — display column at `char_col` chars into the line (tabs = 2, other = 1). Pass `usize::MAX` for total line display width. Does not allocate.
-- `char_col_from_display(line, target_display) -> usize` — inverse of `display_col_at`: maps a display column back to a char column. Does not allocate.
+- All line-query methods (`line_count`, `line_start`, `line_end`, `line_text`, `pos_to_offset`, `offset_to_pos`, `line_char_len`, `line_is_ascii`) take `&self` — no mutable borrow needed.
+- `pos_to_offset(line, col)` — ASCII lines: `start + col.min(byte_len)` (O(1)). UTF-8 lines: walks chars from line start.
+- `offset_to_pos(offset)` — binary searches `line_starts` for the line. ASCII lines: col = `offset - line_start` (O(1)). UTF-8 lines: counts chars.
+- `display_col_at(line, char_col) -> usize` — display column at `char_col` chars into the line (tabs = 2, other = 1). Pass `usize::MAX` for total line display width. ASCII fast path uses direct byte indexing. Does not allocate.
+- `char_col_from_display(line, target_display) -> usize` — inverse of `display_col_at`. ASCII fast path. Does not allocate.
 
 Free functions:
 - `utf8_char_len(first_byte: u8) -> usize` — returns 1-4 based on leading byte. Continuation bytes (0x80-0xBF) return 1 (treated as single invalid bytes). Walking functions (`pos_to_offset`, `char_count_in_range`) cap multi-byte advances to never cross range boundaries, handling invalid UTF-8 gracefully.
-- `char_count(bytes: &[u8]) -> usize` — counts UTF-8 characters.
-- `char_to_byte(bytes: &[u8], char_col: usize) -> usize` — converts character column index to byte offset in UTF-8 bytes.
+- `char_count(bytes: &[u8]) -> usize` — counts UTF-8 characters. Uses `bytes.is_ascii()` (SIMD-optimized) for O(1) fast path.
+- `char_to_byte(bytes: &[u8], char_col: usize) -> usize` — converts character column index to byte offset. ASCII fast path: `col.min(len)`.
 
 ### 3.2 Document (`document.rs`)
 

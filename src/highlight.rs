@@ -1330,6 +1330,9 @@ pub fn find_quote_match(
 }
 
 fn char_col_to_byte(line: &[u8], char_col: usize) -> Option<usize> {
+    if line.is_ascii() {
+        return Some(char_col.min(line.len()));
+    }
     let mut bi = 0;
     let mut ci = 0;
     while ci < char_col && bi < line.len() {
@@ -1340,6 +1343,9 @@ fn char_col_to_byte(line: &[u8], char_col: usize) -> Option<usize> {
 }
 
 fn byte_to_char_col(line: &[u8], byte_idx: usize) -> usize {
+    if line.is_ascii() {
+        return byte_idx.min(line.len());
+    }
     let mut bi = 0;
     let mut ci = 0;
     while bi < byte_idx && bi < line.len() {
@@ -1356,17 +1362,27 @@ fn byte_to_char_col(line: &[u8], byte_idx: usize) -> usize {
 /// Clears `out` first; reuses its allocation across calls.
 pub fn byte_hl_to_char_hl_into(raw: &[u8], byte_hl: &[HlType], out: &mut Vec<HlType>) {
     out.clear();
-    let mut bi = 0;
-    while bi < raw.len() {
-        let ht = byte_hl[bi];
-        if raw[bi] == b'\t' {
-            // Tab expands to 2 display positions
-            out.push(ht);
-            out.push(ht);
-            bi += 1;
-        } else {
-            out.push(ht);
-            bi += buffer::utf8_char_len(raw[bi]);
+    if raw.is_ascii() {
+        // ASCII fast path: 1 byte = 1 char, tabs expand to 2 display positions
+        out.reserve(raw.len());
+        for (i, &b) in raw.iter().enumerate() {
+            out.push(byte_hl[i]);
+            if b == b'\t' {
+                out.push(byte_hl[i]);
+            }
+        }
+    } else {
+        let mut bi = 0;
+        while bi < raw.len() {
+            let ht = byte_hl[bi];
+            if raw[bi] == b'\t' {
+                out.push(ht);
+                out.push(ht);
+                bi += 1;
+            } else {
+                out.push(ht);
+                bi += buffer::utf8_char_len(raw[bi]);
+            }
         }
     }
 }
