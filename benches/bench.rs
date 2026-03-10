@@ -16,23 +16,54 @@ use e::selection::Pos;
 use e::view::{self, View};
 
 // ---------------------------------------------------------------------------
-// Counting allocator
+// Counting allocator — tracks allocations, live bytes, and peak (high-water)
 // ---------------------------------------------------------------------------
 
 struct CountingAlloc;
 
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Update peak to be the max of current peak and current live bytes.
+fn update_peak() {
+    let live = LIVE_BYTES.load(Relaxed);
+    let mut peak = PEAK_BYTES.load(Relaxed);
+    while live > peak {
+        match PEAK_BYTES.compare_exchange_weak(peak, live, Relaxed, Relaxed) {
+            Ok(_) => break,
+            Err(actual) => peak = actual,
+        }
+    }
+}
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOC_COUNT.fetch_add(1, Relaxed);
         ALLOC_BYTES.fetch_add(layout.size(), Relaxed);
+        LIVE_BYTES.fetch_add(layout.size(), Relaxed);
+        update_peak();
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_BYTES.fetch_sub(layout.size(), Relaxed);
         unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        ALLOC_COUNT.fetch_add(1, Relaxed);
+        if new_size > layout.size() {
+            let delta = new_size - layout.size();
+            ALLOC_BYTES.fetch_add(delta, Relaxed);
+            LIVE_BYTES.fetch_add(delta, Relaxed);
+        } else {
+            let delta = layout.size() - new_size;
+            LIVE_BYTES.fetch_sub(delta, Relaxed);
+        }
+        update_peak();
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
 
@@ -42,6 +73,7 @@ static GLOBAL: CountingAlloc = CountingAlloc;
 fn reset_alloc_counters() {
     ALLOC_COUNT.store(0, Relaxed);
     ALLOC_BYTES.store(0, Relaxed);
+    PEAK_BYTES.store(LIVE_BYTES.load(Relaxed), Relaxed);
 }
 
 fn alloc_count() -> usize {
@@ -50,6 +82,53 @@ fn alloc_count() -> usize {
 
 fn alloc_bytes() -> usize {
     ALLOC_BYTES.load(Relaxed)
+}
+
+fn peak_bytes() -> usize {
+    PEAK_BYTES.load(Relaxed)
+}
+
+/// Snapshot of allocation counters for a measured region.
+#[derive(Clone, Copy)]
+struct AllocStats {
+    count: usize,
+    bytes: usize,
+    peak_delta: usize,
+}
+
+impl std::fmt::Display for AllocStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn human(n: usize) -> String {
+            if n >= 1_048_576 {
+                format!("{:.1} MiB", n as f64 / 1_048_576.0)
+            } else if n >= 1024 {
+                format!("{:.1} KiB", n as f64 / 1024.0)
+            } else {
+                format!("{n} B")
+            }
+        }
+        write!(
+            f,
+            "{} allocs, {} total, {} peak",
+            self.count,
+            human(self.bytes),
+            human(self.peak_delta)
+        )
+    }
+}
+
+/// Reset counters, run `f`, return stats for the measured region.
+/// Peak is reported as a delta above the live-bytes baseline at entry.
+fn measure_allocs<F: FnOnce()>(f: F) -> AllocStats {
+    let baseline = LIVE_BYTES.load(Relaxed);
+    reset_alloc_counters();
+    f();
+    let peak = peak_bytes();
+    AllocStats {
+        count: alloc_count(),
+        bytes: alloc_bytes(),
+        peak_delta: peak.saturating_sub(baseline),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -342,43 +421,80 @@ fn bench_alloc_counts(c: &mut Criterion) {
     let data = make_rust_source(1_000);
     let rules = highlight::rules_for_language("Rust").unwrap();
 
-    // Measure allocations for highlighting (using _into variant should be ~0)
-    group.bench_function("highlight_1k_into_allocs", |b| {
+    // One-shot allocation reports (printed, not benchmarked for speed)
+    {
         let mut out = Vec::new();
-        b.iter(|| {
-            reset_alloc_counters();
+        let stats = measure_allocs(|| {
             let mut state = HlState::default();
             for line in data.split(|&byte| byte == b'\n') {
                 state = highlight::highlight_line_into(line, state, rules, &mut out);
             }
-            let count = alloc_count();
-            let bytes = alloc_bytes();
-            black_box((count, bytes));
         });
-    });
+        eprintln!("  [alloc] highlight_1k_into:  {stats}");
 
-    // Measure allocations for pos_to_offset (should be 0)
-    group.bench_function("pos_to_offset_allocs", |b| {
         let buf = GapBuffer::from_vec(data.clone());
-        b.iter(|| {
-            reset_alloc_counters();
+        let stats = measure_allocs(|| {
             for line in 0..buf.line_count() {
                 buf.pos_to_offset(line, 0);
             }
-            let count = alloc_count();
-            black_box(count);
+        });
+        eprintln!("  [alloc] pos_to_offset_1k:   {stats}");
+
+        let stats = measure_allocs(|| {
+            let mut buf2 = GapBuffer::from_vec(data.clone());
+            buf2.insert(0, b"hello");
+            black_box(&buf2);
+        });
+        eprintln!("  [alloc] single_insert:      {stats}");
+
+        let stats = measure_allocs(|| {
+            let mut state = HlState::default();
+            for line in data.split(|&byte| byte == b'\n') {
+                let (hl, next) = highlight::highlight_line(line, state, rules);
+                state = next;
+                black_box(&hl);
+            }
+        });
+        eprintln!("  [alloc] highlight_1k_alloc: {stats}");
+    }
+
+    // Criterion timing benchmarks for the same operations
+    group.bench_function("highlight_1k_into", |b| {
+        let mut out = Vec::new();
+        b.iter(|| {
+            let mut state = HlState::default();
+            for line in data.split(|&byte| byte == b'\n') {
+                state = highlight::highlight_line_into(line, state, rules, &mut out);
+            }
+            black_box(&out);
         });
     });
 
-    // Measure allocations for a single insert
-    group.bench_function("single_insert_allocs", |b| {
+    group.bench_function("highlight_1k_alloc", |b| {
+        b.iter(|| {
+            let mut state = HlState::default();
+            for line in data.split(|&byte| byte == b'\n') {
+                let (hl, next) = highlight::highlight_line(line, state, rules);
+                state = next;
+                black_box(&hl);
+            }
+        });
+    });
+
+    group.bench_function("pos_to_offset_1k", |b| {
+        let buf = GapBuffer::from_vec(data.clone());
+        b.iter(|| {
+            for line in 0..buf.line_count() {
+                black_box(buf.pos_to_offset(line, 0));
+            }
+        });
+    });
+
+    group.bench_function("single_insert", |b| {
         b.iter(|| {
             let mut buf = GapBuffer::from_vec(data.clone());
-            reset_alloc_counters();
             buf.insert(0, b"hello");
-            let count = alloc_count();
-            let bytes = alloc_bytes();
-            black_box((count, bytes));
+            black_box(&buf);
         });
     });
 
