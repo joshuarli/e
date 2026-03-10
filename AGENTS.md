@@ -685,7 +685,7 @@ pub struct Renderer {
    - Expand tabs in each line (`\t` → `|` + space, 2 display columns).
    - Convert to chars. Compute wrapped rows.
    - For each wrapped chunk:
-     - **Gutter**: line number (right-aligned, formatted via `write_line_num` into a stack `[u8; 20]` — no heap allocation) on first wrap row; blank on continuation rows. Current line: white bg black text (`\x1b[0;47;30m`). Other lines: dim (`\x1b[0;2m`).
+     - **Gutter**: line number (right-aligned, formatted via `write_line_num` into a stack `[u8; 20]` — no heap allocation) on first wrap row; blank on continuation rows. Current line: white bg black text (`\x1b[0;47;30m`). Other lines: dark grey (`\x1b[0;90m`).
      - **Content**: two paths:
        - **Slow path** (selection, find matches, or bracket matches present): per-character rendering with priority: selection (reverse video `\x1b[7m`) > find match (yellow bg `\x1b[43;30m`, current match green bg `\x1b[42;30m`) > bracket match (magenta bg `\x1b[45;30m`) > tab pipe (dark grey `\x1b[90m`) > syntax highlight. Bracket match highlights only the *matching* character (not the cursor's character — the terminal cursor already shows the cursor position).
        - **Fast path** (no overlays): streaming syntax highlighting with minimal escape changes. Tab pipes handled inline.
@@ -693,7 +693,7 @@ pub struct Renderer {
      - Reset and erase to end of line: `\x1b[0m\x1b[K`.
 8. Fill remaining rows with empty lines (blank gutters if ruler on).
 9. **Completions**: dim text (`\x1b[2m`) on rows above status bar.
-10. **Status bar**: reverse video (`\x1b[0;7m`). Left: built by `build_status_left()` into `Editor::status_left_cache` (reused `String`, filled with `push`/`push_str` — no `format!` allocation after warm-up); the `&str` is passed to `render()`. Right: `" e vVERSION "` (`&'static str` via `concat!`, no per-frame allocation). Padded with spaces to fill width.
+10. **Status bar**: dark grey background (`\x1b[0;100m`). Left: built by `build_status_left()` into `Editor::status_left_cache` (reused `String`, filled with `push`/`push_str` — no `format!` allocation after warm-up); the `&str` is passed to `render()`. Right: `" e vVERSION "` (`&'static str` via `concat!`, no per-frame allocation). Padded with spaces to fill width.
 11. **Command line**: if active, yellow bg black text (`\x1b[30;43m`) + erase to end. If status message, display it. Otherwise blank.
 12. **Cursor positioning**:
     - If `find.active` or selection active: cursor stays hidden.

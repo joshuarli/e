@@ -327,12 +327,12 @@ impl Renderer {
                         if is_cursor_line {
                             write!(w, "\x1b[0;47;30m{:>width$}\x1b[0m ", num_str, width = pad)?;
                         } else {
-                            write!(w, "\x1b[0;2m{:>width$} \x1b[0m", num_str, width = pad)?;
+                            write!(w, "\x1b[0;90m{:>width$} \x1b[0m", num_str, width = pad)?;
                         }
                     } else if is_cursor_line {
                         write!(w, "\x1b[0;47;30m{:>width$}\x1b[0m ", "", width = gw - 1)?;
                     } else {
-                        write!(w, "\x1b[0;2m{:>width$} \x1b[0m", "", width = gw - 1)?;
+                        write!(w, "\x1b[0;90m{:>width$} \x1b[0m", "", width = gw - 1)?;
                     }
                 }
 
@@ -480,7 +480,7 @@ impl Renderer {
         // Status bar
         let status_row = text_rows + completion_rows + 1;
         write!(w, "\x1b[{};1H", status_row)?;
-        write!(w, "\x1b[0;7m")?;
+        write!(w, "\x1b[0;100m")?;
         let width = view.width as usize;
         let left_len = status_left.len().min(width);
         let right_len = status_right.len();
