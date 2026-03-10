@@ -1,6 +1,6 @@
 NAME   := e
-UNAME  := $(shell uname -m)
-TARGET := $(UNAME)-apple-darwin
+ARCH   := $(shell uname -m | sed 's/arm64/aarch64/')
+TARGET := $(ARCH)-apple-darwin
 
 .PHONY: setup build-dev release install test test-ci record gifs pc bump-version
 
@@ -54,5 +54,5 @@ endif
 	sed -i '' 's/^version = ".*"/version = "$(V)"/' Cargo.toml
 	cargo check --quiet 2>/dev/null
 	git add Cargo.toml Cargo.lock
-	git commit -m "bump version to v$(V)"
-	git tag "v$(V)"
+	git commit -m "bump version to $(V)"
+	git tag "release/$(V)"
