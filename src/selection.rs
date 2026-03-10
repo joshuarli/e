@@ -283,3 +283,68 @@ mod tests {
         assert_eq!(next_word_boundary(b"", 0), 0);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// prev_word_boundary always returns <= col and within bounds.
+        #[test]
+        fn prev_word_boundary_in_bounds(
+            line in prop::collection::vec(any::<u8>(), 0..128),
+            col in 0usize..256,
+        ) {
+            let result = prev_word_boundary(&line, col);
+            prop_assert!(result <= col);
+            prop_assert!(result <= line.len());
+        }
+
+        /// next_word_boundary always returns >= col and within bounds.
+        #[test]
+        fn next_word_boundary_in_bounds(
+            line in prop::collection::vec(any::<u8>(), 0..128),
+            col in 0usize..256,
+        ) {
+            let result = next_word_boundary(&line, col.min(line.len()));
+            prop_assert!(result >= col.min(line.len()));
+            prop_assert!(result <= line.len());
+        }
+
+        /// Selection::ordered always returns (start <= end).
+        #[test]
+        fn selection_ordered_invariant(
+            al in 0usize..1000, ac in 0usize..1000,
+            cl in 0usize..1000, cc in 0usize..1000,
+        ) {
+            let sel = Selection {
+                anchor: Pos::new(al, ac),
+                cursor: Pos::new(cl, cc),
+            };
+            let (start, end) = sel.ordered();
+            prop_assert!(start <= end);
+            // One of them should be anchor, the other cursor
+            prop_assert!(
+                (start == sel.anchor && end == sel.cursor)
+                || (start == sel.cursor && end == sel.anchor)
+            );
+        }
+
+        /// Pos ordering is a total order (transitivity, antisymmetry).
+        #[test]
+        fn pos_ordering_total(
+            l1 in 0usize..100, c1 in 0usize..100,
+            l2 in 0usize..100, c2 in 0usize..100,
+        ) {
+            let a = Pos::new(l1, c1);
+            let b = Pos::new(l2, c2);
+            // Antisymmetry: if a <= b and b <= a then a == b
+            if a <= b && b <= a {
+                prop_assert_eq!(a, b);
+            }
+            // Totality: either a <= b or b <= a
+            prop_assert!(a <= b || b <= a);
+        }
+    }
+}

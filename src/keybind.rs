@@ -112,7 +112,7 @@ fn config_path() -> PathBuf {
         .join("keybindings.ini")
 }
 
-fn parse_key(s: &str) -> Option<Key> {
+pub fn parse_key(s: &str) -> Option<Key> {
     if let Some(ch) = s.strip_prefix("ctrl+")
         && ch.len() == 1
     {
@@ -121,7 +121,7 @@ fn parse_key(s: &str) -> Option<Key> {
     None
 }
 
-fn parse_action(s: &str) -> Option<EditorAction> {
+pub fn parse_action(s: &str) -> Option<EditorAction> {
     match s {
         "save" => Some(EditorAction::Save),
         "quit" => Some(EditorAction::Quit),

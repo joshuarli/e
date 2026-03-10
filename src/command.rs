@@ -4,7 +4,7 @@ use std::collections::HashMap;
 /// Parse a command argument string into tokens, respecting single and double quotes.
 /// Unquoted tokens are split on whitespace. Quoted tokens preserve interior whitespace
 /// and the quotes are stripped. Backslash-escaping is NOT supported (keep it simple).
-fn parse_args(input: &str) -> Vec<String> {
+pub fn parse_args(input: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut chars = input.chars().peekable();
 

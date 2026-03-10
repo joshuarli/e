@@ -578,3 +578,77 @@ mod tests {
         assert_eq!(v.buffer_to_screen(0, 12, 4, &mut widths), Some((1, 6)));
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// wrapped_rows never returns 0 and never panics.
+        #[test]
+        fn wrapped_rows_always_at_least_one(
+            display_width in 0usize..10_000,
+            text_cols in 0usize..10_000,
+        ) {
+            let rows = wrapped_rows(display_width, text_cols);
+            prop_assert!(rows >= 1);
+        }
+
+        /// ensure_cursor_visible never panics on arbitrary inputs.
+        #[test]
+        fn ensure_cursor_visible_no_panic(
+            width in 1u16..500,
+            height in 1u16..200,
+            cursor_line in 0usize..5000,
+            cursor_col in 0usize..5000,
+            gutter in 0usize..20,
+            scroll_line in 0usize..5000,
+            scroll_wrap in 0usize..50,
+        ) {
+            let mut v = View::new(width, height);
+            v.scroll_line = scroll_line;
+            v.scroll_wrap = scroll_wrap;
+
+            // Use a constant-width line function to avoid unbounded callbacks.
+            let mut widths = |_line: usize| -> usize { 40 };
+            v.ensure_cursor_visible(cursor_line, cursor_col, gutter, &mut widths);
+
+            // After call, scroll state must be sane.
+            // If text_rows > 0, the cursor should now be reachable.
+            // At minimum, no panic occurred.
+        }
+
+        /// buffer_to_screen never panics on arbitrary inputs.
+        #[test]
+        fn buffer_to_screen_no_panic(
+            width in 1u16..500,
+            height in 1u16..200,
+            line in 0usize..5000,
+            col in 0usize..5000,
+            gutter in 0usize..20,
+            scroll_line in 0usize..5000,
+            scroll_wrap in 0usize..50,
+        ) {
+            let mut v = View::new(width, height);
+            v.scroll_line = scroll_line;
+            v.scroll_wrap = scroll_wrap;
+
+            let mut widths = |_line: usize| -> usize { 40 };
+            let _ = v.buffer_to_screen(line, col, gutter, &mut widths);
+        }
+
+        /// center_on_line never panics on arbitrary inputs.
+        #[test]
+        fn center_on_line_no_panic(
+            width in 1u16..500,
+            height in 1u16..200,
+            line in 0usize..5000,
+            gutter in 0usize..20,
+        ) {
+            let mut v = View::new(width, height);
+            let mut widths = |_line: usize| -> usize { 40 };
+            v.center_on_line(line, &mut widths, gutter);
+        }
+    }
+}

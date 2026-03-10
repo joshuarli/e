@@ -1023,8 +1023,8 @@ Reverse video (`\x1b[0;7m`). Full width.
 - Integration tests use `std::env::temp_dir()` for file I/O, clean up with `remove_dir_all`.
 - Coverage: `cargo tarpaulin`.
 - Philosophy: prefer integration-style scenario tests over tiny unit tests.
-- **Property tests** (proptest): `buffer::proptests` module has 7 properties covering GapBuffer invariants — contents match reference, line index partitions, pos/offset roundtrip, insert/delete roundtrip, display col roundtrip, etc.
-- **Fuzz targets** (`fuzz/`): cargo-fuzz setup with 4 targets — `fuzz_gap_buffer` (arbitrary edit sequences), `fuzz_undo_deserialize`, `fuzz_cursor_deserialize`, `fuzz_highlight` (all languages on arbitrary bytes). Run with `cargo +nightly fuzz run <target>`.
+- **Property tests** (proptest): `buffer::proptests` (7 properties — GapBuffer invariants), `document::proptests` (2 — edit/undo/redo consistency, full-undo restores original), `view::proptests` (4 — wrapped_rows, ensure_cursor_visible, buffer_to_screen, center_on_line no-panic), `selection::proptests` (4 — word boundary bounds, selection ordering, Pos total order).
+- **Fuzz targets** (`fuzz/`): cargo-fuzz setup with 7 targets — `fuzz_gap_buffer`, `fuzz_document` (edit + undo/redo sequences), `fuzz_undo_deserialize`, `fuzz_cursor_deserialize`, `fuzz_highlight` (all languages), `fuzz_command` (command dispatch + arg parsing), `fuzz_keybind_parse` (INI config parsing). Run with `cargo +nightly fuzz run <target>`.
 - **Crate structure**: `lib.rs` re-exports all modules publicly so fuzz targets can import them. `main.rs` imports from `e::*`.
 
 ## 22. Configuration Paths Summary

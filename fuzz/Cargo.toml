@@ -36,3 +36,18 @@ doc = false
 name = "fuzz_highlight"
 path = "fuzz_targets/fuzz_highlight.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_document"
+path = "fuzz_targets/fuzz_document.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_command"
+path = "fuzz_targets/fuzz_command.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_keybind_parse"
+path = "fuzz_targets/fuzz_keybind_parse.rs"
+doc = false

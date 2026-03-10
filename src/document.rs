@@ -382,3 +382,119 @@ mod tests {
         assert_eq!(text, b"hello\nworld");
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum DocOp {
+        Insert {
+            line_frac: f64,
+            col_frac: f64,
+            data: Vec<u8>,
+        },
+        Delete {
+            l1_frac: f64,
+            c1_frac: f64,
+            l2_frac: f64,
+            c2_frac: f64,
+        },
+        Undo,
+        Redo,
+        Seal,
+    }
+
+    fn arb_doc_op() -> impl Strategy<Value = DocOp> {
+        prop_oneof![
+            3 => (any::<f64>(), any::<f64>(), prop::collection::vec(any::<u8>(), 1..32))
+                .prop_map(|(l, c, d)| DocOp::Insert { line_frac: l, col_frac: c, data: d }),
+            2 => (any::<f64>(), any::<f64>(), any::<f64>(), any::<f64>())
+                .prop_map(|(l1, c1, l2, c2)| DocOp::Delete {
+                    l1_frac: l1, c1_frac: c1, l2_frac: l2, c2_frac: c2
+                }),
+            2 => Just(DocOp::Undo),
+            1 => Just(DocOp::Redo),
+            1 => Just(DocOp::Seal),
+        ]
+    }
+
+    fn clamp_pos(doc: &Document, line_frac: f64, col_frac: f64) -> Pos {
+        let lc = doc.buf.line_count();
+        let line = (line_frac.abs().fract() * lc as f64) as usize % lc;
+        let char_len = doc.buf.line_char_len(line);
+        let col = if char_len == 0 {
+            0
+        } else {
+            (col_frac.abs().fract() * (char_len + 1) as f64) as usize % (char_len + 1)
+        };
+        Pos::new(line, col)
+    }
+
+    proptest! {
+        /// After any sequence of edits/undos/redos, buffer invariants hold.
+        #[test]
+        fn document_edit_undo_redo_consistency(
+            initial in prop::collection::vec(any::<u8>(), 0..128),
+            ops in prop::collection::vec(arb_doc_op(), 0..40),
+        ) {
+            let mut doc = Document::new(initial, None);
+
+            for op in &ops {
+                match op {
+                    DocOp::Insert { line_frac, col_frac, data } => {
+                        let pos = clamp_pos(&doc, *line_frac, *col_frac);
+                        doc.insert(pos.line, pos.col, data);
+                    }
+                    DocOp::Delete { l1_frac, c1_frac, l2_frac, c2_frac } => {
+                        let start = clamp_pos(&doc, *l1_frac, *c1_frac);
+                        let end = clamp_pos(&doc, *l2_frac, *c2_frac);
+                        if start < end {
+                            doc.delete_range(start, end);
+                        }
+                    }
+                    DocOp::Undo => { doc.undo(); }
+                    DocOp::Redo => { doc.redo(); }
+                    DocOp::Seal => { doc.seal_undo(); }
+                }
+
+                // Buffer must be internally consistent after every operation.
+                let lc = doc.buf.line_count();
+                prop_assert!(lc >= 1);
+                prop_assert_eq!(doc.buf.line_start(0), 0);
+                prop_assert_eq!(doc.buf.line_end(lc - 1), doc.buf.len());
+                prop_assert_eq!(doc.buf.len(), doc.buf.contents().len());
+            }
+        }
+
+        /// Full undo restores original content.
+        #[test]
+        fn full_undo_restores_original(
+            initial in prop::collection::vec(any::<u8>(), 0..128),
+            inserts in prop::collection::vec(
+                (any::<f64>(), any::<f64>(), prop::collection::vec(any::<u8>(), 1..16)),
+                1..10,
+            ),
+        ) {
+            let mut doc = Document::new(initial.clone(), None);
+            let original = doc.buf.contents();
+
+            for (l, c, data) in &inserts {
+                doc.seal_undo();
+                let pos = clamp_pos(&doc, *l, *c);
+                doc.insert(pos.line, pos.col, data);
+            }
+            doc.seal_undo();
+
+            // Undo everything
+            let mut undo_count = 0;
+            while doc.undo().is_some() {
+                undo_count += 1;
+                prop_assert!(undo_count <= inserts.len() + 1, "infinite undo loop");
+            }
+
+            prop_assert_eq!(doc.buf.contents(), original);
+        }
+    }
+}
