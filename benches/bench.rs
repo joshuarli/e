@@ -199,6 +199,7 @@ fn bench_highlight(c: &mut Criterion) {
         });
 
         // Rust highlighting (non-allocating path)
+        group.throughput(Throughput::Bytes(rust_src.len() as u64));
         group.bench_with_input(BenchmarkId::new("rust_into", size), &rust_src, |b, data| {
             let rules = highlight::rules_for_language("Rust").unwrap();
             let mut out = Vec::new();
@@ -270,20 +271,29 @@ fn bench_search(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(data.len() as u64));
 
-        group.bench_with_input(BenchmarkId::new("search_forward", size), &buf, |b, buf| {
-            let re = regex_lite::Regex::new("result").expect("valid regex");
-            b.iter(|| {
-                black_box(FindState::search_forward(buf, &re, Pos::zero()));
-            });
-        });
+        // Use a pattern that doesn't exist to force a full scan of the buffer
+        group.bench_with_input(
+            BenchmarkId::new("search_forward_miss", size),
+            &buf,
+            |b, buf| {
+                let re = regex_lite::Regex::new("ZZNOTFOUND").expect("valid regex");
+                b.iter(|| {
+                    black_box(FindState::search_forward(buf, &re, Pos::zero()));
+                });
+            },
+        );
 
-        group.bench_with_input(BenchmarkId::new("search_backward", size), &buf, |b, buf| {
-            let re = regex_lite::Regex::new("result").expect("valid regex");
-            let last = Pos::new(buf.line_count().saturating_sub(1), 0);
-            b.iter(|| {
-                black_box(FindState::search_backward(buf, &re, last));
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("search_backward_miss", size),
+            &buf,
+            |b, buf| {
+                let re = regex_lite::Regex::new("ZZNOTFOUND").expect("valid regex");
+                let last = Pos::new(buf.line_count().saturating_sub(1), 0);
+                b.iter(|| {
+                    black_box(FindState::search_backward(buf, &re, last));
+                });
+            },
+        );
     }
 
     group.finish();

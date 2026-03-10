@@ -745,9 +745,11 @@ struct SyntaxRules {
 
 ### Core function
 
+`highlight_line_into(line, state, rules, out: &mut Vec<HlType>) -> HlState`:
+- The primary non-allocating entry point. Clears `out`, resizes to `line.len()` (reusing capacity), dispatches to specialized highlighter, runs `highlight_semver` post-pass. All internal highlighters accept `hl: &mut [HlType]` and write in-place — no per-line allocations on steady state.
+
 `highlight_line(line, state, rules) -> (Vec<HlType>, HlState)`:
-- Dispatches to specialized highlighter based on flags (`is_markdown`, `is_json`, `is_yaml`, `is_ini`, or generic `highlight_line_code`).
-- Runs `highlight_semver` post-pass on result.
+- Thin allocating wrapper around `highlight_line_into`. Used by callers that need an owned Vec.
 
 ### Generic code highlighter (`highlight_line_code`)
 
@@ -1026,7 +1028,7 @@ Reverse video (`\x1b[0;7m`). Full width.
 - **Property tests** (proptest): `buffer::proptests` (7 properties — GapBuffer invariants), `document::proptests` (2 — edit/undo/redo consistency, full-undo restores original), `view::proptests` (4 — wrapped_rows, ensure_cursor_visible, buffer_to_screen, center_on_line no-panic), `selection::proptests` (4 — word boundary bounds, selection ordering, Pos total order).
 - **Fuzz targets** (`fuzz/`): cargo-fuzz setup with 7 targets — `fuzz_gap_buffer`, `fuzz_document` (edit + undo/redo sequences), `fuzz_undo_deserialize`, `fuzz_cursor_deserialize`, `fuzz_highlight` (all languages), `fuzz_command` (command dispatch + arg parsing), `fuzz_keybind_parse` (INI config parsing). Run with `cargo +nightly fuzz run <target>`.
 - **Crate structure**: `lib.rs` re-exports all modules publicly so fuzz targets can import them. `main.rs` imports from `e::*`.
-- **Benchmarks** (`benches/bench.rs`): criterion-based with a counting allocator (`CountingAlloc`) that tracks heap allocation count and bytes. 6 groups: `gap_buffer` (from_vec, insert, pos_to_offset, offset_to_pos, line_text at 1k/10k/50k lines), `highlight` (Rust, JSON, highlight_into at 1k/10k lines), `document` (insert+undo, interleaved edit/delete), `search` (forward/backward regex at 1k/10k), `viewport` (ensure_cursor_visible, wrapped_rows), `alloc_audit` (allocation counting for hot paths). Run with `cargo bench`.
+- **Benchmarks** (`benches/bench.rs`): criterion-based with a counting allocator (`CountingAlloc`) that tracks heap allocation count and bytes. 6 groups: `gap_buffer` (from_vec, insert, pos_to_offset, offset_to_pos, line_text at 1k/10k/50k lines), `highlight` (Rust, JSON, rust_into non-allocating path at 1k/10k lines), `document` (insert+undo, interleaved edit/delete), `search` (forward/backward miss — full-scan regex at 1k/10k), `viewport` (ensure_cursor_visible, wrapped_rows), `alloc_audit` (allocation counting for hot paths). Run with `cargo bench`.
 
 ## 22. Configuration Paths Summary
 

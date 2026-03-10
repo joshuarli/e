@@ -111,24 +111,18 @@ fn starts_with_at(haystack: &[u8], needle: &[u8], pos: usize) -> bool {
 
 /// Highlight a single line. Returns (per-byte HlType vec, next-line state).
 pub fn highlight_line(line: &[u8], state: HlState, rules: &SyntaxRules) -> (Vec<HlType>, HlState) {
-    let (mut hl, next_state) = if rules.is_markdown {
-        highlight_line_markdown(line, state, rules)
-    } else if rules.is_json {
-        highlight_line_json(line, state)
-    } else if rules.is_yaml {
-        highlight_line_yaml(line, state)
-    } else if rules.is_ini {
-        highlight_line_ini(line, state)
-    } else {
-        highlight_line_code(line, state, rules)
-    };
-    highlight_semver(line, &mut hl);
+    let mut hl = Vec::new();
+    let next_state = highlight_line_into(line, state, rules, &mut hl);
     (hl, next_state)
 }
 
-fn highlight_line_code(line: &[u8], state: HlState, rules: &SyntaxRules) -> (Vec<HlType>, HlState) {
+fn highlight_line_code(
+    line: &[u8],
+    state: HlState,
+    rules: &SyntaxRules,
+    hl: &mut [HlType],
+) -> HlState {
     let len = line.len();
-    let mut hl = vec![HlType::Normal; len];
     let mut i = 0;
     let mut prev_sep = true;
     let mut current_state = state;
@@ -155,7 +149,7 @@ fn highlight_line_code(line: &[u8], state: HlState, rules: &SyntaxRules) -> (Vec
                 i += 1;
             }
             if current_state == HlState::BlockComment {
-                return (hl, HlState::BlockComment);
+                return HlState::BlockComment;
             }
         }
         HlState::MultiLineString(idx) => {
@@ -182,7 +176,7 @@ fn highlight_line_code(line: &[u8], state: HlState, rules: &SyntaxRules) -> (Vec
                 i += 1;
             }
             if matches!(current_state, HlState::MultiLineString(_)) {
-                return (hl, current_state);
+                return current_state;
             }
         }
         HlState::Normal => {}
@@ -196,7 +190,7 @@ fn highlight_line_code(line: &[u8], state: HlState, rules: &SyntaxRules) -> (Vec
             for b in &mut hl[i..len] {
                 *b = HlType::Comment;
             }
-            return (hl, HlState::Normal);
+            return HlState::Normal;
         }
 
         // Block comment start
@@ -222,7 +216,7 @@ fn highlight_line_code(line: &[u8], state: HlState, rules: &SyntaxRules) -> (Vec
                 for b in &mut hl[start..len] {
                     *b = HlType::Comment;
                 }
-                return (hl, HlState::BlockComment);
+                return HlState::BlockComment;
             }
             continue;
         }
@@ -261,9 +255,9 @@ fn highlight_line_code(line: &[u8], state: HlState, rules: &SyntaxRules) -> (Vec
                         *b = HlType::String;
                     }
                     if delim.multiline {
-                        return (hl, HlState::MultiLineString(di as u8));
+                        return HlState::MultiLineString(di as u8);
                     }
-                    return (hl, HlState::Normal);
+                    return HlState::Normal;
                 }
                 matched_string = true;
                 break;
@@ -289,12 +283,12 @@ fn highlight_line_code(line: &[u8], state: HlState, rules: &SyntaxRules) -> (Vec
 
         // Keywords and types (after separator)
         if prev_sep && (line[i].is_ascii_alphabetic() || line[i] == b'_') {
-            if let Some(advance) = try_keyword(line, i, rules.keywords, HlType::Keyword, &mut hl) {
+            if let Some(advance) = try_keyword(line, i, rules.keywords, HlType::Keyword, hl) {
                 i += advance;
                 prev_sep = false;
                 continue;
             }
-            if let Some(advance) = try_keyword(line, i, rules.types, HlType::Type, &mut hl) {
+            if let Some(advance) = try_keyword(line, i, rules.types, HlType::Type, hl) {
                 i += advance;
                 prev_sep = false;
                 continue;
@@ -303,7 +297,7 @@ fn highlight_line_code(line: &[u8], state: HlState, rules: &SyntaxRules) -> (Vec
 
         // Operators (multi-char like &&, ||, !=, etc.)
         if !rules.operators.is_empty()
-            && let Some(advance) = try_operator(line, i, rules.operators, &mut hl)
+            && let Some(advance) = try_operator(line, i, rules.operators, hl)
         {
             i += advance;
             prev_sep = true;
@@ -317,7 +311,7 @@ fn highlight_line_code(line: &[u8], state: HlState, rules: &SyntaxRules) -> (Vec
         i += 1;
     }
 
-    (hl, HlState::Normal)
+    HlState::Normal
 }
 
 fn is_digit_start(line: &[u8], i: usize) -> bool {
@@ -457,9 +451,8 @@ fn highlight_semver(line: &[u8], hl: &mut [HlType]) {
 
 // -- JSON highlighting ------------------------------------------------------
 
-fn highlight_line_json(line: &[u8], _state: HlState) -> (Vec<HlType>, HlState) {
+fn highlight_line_json(line: &[u8], _state: HlState, hl: &mut [HlType]) -> HlState {
     let len = line.len();
-    let mut hl = vec![HlType::Normal; len];
     let mut i = 0;
 
     while i < len {
@@ -551,17 +544,16 @@ fn highlight_line_json(line: &[u8], _state: HlState) -> (Vec<HlType>, HlState) {
         i += 1;
     }
 
-    (hl, HlState::Normal)
+    HlState::Normal
 }
 
 // -- YAML highlighting ------------------------------------------------------
 
-fn highlight_line_yaml(line: &[u8], _state: HlState) -> (Vec<HlType>, HlState) {
+fn highlight_line_yaml(line: &[u8], _state: HlState, hl: &mut [HlType]) -> HlState {
     let len = line.len();
-    let mut hl = vec![HlType::Normal; len];
 
     if len == 0 {
-        return (hl, HlState::Normal);
+        return HlState::Normal;
     }
 
     // Comment: # (at start or after whitespace)
@@ -573,11 +565,11 @@ fn highlight_line_yaml(line: &[u8], _state: HlState) -> (Vec<HlType>, HlState) {
         if comment_start > 0 {
             highlight_yaml_content(&line[..comment_start], &mut hl[..comment_start]);
         }
-        return (hl, HlState::Normal);
+        return HlState::Normal;
     }
 
-    highlight_yaml_content(line, &mut hl);
-    (hl, HlState::Normal)
+    highlight_yaml_content(line, hl);
+    HlState::Normal
 }
 
 fn find_yaml_comment(line: &[u8]) -> Option<usize> {
@@ -775,12 +767,11 @@ fn highlight_yaml_value(val: &[u8], hl: &mut [HlType]) {
 
 // -- INI/Config highlighting ------------------------------------------------
 
-fn highlight_line_ini(line: &[u8], _state: HlState) -> (Vec<HlType>, HlState) {
+fn highlight_line_ini(line: &[u8], _state: HlState, hl: &mut [HlType]) -> HlState {
     let len = line.len();
-    let mut hl = vec![HlType::Normal; len];
 
     if len == 0 {
-        return (hl, HlState::Normal);
+        return HlState::Normal;
     }
 
     // Skip leading whitespace
@@ -791,7 +782,7 @@ fn highlight_line_ini(line: &[u8], _state: HlState) -> (Vec<HlType>, HlState) {
     let rest = &line[indent..];
 
     if rest.is_empty() {
-        return (hl, HlState::Normal);
+        return HlState::Normal;
     }
 
     // Comment lines: ; or # at start (after optional whitespace)
@@ -799,7 +790,7 @@ fn highlight_line_ini(line: &[u8], _state: HlState) -> (Vec<HlType>, HlState) {
         for b in &mut hl[indent..] {
             *b = HlType::Comment;
         }
-        return (hl, HlState::Normal);
+        return HlState::Normal;
     }
 
     // Section headers: [section]
@@ -811,10 +802,10 @@ fn highlight_line_ini(line: &[u8], _state: HlState) -> (Vec<HlType>, HlState) {
             // Anything after ] could be an inline comment
             let after = indent + close + 1;
             if after < len {
-                highlight_ini_inline_comment(line, &mut hl, after);
+                highlight_ini_inline_comment(line, hl, after);
             }
         }
-        return (hl, HlState::Normal);
+        return HlState::Normal;
     }
 
     // Key = value pairs
@@ -831,7 +822,7 @@ fn highlight_line_ini(line: &[u8], _state: HlState) -> (Vec<HlType>, HlState) {
         }
     }
 
-    (hl, HlState::Normal)
+    HlState::Normal
 }
 
 fn highlight_ini_value(val: &[u8], hl: &mut [HlType]) {
@@ -976,9 +967,9 @@ fn highlight_line_markdown(
     line: &[u8],
     state: HlState,
     rules: &SyntaxRules,
-) -> (Vec<HlType>, HlState) {
+    hl: &mut [HlType],
+) -> HlState {
     let len = line.len();
-    let mut hl = vec![HlType::Normal; len];
 
     let block_close = rules.block_comment.1.as_bytes();
 
@@ -988,12 +979,12 @@ fn highlight_line_markdown(
             for b in &mut hl[..len] {
                 *b = HlType::String;
             }
-            return (hl, HlState::Normal);
+            return HlState::Normal;
         }
         for b in &mut hl[..len] {
             *b = HlType::String;
         }
-        return (hl, HlState::FencedCodeBlock);
+        return HlState::FencedCodeBlock;
     }
 
     // Block comment continuation
@@ -1005,21 +996,13 @@ fn highlight_line_markdown(
                 for b in &mut hl[i..end] {
                     *b = HlType::Comment;
                 }
-                // Rest of line is normal — continue processing below
-                let remaining_start = end;
-                let mut sub_hl = vec![HlType::Normal; len];
-                let (rest_hl, rest_state) =
-                    highlight_line_markdown_inner(&line[remaining_start..], rules);
-                for (j, &h) in rest_hl.iter().enumerate() {
-                    sub_hl[remaining_start + j] = h;
-                }
-                sub_hl[..remaining_start].copy_from_slice(&hl[..remaining_start]);
-                return (sub_hl, rest_state);
+                // hl[0..end] is all Comment; process remainder as inline markdown
+                return highlight_line_markdown_inner(&line[end..], rules, &mut hl[end..]);
             }
             hl[i] = HlType::Comment;
             i += 1;
         }
-        return (hl, HlState::BlockComment);
+        return HlState::BlockComment;
     }
 
     // Fenced code block start
@@ -1027,21 +1010,21 @@ fn highlight_line_markdown(
         for b in &mut hl[..len] {
             *b = HlType::String;
         }
-        return (hl, HlState::FencedCodeBlock);
+        return HlState::FencedCodeBlock;
     }
 
     // Horizontal rules: ---, ***, ___ (optionally with spaces)
     {
-        let trimmed: Vec<u8> = line.iter().copied().filter(|&b| b != b' ').collect();
-        if trimmed.len() >= 3 {
-            let is_hr = (trimmed.iter().all(|&b| b == b'-') && trimmed.len() >= 3)
-                || (trimmed.iter().all(|&b| b == b'*') && trimmed.len() >= 3)
-                || (trimmed.iter().all(|&b| b == b'_') && trimmed.len() >= 3);
+        let non_space_count = line.iter().filter(|&&b| b != b' ').count();
+        if non_space_count >= 3 {
+            let is_hr = line.iter().find(|&&b| b != b' ').is_some_and(|&ch| {
+                matches!(ch, b'-' | b'*' | b'_') && line.iter().all(|&b| b == b' ' || b == ch)
+            });
             if is_hr {
                 for b in &mut hl[..len] {
                     *b = HlType::Comment;
                 }
-                return (hl, HlState::Normal);
+                return HlState::Normal;
             }
         }
     }
@@ -1051,7 +1034,7 @@ fn highlight_line_markdown(
         for b in &mut hl[..len] {
             *b = HlType::Keyword;
         }
-        return (hl, HlState::Normal);
+        return HlState::Normal;
     }
 
     // Blockquote: > at line start
@@ -1060,13 +1043,8 @@ fn highlight_line_markdown(
         if len > 1 && line[1] == b' ' {
             hl[1] = HlType::Comment;
         }
-        // rest normal — fall through to inline processing
         let start = if len > 1 && line[1] == b' ' { 2 } else { 1 };
-        let (inline_hl, next_state) = highlight_line_markdown_inner(&line[start..], rules);
-        for (j, &h) in inline_hl.iter().enumerate() {
-            hl[start + j] = h;
-        }
-        return (hl, next_state);
+        return highlight_line_markdown_inner(&line[start..], rules, &mut hl[start..]);
     }
 
     // List markers: - , * , 1. at start (possibly indented)
@@ -1102,26 +1080,17 @@ fn highlight_line_markdown(
                 *b = HlType::Number;
             }
             let after = indent + marker_len;
-            let (inline_hl, next_state) = highlight_line_markdown_inner(&line[after..], rules);
-            for (j, &h) in inline_hl.iter().enumerate() {
-                hl[after + j] = h;
-            }
-            return (hl, next_state);
+            return highlight_line_markdown_inner(&line[after..], rules, &mut hl[after..]);
         }
     }
 
     // Normal line — process inline elements
-    let (inline_hl, next_state) = highlight_line_markdown_inner(line, rules);
-    for (j, &h) in inline_hl.iter().enumerate() {
-        hl[j] = h;
-    }
-    (hl, next_state)
+    highlight_line_markdown_inner(line, rules, hl)
 }
 
 /// Process inline markdown elements: inline code, bold, italic, HTML comments.
-fn highlight_line_markdown_inner(line: &[u8], rules: &SyntaxRules) -> (Vec<HlType>, HlState) {
+fn highlight_line_markdown_inner(line: &[u8], rules: &SyntaxRules, hl: &mut [HlType]) -> HlState {
     let len = line.len();
-    let mut hl = vec![HlType::Normal; len];
     let mut i = 0;
 
     let block_open = rules.block_comment.0.as_bytes();
@@ -1149,7 +1118,7 @@ fn highlight_line_markdown_inner(line: &[u8], rules: &SyntaxRules) -> (Vec<HlTyp
                 for b in &mut hl[start..len] {
                     *b = HlType::Comment;
                 }
-                return (hl, HlState::BlockComment);
+                return HlState::BlockComment;
             }
             continue;
         }
@@ -1205,7 +1174,7 @@ fn highlight_line_markdown_inner(line: &[u8], rules: &SyntaxRules) -> (Vec<HlTyp
         i += 1;
     }
 
-    (hl, HlState::Normal)
+    HlState::Normal
 }
 
 // -- Bracket matching -------------------------------------------------------
@@ -1419,9 +1388,20 @@ pub fn highlight_line_into(
     rules: &SyntaxRules,
     out: &mut Vec<HlType>,
 ) -> HlState {
-    let (hl, next_state) = highlight_line(line, state, rules);
     out.clear();
-    out.extend_from_slice(&hl);
+    out.resize(line.len(), HlType::Normal);
+    let next_state = if rules.is_markdown {
+        highlight_line_markdown(line, state, rules, out)
+    } else if rules.is_json {
+        highlight_line_json(line, state, out)
+    } else if rules.is_yaml {
+        highlight_line_yaml(line, state, out)
+    } else if rules.is_ini {
+        highlight_line_ini(line, state, out)
+    } else {
+        highlight_line_code(line, state, rules, out)
+    };
+    highlight_semver(line, out);
     next_state
 }
 
