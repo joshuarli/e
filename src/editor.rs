@@ -275,17 +275,18 @@ impl Editor {
             self.draw(&mut stdout)?;
 
             match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(EditorEvent::Term(ev)) => self.handle_event(ev),
-                Ok(EditorEvent::Paste(text)) => {
-                    if self.cmd_buf.active {
-                        let result = self.cmd_buf.insert_str(&text);
-                        let mode = self.cmd_buf.mode;
-                        self.handle_cmd_result(mode, result);
-                    } else {
-                        self.paste_text(&text);
+                Ok(ev) => {
+                    self.dispatch_event(ev);
+                    // Drain all pending events before re-rendering so bursts
+                    // (e.g. rapid scroll wheel) coalesce into a single frame.
+                    while self.running {
+                        match rx.try_recv() {
+                            Ok(ev) => self.dispatch_event(ev),
+                            Err(_) => break,
+                        }
                     }
                 }
-                Ok(EditorEvent::Tick) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
                     if crate::signal::take_sigwinch()
                         && let Ok((w, h)) = termion::terminal_size()
                     {
@@ -304,6 +305,30 @@ impl Editor {
         )?;
         stdout.flush()?;
         Ok(())
+    }
+
+    fn dispatch_event(&mut self, ev: EditorEvent) {
+        match ev {
+            EditorEvent::Term(ev) => self.handle_event(ev),
+            EditorEvent::Paste(text) => {
+                if self.cmd_buf.active {
+                    let result = self.cmd_buf.insert_str(&text);
+                    let mode = self.cmd_buf.mode;
+                    self.handle_cmd_result(mode, result);
+                } else {
+                    self.paste_text(&text);
+                }
+            }
+            EditorEvent::Tick => {
+                if crate::signal::take_sigwinch()
+                    && let Ok((w, h)) = termion::terminal_size()
+                {
+                    self.view.width = w;
+                    self.view.height = h;
+                    self.renderer.force_full_redraw();
+                }
+            }
+        }
     }
 
     fn set_status(&mut self, msg: String) {

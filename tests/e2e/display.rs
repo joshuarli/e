@@ -28,14 +28,19 @@ fn status_bar_layout() {
 }
 
 #[test]
-fn status_bar_is_reverse_video() {
+fn status_bar_has_grey_background() {
     let dir = TempDir::new();
     let path = create_file(dir.path(), "test.txt", "hello\n");
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
     // Status bar is on row `rows - 2`
     let sb_row = e.rows - 2;
-    let inv = e.cell_inverse(sb_row, 0);
-    assert!(inv, "status bar should use reverse video");
+    let bg = e.cell_bg(sb_row, 0);
+    // \x1b[100m = bright black (dark grey) background
+    assert_eq!(
+        bg,
+        vt100::Color::Idx(8),
+        "status bar should have dark grey background"
+    );
 }
 
 #[test]

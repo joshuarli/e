@@ -267,8 +267,8 @@ Bracketed paste detection: when the thread sees `\x1b[200~` (PASTE_START), it en
 1. Expire status messages after 3 seconds.
 2. Call `draw()` to render the frame.
 3. `recv_timeout(500ms)`:
-   - `Term(ev)` → `handle_event(ev)`
-   - `Paste(text)` → if command buffer active: `insert_str(text)`; else `paste_text(text)`
+   - On any event: `dispatch_event(ev)`, then **drain all pending events** via `try_recv()` loop before re-rendering. This coalesces bursts (e.g. rapid scroll wheel flicks) into a single frame. The drain loop stops when the channel is empty or `self.running` becomes false.
+   - `dispatch_event` routes: `Term(ev)` → `handle_event(ev)`; `Paste(text)` → if command buffer active: `insert_str(text)`, else `paste_text(text)`; `Tick` → poll SIGWINCH.
    - Timeout → poll SIGWINCH via `take_sigwinch()`, update terminal size if changed.
    - Disconnected → break.
 
