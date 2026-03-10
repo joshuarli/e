@@ -173,32 +173,29 @@ impl UndoStack {
         }
     }
 
-    /// Undo the last group. Returns the cursor position to restore.
-    pub fn undo(&mut self) -> Option<(Vec<Operation>, Pos)> {
+    /// Undo the last group. Calls `apply` for each operation in reverse order.
+    /// Returns the cursor position to restore.
+    pub fn undo(&mut self, mut apply: impl FnMut(&Operation)) -> Option<Pos> {
         self.flush_current();
         let group = self.undo.pop()?;
         let cursor = group.cursor_before;
-
-        // Build reverse operations for redo
-        let mut redo_ops = Vec::new();
         for op in group.ops.iter().rev() {
-            redo_ops.push(op.clone());
+            apply(op);
         }
-
         self.redo.push(group);
-
-        Some((redo_ops, cursor))
+        Some(cursor)
     }
 
-    /// Redo the last undone group. Returns the cursor position to restore.
-    pub fn redo(&mut self) -> Option<(Vec<Operation>, Pos)> {
+    /// Redo the last undone group. Calls `apply` for each operation in order.
+    /// Returns the cursor position to restore.
+    pub fn redo(&mut self, mut apply: impl FnMut(&Operation)) -> Option<Pos> {
         let group = self.redo.pop()?;
         let cursor = group.cursor_after;
-
-        let ops: Vec<Operation> = group.ops.clone();
+        for op in &group.ops {
+            apply(op);
+        }
         self.undo.push(group);
-
-        Some((ops, cursor))
+        Some(cursor)
     }
 }
 
@@ -223,42 +220,44 @@ mod tests {
     #[test]
     fn test_empty_undo_returns_none() {
         let mut stack = UndoStack::new();
-        assert!(stack.undo().is_none());
+        assert!(stack.undo(|_| {}).is_none());
     }
 
     #[test]
     fn test_empty_redo_returns_none() {
         let mut stack = UndoStack::new();
-        assert!(stack.redo().is_none());
+        assert!(stack.redo(|_| {}).is_none());
     }
 
     #[test]
     fn test_record_and_undo() {
         let mut stack = UndoStack::new();
         stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
-        let (ops, cursor) = stack.undo().unwrap();
+        let mut count = 0;
+        let cursor = stack.undo(|_| count += 1).unwrap();
         assert_eq!(cursor, Pos::new(0, 0));
-        assert_eq!(ops.len(), 1);
+        assert_eq!(count, 1);
     }
 
     #[test]
     fn test_undo_then_redo() {
         let mut stack = UndoStack::new();
         stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
-        stack.undo();
-        let (ops, cursor) = stack.redo().unwrap();
+        stack.undo(|_| {});
+        let mut count = 0;
+        let cursor = stack.redo(|_| count += 1).unwrap();
         assert_eq!(cursor, Pos::new(0, 1));
-        assert_eq!(ops.len(), 1);
+        assert_eq!(count, 1);
     }
 
     #[test]
     fn test_new_record_clears_redo() {
         let mut stack = UndoStack::new();
         stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
-        stack.undo();
+        stack.undo(|_| {});
         // New edit should clear redo
         stack.record(ins(0, b"b"), Pos::new(0, 0), Pos::new(0, 1));
-        assert!(stack.redo().is_none());
+        assert!(stack.redo(|_| {}).is_none());
     }
 
     #[test]
@@ -269,13 +268,15 @@ mod tests {
         stack.record(ins(1, b"b"), Pos::new(0, 1), Pos::new(0, 2));
 
         // Undo should only undo "b"
-        let (ops, cursor) = stack.undo().unwrap();
-        assert_eq!(ops.len(), 1);
+        let mut count = 0;
+        let cursor = stack.undo(|_| count += 1).unwrap();
+        assert_eq!(count, 1);
         assert_eq!(cursor, Pos::new(0, 1));
 
         // Undo should undo "a"
-        let (ops, cursor) = stack.undo().unwrap();
-        assert_eq!(ops.len(), 1);
+        count = 0;
+        let cursor = stack.undo(|_| count += 1).unwrap();
+        assert_eq!(count, 1);
         assert_eq!(cursor, Pos::new(0, 0));
     }
 
@@ -287,11 +288,11 @@ mod tests {
         stack.record(del(0, b"a"), Pos::new(0, 1), Pos::new(0, 0));
 
         // Undo first undoes the delete
-        let (_, cursor) = stack.undo().unwrap();
+        let cursor = stack.undo(|_| {}).unwrap();
         assert_eq!(cursor, Pos::new(0, 1));
 
         // Then the insert
-        let (_, cursor) = stack.undo().unwrap();
+        let cursor = stack.undo(|_| {}).unwrap();
         assert_eq!(cursor, Pos::new(0, 0));
     }
 
@@ -304,12 +305,14 @@ mod tests {
         stack.record(ins(2, b" "), Pos::new(0, 2), Pos::new(0, 3));
 
         // Undo: first undoes the space
-        let (ops, _) = stack.undo().unwrap();
-        assert_eq!(ops.len(), 1);
+        let mut count = 0;
+        stack.undo(|_| count += 1);
+        assert_eq!(count, 1);
 
         // Then undoes "ab" as a group
-        let (ops, _) = stack.undo().unwrap();
-        assert_eq!(ops.len(), 2);
+        count = 0;
+        stack.undo(|_| count += 1);
+        assert_eq!(count, 2);
     }
 
     #[test]
@@ -319,8 +322,9 @@ mod tests {
         stack.record(ins(1, b"\n"), Pos::new(0, 1), Pos::new(1, 0));
 
         // Newline should be separate
-        let (ops, _) = stack.undo().unwrap();
-        assert_eq!(ops.len(), 1);
+        let mut count = 0;
+        stack.undo(|_| count += 1);
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -330,8 +334,9 @@ mod tests {
         // cursor_before doesn't match last cursor_after — should break
         stack.record(ins(5, b"b"), Pos::new(0, 5), Pos::new(0, 6));
 
-        let (ops, _) = stack.undo().unwrap();
-        assert_eq!(ops.len(), 1); // "b" alone
+        let mut count = 0;
+        stack.undo(|_| count += 1);
+        assert_eq!(count, 1); // "b" alone
     }
 
     #[test]
@@ -342,8 +347,9 @@ mod tests {
         stack.record(ins(2, b"c"), Pos::new(0, 2), Pos::new(0, 3));
 
         // All three should be one group
-        let (ops, _) = stack.undo().unwrap();
-        assert_eq!(ops.len(), 3);
+        let mut count = 0;
+        stack.undo(|_| count += 1);
+        assert_eq!(count, 3);
     }
 
     #[test]
@@ -373,7 +379,7 @@ mod tests {
         stack.seal();
         stack.record(ins(1, b"b"), Pos::new(0, 1), Pos::new(0, 2));
         stack.seal();
-        stack.undo();
+        stack.undo(|_| {});
         let (undo, redo) = stack.stacks();
         assert_eq!(undo.len(), 1);
         assert_eq!(redo.len(), 1);
@@ -429,9 +435,10 @@ mod tests {
         stack.end_group();
 
         // All three ops in one group, even though space normally breaks
-        let (ops, _) = stack.undo().unwrap();
-        assert_eq!(ops.len(), 3);
-        assert!(stack.undo().is_none());
+        let mut count = 0;
+        stack.undo(|_| count += 1).unwrap();
+        assert_eq!(count, 3);
+        assert!(stack.undo(|_| {}).is_none());
     }
 
     #[test]
@@ -443,8 +450,9 @@ mod tests {
         stack.end_group();
 
         // Insert then delete should still be one group when force_group is on
-        let (ops, _) = stack.undo().unwrap();
-        assert_eq!(ops.len(), 2);
+        let mut count = 0;
+        stack.undo(|_| count += 1).unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]
@@ -454,14 +462,14 @@ mod tests {
         stack.seal();
         stack.record(ins(1, b"y"), Pos::new(0, 1), Pos::new(0, 2));
 
-        stack.undo(); // undo "y"
-        stack.undo(); // undo "x"
-        stack.redo(); // redo "x"
-        stack.redo(); // redo "y"
+        stack.undo(|_| {}); // undo "y"
+        stack.undo(|_| {}); // undo "x"
+        stack.redo(|_| {}); // redo "x"
+        stack.redo(|_| {}); // redo "y"
 
         // Should be back to having two groups on undo stack
-        assert!(stack.undo().is_some()); // "y"
-        assert!(stack.undo().is_some()); // "x"
-        assert!(stack.undo().is_none());
+        assert!(stack.undo(|_| {}).is_some()); // "y"
+        assert!(stack.undo(|_| {}).is_some()); // "x"
+        assert!(stack.undo(|_| {}).is_none());
     }
 }

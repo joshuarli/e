@@ -84,36 +84,20 @@ impl Document {
 
     /// Undo the last operation group. Returns new cursor position.
     pub fn undo(&mut self) -> Option<Pos> {
-        let (ops, cursor) = self.undo_stack.undo()?;
-        for op in &ops {
-            match op {
-                Operation::Insert { pos, data } => {
-                    // To undo an insert, delete
-                    self.buf.delete(*pos, data.len());
-                }
-                Operation::Delete { pos, data } => {
-                    // To undo a delete, insert
-                    self.buf.insert(*pos, data.as_ref());
-                }
-            }
-        }
+        let cursor = self.undo_stack.undo(|op| match op {
+            Operation::Insert { pos, data } => self.buf.delete(*pos, data.len()),
+            Operation::Delete { pos, data } => self.buf.insert(*pos, data.as_ref()),
+        })?;
         self.dirty = true;
         Some(cursor)
     }
 
     /// Redo the last undone group. Returns new cursor position.
     pub fn redo(&mut self) -> Option<Pos> {
-        let (ops, cursor) = self.undo_stack.redo()?;
-        for op in &ops {
-            match op {
-                Operation::Insert { pos, data } => {
-                    self.buf.insert(*pos, data.as_ref());
-                }
-                Operation::Delete { pos, data } => {
-                    self.buf.delete(*pos, data.len());
-                }
-            }
-        }
+        let cursor = self.undo_stack.redo(|op| match op {
+            Operation::Insert { pos, data } => self.buf.insert(*pos, data.as_ref()),
+            Operation::Delete { pos, data } => self.buf.delete(*pos, data.len()),
+        })?;
         self.dirty = true;
         Some(cursor)
     }

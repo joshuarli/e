@@ -83,6 +83,7 @@ pub struct GapBuffer {
 Free functions:
 - `utf8_char_len(first_byte: u8) -> usize` — returns 1-4 based on leading byte. Continuation bytes (0x80-0xBF) return 1 (treated as single invalid bytes). Walking functions (`pos_to_offset`, `char_count_in_range`) cap multi-byte advances to never cross range boundaries, handling invalid UTF-8 gracefully.
 - `char_count(bytes: &[u8]) -> usize` — counts UTF-8 characters.
+- `char_to_byte(bytes: &[u8], char_col: usize) -> usize` — converts character column index to byte offset in UTF-8 bytes.
 
 ### 3.2 Document (`document.rs`)
 
@@ -101,8 +102,8 @@ All mutations go through Document methods that record undo operations:
 - `delete_range(start_pos, end_pos) -> Pos` — extracts deleted bytes first, deletes, records `Operation::Delete`, returns start_pos. No-op if start >= end.
 - `insert_at_byte(offset, bytes, cursor_before, cursor_after)` — raw byte-offset insert. Avoids line-cache lookups. Used by indent/comment operations.
 - `delete_at_byte(offset, count, cursor_before, cursor_after)` — raw byte-offset delete.
-- `undo() -> Option<Pos>` — pops group from undo stack. Reverses each operation: Insert → delete, Delete → insert (operating directly on GapBuffer).
-- `redo() -> Option<Pos>` — pops group from redo stack, replays each operation forward.
+- `undo() -> Option<Pos>` — pops group from undo stack. Uses callback pattern: calls `undo_stack.undo(|op| ...)` which reverses each operation inline (Insert → delete, Delete → insert on GapBuffer). Zero-alloc — no intermediate `Vec<Operation>`.
+- `redo() -> Option<Pos>` — pops group from redo stack, replays each operation forward via callback.
 - `seal_undo()`, `begin_undo_group()`, `end_undo_group()` — delegate to UndoStack.
 - `text_in_range(start, end) -> Vec<u8>` — extracts text between two Pos values.
 
@@ -167,8 +168,8 @@ Key methods:
 - `seal()` — flushes current group to undo stack.
 - `begin_group()` / `end_group()` — force all operations between into one undo step.
 - `record(op, cursor_before, cursor_after)` — clears redo, checks grouping, extends or creates group.
-- `undo()` — flushes current, pops from undo, pushes to redo. Returns reversed ops + cursor_before.
-- `redo()` — pops from redo, pushes to undo. Returns ops + cursor_after.
+- `undo(apply: impl FnMut(&Operation))` — flushes current, pops from undo, calls `apply` for each op in reverse, pushes group to redo. Returns cursor_before. Zero-alloc callback pattern (no `Vec<Operation>` return).
+- `redo(apply: impl FnMut(&Operation))` — pops from redo, calls `apply` for each op forward, pushes group to undo. Returns cursor_after.
 - `stacks()` / `restore()` — for serialization/deserialization.
 
 ### 3.5 View (`view.rs`)
@@ -214,6 +215,7 @@ pub struct Editor {
     piped_stdin: bool,
     file_mtime: Option<SystemTime>,
     reload_pending: bool,
+    line_scratch: Vec<u8>,             // Reused scratch buffer for line_text_into (avoids per-call alloc)
     status_left_cache: String,         // Reused buffer for status-bar left string (no per-frame alloc)
 }
 ```

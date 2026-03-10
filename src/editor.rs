@@ -131,6 +131,8 @@ pub struct Editor {
     reload_pending: bool,
     /// Cached status-left string; reused each frame to avoid per-draw allocation.
     status_left_cache: String,
+    /// Scratch buffer for line_text_into; avoids per-call allocation.
+    line_scratch: Vec<u8>,
 }
 
 enum EditorEvent {
@@ -189,6 +191,7 @@ impl Editor {
             file_mtime,
             reload_pending: false,
             status_left_cache: String::new(),
+            line_scratch: Vec::new(),
         }
     }
 
@@ -1023,7 +1026,10 @@ impl Editor {
     }
 
     fn select_word_at(&mut self, pos: Pos) {
-        let line_text = self.doc.buf.line_text(pos.line);
+        self.doc
+            .buf
+            .line_text_into(pos.line, &mut self.line_scratch);
+        let line_text = &self.line_scratch;
         if line_text.is_empty() {
             return;
         }
@@ -1355,8 +1361,8 @@ impl Editor {
             }
             return;
         }
-        let line_text = self.doc.buf.line_text(c.line);
-        let boundary = prev_word_boundary(&line_text, c.col);
+        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
+        let boundary = prev_word_boundary(&self.line_scratch, c.col);
         self.set_cursor(Pos::new(c.line, boundary));
     }
 
@@ -1374,8 +1380,8 @@ impl Editor {
             }
             return;
         }
-        let line_text = self.doc.buf.line_text(c.line);
-        let boundary = next_word_boundary(&line_text, c.col);
+        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
+        let boundary = next_word_boundary(&self.line_scratch, c.col);
         self.set_cursor(Pos::new(c.line, boundary));
     }
 
@@ -1388,8 +1394,8 @@ impl Editor {
             }
             return;
         }
-        let line_text = self.doc.buf.line_text(c.line);
-        let boundary = prev_word_boundary(&line_text, c.col);
+        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
+        let boundary = prev_word_boundary(&self.line_scratch, c.col);
         self.sel.cursor = Pos::new(c.line, boundary);
     }
 
@@ -1402,8 +1408,8 @@ impl Editor {
             }
             return;
         }
-        let line_text = self.doc.buf.line_text(c.line);
-        let boundary = next_word_boundary(&line_text, c.col);
+        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
+        let boundary = next_word_boundary(&self.line_scratch, c.col);
         self.sel.cursor = Pos::new(c.line, boundary);
     }
 
@@ -1627,8 +1633,9 @@ impl Editor {
             self.delete_selection();
         }
         let c = self.cursor();
-        let line_text = self.doc.buf.line_text(c.line);
-        let indent: Vec<u8> = line_text
+        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
+        let indent: Vec<u8> = self
+            .line_scratch
             .iter()
             .take_while(|&&b| b == b' ' || b == b'\t')
             .copied()
@@ -1762,8 +1769,8 @@ impl Editor {
             self.set_cursor(start);
             return;
         }
-        let line_text = self.doc.buf.line_text(c.line);
-        let boundary = prev_word_boundary(&line_text, c.col);
+        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
+        let boundary = prev_word_boundary(&self.line_scratch, c.col);
         let start = Pos::new(c.line, boundary);
         let end = Pos::new(c.line, c.col);
         self.doc.seal_undo();
@@ -1790,9 +1797,9 @@ impl Editor {
 
     fn duplicate_line(&mut self) {
         let c = self.cursor();
-        let line_text = self.doc.buf.line_text(c.line);
+        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
         let mut new_content = vec![b'\n'];
-        new_content.extend_from_slice(&line_text);
+        new_content.extend_from_slice(&self.line_scratch);
         let line_char_len = self.doc.buf.line_char_len(c.line);
         self.doc.seal_undo();
         self.doc.insert(c.line, line_char_len, &new_content);
@@ -2001,10 +2008,10 @@ impl Editor {
         // Indentation is a copy-time property, not a paste-time one.
         if text.contains('\n') {
             let c = self.cursor();
-            let line_text = self.doc.buf.line_text(c.line);
-            let is_blank = line_text.iter().all(|&b| b == b' ' || b == b'\t');
+            self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
+            let is_blank = self.line_scratch.iter().all(|&b| b == b' ' || b == b'\t');
             if is_blank {
-                let char_len = crate::buffer::char_count(&line_text);
+                let char_len = crate::buffer::char_count(&self.line_scratch);
                 if char_len > 0 {
                     self.doc
                         .delete_range(Pos::new(c.line, 0), Pos::new(c.line, char_len));
@@ -2035,8 +2042,11 @@ impl Editor {
         }
 
         // Get the indent of the current line at cursor
-        let cur_line_text = self.doc.buf.line_text(self.cursor().line);
-        let cur_indent: usize = cur_line_text
+        self.doc
+            .buf
+            .line_text_into(self.cursor().line, &mut self.line_scratch);
+        let cur_indent: usize = self
+            .line_scratch
             .iter()
             .take_while(|&&b| b == b' ' || b == b'\t')
             .count();
@@ -2093,14 +2103,17 @@ impl Editor {
         let line_count = self.doc.buf.line_count();
         self.doc.seal_undo();
         for line_idx in (0..line_count).rev() {
-            let text = self.doc.buf.line_text(line_idx);
-            let trimmed_len = text
+            self.doc
+                .buf
+                .line_text_into(line_idx, &mut self.line_scratch);
+            let trimmed_len = self
+                .line_scratch
                 .iter()
                 .rposition(|&b| b != b' ' && b != b'\t')
                 .map(|i| i + 1)
                 .unwrap_or(0);
-            let char_len = crate::buffer::char_count(&text);
-            let trim_char_len = crate::buffer::char_count(&text[..trimmed_len]);
+            let char_len = crate::buffer::char_count(&self.line_scratch);
+            let trim_char_len = crate::buffer::char_count(&self.line_scratch[..trimmed_len]);
             if trim_char_len < char_len {
                 self.doc.delete_range(
                     Pos::new(line_idx, trim_char_len),
@@ -2121,19 +2134,21 @@ impl Editor {
         let line_count = self.doc.buf.line_count();
         self.doc.seal_undo();
         for line_idx in 0..line_count {
-            let text = self.doc.buf.line_text(line_idx);
-            if !text.contains(&b'\t') {
+            self.doc
+                .buf
+                .line_text_into(line_idx, &mut self.line_scratch);
+            if !self.line_scratch.contains(&b'\t') {
                 continue;
             }
-            let mut new_text = Vec::with_capacity(text.len() * 2);
-            for &b in &text {
+            let mut new_text = Vec::with_capacity(self.line_scratch.len() * 2);
+            for &b in &self.line_scratch {
                 if b == b'\t' {
                     new_text.extend_from_slice(b"  ");
                 } else {
                     new_text.push(b);
                 }
             }
-            let char_len = crate::buffer::char_count(&text);
+            let char_len = crate::buffer::char_count(&self.line_scratch);
             self.doc
                 .delete_range(Pos::new(line_idx, 0), Pos::new(line_idx, char_len));
             self.doc.insert(line_idx, 0, &new_text);
@@ -2151,27 +2166,32 @@ impl Editor {
         let line_count = self.doc.buf.line_count();
         self.doc.seal_undo();
         for line_idx in 0..line_count {
-            let text = self.doc.buf.line_text(line_idx);
+            self.doc
+                .buf
+                .line_text_into(line_idx, &mut self.line_scratch);
             // Only convert leading whitespace (indentation)
-            let mut new_text = Vec::with_capacity(text.len());
+            let mut new_text = Vec::with_capacity(self.line_scratch.len());
             let mut i = 0;
-            while i < text.len() {
-                if text[i] == b'\t' {
+            while i < self.line_scratch.len() {
+                if self.line_scratch[i] == b'\t' {
                     new_text.push(b'\t');
                     i += 1;
-                } else if i + 1 < text.len() && text[i] == b' ' && text[i + 1] == b' ' {
+                } else if i + 1 < self.line_scratch.len()
+                    && self.line_scratch[i] == b' '
+                    && self.line_scratch[i + 1] == b' '
+                {
                     new_text.push(b'\t');
                     i += 2;
                 } else {
                     // End of leading whitespace (or lone space): copy rest verbatim
-                    new_text.extend_from_slice(&text[i..]);
+                    new_text.extend_from_slice(&self.line_scratch[i..]);
                     break;
                 }
             }
-            if new_text == text {
+            if new_text[..] == self.line_scratch[..] {
                 continue;
             }
-            let char_len = crate::buffer::char_count(&text);
+            let char_len = crate::buffer::char_count(&self.line_scratch);
             self.doc
                 .delete_range(Pos::new(line_idx, 0), Pos::new(line_idx, char_len));
             self.doc.insert(line_idx, 0, &new_text);
@@ -2429,6 +2449,7 @@ mod tests {
             file_mtime: None,
             reload_pending: false,
             status_left_cache: String::new(),
+            line_scratch: Vec::new(),
         }
     }
 

@@ -861,7 +861,7 @@ mod tests {
         fs::write(&path, b"hel").unwrap();
 
         let mut stack = make_test_stack();
-        stack.undo();
+        stack.undo(|_| {});
         save_undo_history_to(&db, &path, &stack);
 
         let mut loaded = UndoStack::new();
