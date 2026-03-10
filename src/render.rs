@@ -110,6 +110,14 @@ pub struct Renderer {
     prev_scroll_wrap: usize,
     /// Previous frame's text_rows (to detect completions/resize changes).
     prev_text_rows: usize,
+    /// Previous frame state for skip-clean-lines optimization.
+    prev_buf_version: u64,
+    prev_cursor_line: usize,
+    prev_cursor_col: usize,
+    prev_draw_cursor: bool,
+    prev_sel: Option<Selection>,
+    prev_bracket_pair: Option<(Pos, Pos)>,
+    prev_has_find: bool,
 }
 
 impl Default for Renderer {
@@ -137,6 +145,13 @@ impl Renderer {
             prev_rows: Vec::new(),
             prev_scroll_line: usize::MAX,
             prev_scroll_wrap: usize::MAX,
+            prev_buf_version: u64::MAX,
+            prev_cursor_line: usize::MAX,
+            prev_cursor_col: usize::MAX,
+            prev_draw_cursor: false,
+            prev_sel: None,
+            prev_bracket_pair: None,
+            prev_has_find: false,
             prev_text_rows: 0,
         }
     }
@@ -269,8 +284,41 @@ impl Renderer {
         let mut line_idx = view.scroll_line;
         let first_wrap = view.scroll_wrap;
         let full = self.needs_full_redraw;
+        let has_find = find_matches.is_some_and(|m| !m.is_empty());
+
+        // Skip-clean-lines: when the buffer hasn't been edited and find state
+        // hasn't changed, we can skip rendering lines that aren't affected by
+        // cursor, selection, or bracket-pair changes.
+        let can_skip =
+            !full && buf_version == self.prev_buf_version && !has_find && !self.prev_has_find;
 
         while screen_row < text_rows && line_idx < line_count {
+            // Fast skip: if this line can't have changed, advance screen_row
+            // using the gap buffer's display_col_at (no allocation, no copying).
+            if can_skip
+                && !self.line_needs_render(
+                    line_idx,
+                    cursor_line,
+                    cursor_col,
+                    draw_cursor,
+                    has_sel,
+                    sel_start,
+                    sel_end,
+                    bracket_pair,
+                )
+            {
+                let dw = buf.display_col_at(line_idx, usize::MAX);
+                let total_wraps = crate::view::wrapped_rows(dw, text_cols);
+                let start_wrap = if line_idx == view.scroll_line {
+                    first_wrap
+                } else {
+                    0
+                };
+                screen_row += (total_wraps - start_wrap).min(text_rows - screen_row);
+                line_idx += 1;
+                continue;
+            }
+
             buf.line_text_into(line_idx, &mut self.line_buf);
             let raw_text: &[u8] = &self.line_buf;
             let has_tabs = expand_tabs_into(
@@ -318,7 +366,7 @@ impl Renderer {
 
             // Per-character highlight info
             let need_per_char = has_sel && line_idx >= sel_start.line && line_idx <= sel_end.line;
-            let has_find = find_matches.is_some_and(|m| {
+            let line_has_find = find_matches.is_some_and(|m| {
                 m.iter()
                     .any(|(s, e)| line_idx >= s.line && line_idx <= e.line)
             });
@@ -396,7 +444,7 @@ impl Renderer {
                 // Is the software cursor on this line?
                 let cursor_on_line = draw_cursor && line_idx == cursor_line;
 
-                if need_per_char || has_find || has_bracket || cursor_on_line {
+                if need_per_char || line_has_find || has_bracket || cursor_on_line {
                     for (i, ch) in line_str
                         .chars()
                         .enumerate()
@@ -636,6 +684,13 @@ impl Renderer {
         self.prev_scroll_line = view.scroll_line;
         self.prev_scroll_wrap = view.scroll_wrap;
         self.prev_text_rows = text_rows;
+        self.prev_buf_version = buf_version;
+        self.prev_cursor_line = cursor_line;
+        self.prev_cursor_col = cursor_col;
+        self.prev_draw_cursor = draw_cursor;
+        self.prev_sel = selection;
+        self.prev_bracket_pair = bracket_pair;
+        self.prev_has_find = has_find;
         self.frame_buf = frame;
         Ok(())
     }
@@ -688,6 +743,57 @@ impl Renderer {
             wrap = 0;
         }
         rows * sign
+    }
+
+    /// Check if a logical line needs re-rendering based on what changed since
+    /// the previous frame. Only valid when `can_skip` is true (no edits, no find).
+    #[allow(clippy::too_many_arguments)]
+    fn line_needs_render(
+        &self,
+        line: usize,
+        cursor_line: usize,
+        cursor_col: usize,
+        draw_cursor: bool,
+        has_sel: bool,
+        sel_start: Pos,
+        sel_end: Pos,
+        bracket_pair: Option<(Pos, Pos)>,
+    ) -> bool {
+        // Cursor line changed (either old or new position)
+        if (line == cursor_line || line == self.prev_cursor_line)
+            && (cursor_line != self.prev_cursor_line
+                || cursor_col != self.prev_cursor_col
+                || draw_cursor != self.prev_draw_cursor)
+        {
+            return true;
+        }
+        // Current selection covers this line
+        if has_sel && line >= sel_start.line && line <= sel_end.line {
+            return true;
+        }
+        // Previous selection covered this line
+        if let Some(prev) = self.prev_sel
+            && !prev.is_empty()
+        {
+            let (ps, pe) = prev.ordered();
+            if line >= ps.line && line <= pe.line {
+                return true;
+            }
+        }
+        // Bracket pair changed
+        if bracket_pair != self.prev_bracket_pair {
+            if let Some((a, b)) = bracket_pair
+                && (line == a.line || line == b.line)
+            {
+                return true;
+            }
+            if let Some((a, b)) = self.prev_bracket_pair
+                && (line == a.line || line == b.line)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Ensure `hl_cache` covers lines `0..end`, computing only what's needed.

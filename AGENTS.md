@@ -675,6 +675,13 @@ pub struct Renderer {
     prev_scroll_line: usize,             // Previous frame's scroll position (scroll-region delta)
     prev_scroll_wrap: usize,
     prev_text_rows: usize,               // Previous text_rows (detect completions/resize changes)
+    prev_buf_version: u64,               // Skip-clean-lines: detect edits
+    prev_cursor_line: usize,             // Skip-clean-lines: detect cursor movement
+    prev_cursor_col: usize,
+    prev_draw_cursor: bool,
+    prev_sel: Option<Selection>,         // Skip-clean-lines: detect selection changes
+    prev_bracket_pair: Option<(Pos, Pos)>, // Skip-clean-lines: detect bracket pair changes
+    prev_has_find: bool,                 // Skip-clean-lines: detect find state changes
 }
 ```
 
@@ -689,6 +696,7 @@ pub struct Renderer {
 7. Hide cursor (`\x1b[?25l`).
 8. **Syntax cache** (lazy, viewport-bounded): compute `visible_end = scroll_line + text_rows + 1`. If buffer version changed, read `buf.take_dirty_line()` to get `hl_dirty_from`. Call `refresh_hl_cache(visible_end, scroll_line)` which: truncates if file shrank; extends the cache to `visible_end` if the user scrolled past the current coverage (reprocesses the last cached line to recover its output state, then continues forward); recomputes from `hl_dirty_from` on edits with early-exit when the cached state matches. **Large-jump fast path**: when `scroll_line > computed + 50` (viewport jumped far past the end of the computed cache, e.g. select-all on a 1M-line file), the intermediate gap is left as `HlState::Normal` and recomputation starts only from `scroll_line - 200`. Multi-line constructs starting in the skipped gap are cosmetically approximated as Normal. On first open of a 1M-line file only ~`text_rows` lines are highlighted — O(viewport) not O(file).
 9. **Wrap-aware render loop**: walk from `(scroll_line, scroll_wrap)` through logical lines:
+   - **Skip-clean-lines**: when `can_skip` is true (no edits = same `buf_version`, no find active), `line_needs_render()` checks if the line is affected by cursor/selection/bracket changes. If not, the entire per-line pipeline (line_text_into, expand_tabs, highlight, char iteration) is skipped — only `display_col_at` is called to compute the wrap count for advancing `screen_row`. Checks: cursor line (old + new), selection range (old + new), bracket pair endpoints (old + new).
    - Expand tabs in each line (`\t` → `|` + space, 2 display columns).
    - Convert to chars. Compute wrapped rows.
    - For each wrapped chunk:
