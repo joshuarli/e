@@ -1,0 +1,242 @@
+commit	short_msg	benchmark	time_ns	alloc_count	alloc_bytes	alloc_peak
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/from_vec/1000	18922.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/insert_sequential/1000	21436.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/pos_to_offset_all_lines/1000	832.85			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/offset_to_pos_walk/1000	635.66			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/line_text_all/1000	41132.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/from_vec/10000	186580.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/insert_sequential/10000	198090.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/pos_to_offset_all_lines/10000	8133.10			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/offset_to_pos_walk/10000	975.02			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/line_text_all/10000	415750.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/from_vec/50000	1129300.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/insert_sequential/50000	1138900.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/pos_to_offset_all_lines/50000	40209.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/offset_to_pos_walk/50000	1163.30			
+5e6eb76	Add criterion benchmark harness with counting allocator	gap_buffer/line_text_all/50000	2075700.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	highlight/rust_into/1000	1604000.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	highlight/rust_into/10000	15941000.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	document/insert_100_seal_undo_all	413180.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	document/insert_delete_interleaved	180920.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	search/search_forward/1000	1234.90			
+5e6eb76	Add criterion benchmark harness with counting allocator	search/search_backward/1000	1145.30			
+5e6eb76	Add criterion benchmark harness with counting allocator	search/search_forward/10000	1246.50			
+5e6eb76	Add criterion benchmark harness with counting allocator	search/search_backward/10000	1128.10			
+5e6eb76	Add criterion benchmark harness with counting allocator	viewport/ensure_cursor_visible_jump	103.82			
+5e6eb76	Add criterion benchmark harness with counting allocator	viewport/wrapped_rows_sweep	112.34			
+5e6eb76	Add criterion benchmark harness with counting allocator	alloc_audit/highlight_1k_into_allocs	1615000.00			
+5e6eb76	Add criterion benchmark harness with counting allocator	alloc_audit/pos_to_offset_allocs	750.31			
+5e6eb76	Add criterion benchmark harness with counting allocator	alloc_audit/single_insert_allocs	22470.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/from_vec/1000	18191.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/insert_sequential/1000	21661.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/pos_to_offset_all_lines/1000	814.77			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/offset_to_pos_walk/1000	631.49			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/line_text_all/1000	41211.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/from_vec/10000	190810.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/insert_sequential/10000	185380.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/pos_to_offset_all_lines/10000	8043.40			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/offset_to_pos_walk/10000	972.68			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/line_text_all/10000	414290.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/from_vec/50000	1134300.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/insert_sequential/50000	1125900.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/pos_to_offset_all_lines/50000	40149.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/offset_to_pos_walk/50000	1163.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	gap_buffer/line_text_all/50000	2054800.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	highlight/rust_into/1000	1588800.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	highlight/rust_into/10000	15914000.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	document/insert_100_seal_undo_all	417240.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	document/insert_delete_interleaved	184080.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	search/search_forward_miss/1000	574580.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	search/search_backward_miss/1000	1131700.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	search/search_forward_miss/10000	5693300.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	search/search_backward_miss/10000	11322000.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	viewport/ensure_cursor_visible_jump	101.02			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	viewport/wrapped_rows_sweep	109.02			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	alloc_audit/highlight_1k_into_allocs	1534100.00			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	alloc_audit/pos_to_offset_allocs	714.70			
+b0d65c2	Make highlight_line_into truly zero-alloc and fix benchmarks	alloc_audit/single_insert_allocs	19966.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/from_vec/1000	16681.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/insert_sequential/1000	20693.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/pos_to_offset_all_lines/1000	787.42			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/offset_to_pos_walk/1000	613.20			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/line_text_all/1000	40774.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/from_vec/10000	169270.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/insert_sequential/10000	182990.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/pos_to_offset_all_lines/10000	7846.10			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/offset_to_pos_walk/10000	941.87			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/line_text_all/10000	406030.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/from_vec/50000	971240.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/insert_sequential/50000	955040.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/pos_to_offset_all_lines/50000	39037.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/offset_to_pos_walk/50000	1126.60			
+623c291	Track peak allocation and live bytes in benchmark allocator	gap_buffer/line_text_all/50000	2045800.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	highlight/rust_into/1000	1534000.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	highlight/rust_into/10000	15303000.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	document/insert_100_seal_undo_all	381920.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	document/insert_delete_interleaved	162750.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	search/search_forward_miss/1000	558550.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	search/search_backward_miss/1000	1138300.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	search/search_forward_miss/10000	5627700.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	search/search_backward_miss/10000	11515000.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	viewport/ensure_cursor_visible_jump	104.85			
+623c291	Track peak allocation and live bytes in benchmark allocator	viewport/wrapped_rows_sweep	113.84			
+623c291	Track peak allocation and live bytes in benchmark allocator	alloc_audit/highlight_1k_into	1603000.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	alloc_audit/highlight_1k_alloc	1612800.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	alloc_audit/pos_to_offset_1k	811.04			
+623c291	Track peak allocation and live bytes in benchmark allocator	alloc_audit/single_insert	29659.00			
+623c291	Track peak allocation and live bytes in benchmark allocator	[alloc] highlight_1k_into		1	43	43
+623c291	Track peak allocation and live bytes in benchmark allocator	[alloc] pos_to_offset_1k		0	0	0
+623c291	Track peak allocation and live bytes in benchmark allocator	[alloc] single_insert		3	83660	83660
+623c291	Track peak allocation and live bytes in benchmark allocator	[alloc] highlight_1k_alloc		1000	34406	43
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/from_vec/1000	21360.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/insert_sequential/1000	23440.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/pos_to_offset_all_lines/1000	810.49			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/offset_to_pos_walk/1000	622.38			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/line_text_all/1000	26894.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/from_vec/10000	174780.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/insert_sequential/10000	196140.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/pos_to_offset_all_lines/10000	8181.50			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/offset_to_pos_walk/10000	991.18			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/line_text_all/10000	277380.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/from_vec/50000	1069300.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/insert_sequential/50000	1033500.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/pos_to_offset_all_lines/50000	55352.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/offset_to_pos_walk/50000	1801.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	gap_buffer/line_text_all/50000	2161200.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	highlight/rust_into/1000	1581300.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	highlight/rust_into/10000	15470000.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	document/insert_100_seal_undo_all	393860.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	document/insert_delete_interleaved	164740.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	search/search_forward_miss/1000	563480.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	search/search_backward_miss/1000	1125100.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	search/search_forward_miss/10000	5557400.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	search/search_backward_miss/10000	11279000.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	viewport/ensure_cursor_visible_jump	104.39			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	viewport/wrapped_rows_sweep	109.56			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	alloc_audit/highlight_1k_into	1550600.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	alloc_audit/highlight_1k_alloc	1562100.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	alloc_audit/pos_to_offset_1k	791.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	alloc_audit/single_insert	30619.00			
+49f13a1	Reduce allocations in search, line_text, and alloc audit	[alloc] GapBuffer::from_vec		3	83660	83660
+49f13a1	Reduce allocations in search, line_text, and alloc audit	[alloc] single_insert		3	83660	83660
+49f13a1	Reduce allocations in search, line_text, and alloc audit	[alloc] doc_100_edit_undo		315	125952	113356
+49f13a1	Reduce allocations in search, line_text, and alloc audit	[alloc] highlight_1k_into		1	43	43
+49f13a1	Reduce allocations in search, line_text, and alloc audit	[alloc] highlight_1k_alloc		1000	34406	43
+49f13a1	Reduce allocations in search, line_text, and alloc audit	[alloc] pos_to_offset_1k		0	0	0
+49f13a1	Reduce allocations in search, line_text, and alloc audit	[alloc] line_text_all_1k		1000	34406	43
+49f13a1	Reduce allocations in search, line_text, and alloc audit	[alloc] search_forward_miss_1k		11	1024	1024
+49f13a1	Reduce allocations in search, line_text, and alloc audit	[alloc] search_backward_miss_1k		3	76	76
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/from_vec/1000	16718.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/insert_sequential/1000	22997.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/pos_to_offset_all_lines/1000	829.18			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/offset_to_pos_walk/1000	648.72			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/line_text_all/1000	27048.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/from_vec/10000	178690.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/insert_sequential/10000	174240.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/pos_to_offset_all_lines/10000	8040.30			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/offset_to_pos_walk/10000	1000.20			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/line_text_all/10000	273690.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/from_vec/50000	985460.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/insert_sequential/50000	1016100.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/pos_to_offset_all_lines/50000	40156.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/offset_to_pos_walk/50000	1162.20			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	gap_buffer/line_text_all/50000	1370300.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	highlight/rust_into/1000	1590900.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	highlight/rust_into/10000	15741000.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	document/insert_100_seal_undo_all	389130.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	document/insert_delete_interleaved	166680.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	search/search_forward_miss/1000	567510.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	search/search_backward_miss/1000	1113700.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	search/search_forward_miss/10000	5575200.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	search/search_backward_miss/10000	11318000.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	viewport/ensure_cursor_visible_jump	105.20			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	viewport/wrapped_rows_sweep	114.27			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	alloc_audit/highlight_1k_into	1589000.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	alloc_audit/highlight_1k_alloc	1610400.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	alloc_audit/pos_to_offset_1k	807.83			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	alloc_audit/single_insert	31304.00			
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	[alloc] GapBuffer::from_vec		3	83660	83660
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	[alloc] single_insert		3	83660	83660
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	[alloc] doc_100_edit_undo		215	113152	113152
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	[alloc] highlight_1k_into		1	43	43
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	[alloc] highlight_1k_alloc		1000	34406	43
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	[alloc] pos_to_offset_1k		0	0	0
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	[alloc] line_text_all_1k		1000	34406	43
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	[alloc] search_forward_miss_1k		11	1024	1024
+6e498d0	Reduce allocations: undo/redo callback pattern and editor scratch buffer	[alloc] search_backward_miss_1k		3	76	76
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/from_vec/1000	24298.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/insert_sequential/1000	32113.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/pos_to_offset_all_lines/1000	966.63			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/offset_to_pos_walk/1000	694.32			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/line_text_all/1000	27179.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/from_vec/10000	244100.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/insert_sequential/10000	244780.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/pos_to_offset_all_lines/10000	9656.80			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/offset_to_pos_walk/10000	1038.90			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/line_text_all/10000	273490.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/from_vec/50000	1372400.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/insert_sequential/50000	1367900.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/pos_to_offset_all_lines/50000	49097.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/offset_to_pos_walk/50000	1240.20			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	gap_buffer/line_text_all/50000	1368200.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	highlight/rust_into/1000	1581700.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	highlight/rust_into/10000	15767000.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	document/insert_100_seal_undo_all	424590.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	document/insert_delete_interleaved	204760.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	search/search_forward_miss/1000	558660.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	search/search_backward_miss/1000	1116500.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	search/search_forward_miss/10000	5679500.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	search/search_backward_miss/10000	11347000.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	viewport/ensure_cursor_visible_jump	167.73			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	viewport/wrapped_rows_sweep	108.78			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	alloc_audit/highlight_1k_into	1526300.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	alloc_audit/highlight_1k_alloc	1548500.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	alloc_audit/pos_to_offset_1k	940.16			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	alloc_audit/single_insert	37890.00			
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	[alloc] GapBuffer::from_vec		4	85401	85401
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	[alloc] single_insert		4	85401	85401
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	[alloc] doc_100_edit_undo		216	114892	114892
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	[alloc] highlight_1k_into		1	43	43
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	[alloc] highlight_1k_alloc		1000	34406	43
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	[alloc] pos_to_offset_1k		0	0	0
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	[alloc] line_text_all_1k		1000	34406	43
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	[alloc] search_forward_miss_1k		11	1024	1024
+9e0446f	Per-line ASCII fast path for O(1) char/byte conversion	[alloc] search_backward_miss_1k		3	76	76
+12c67da	bump version to 0.1.5	gap_buffer/from_vec/1000	23593.00			
+12c67da	bump version to 0.1.5	gap_buffer/insert_sequential/1000	27536.00			
+12c67da	bump version to 0.1.5	gap_buffer/pos_to_offset_all_lines/1000	938.32			
+12c67da	bump version to 0.1.5	gap_buffer/offset_to_pos_walk/1000	673.50			
+12c67da	bump version to 0.1.5	gap_buffer/line_text_all/1000	26400.00			
+12c67da	bump version to 0.1.5	gap_buffer/from_vec/10000	256810.00			
+12c67da	bump version to 0.1.5	gap_buffer/insert_sequential/10000	237800.00			
+12c67da	bump version to 0.1.5	gap_buffer/pos_to_offset_all_lines/10000	9385.10			
+12c67da	bump version to 0.1.5	gap_buffer/offset_to_pos_walk/10000	1009.60			
+12c67da	bump version to 0.1.5	gap_buffer/line_text_all/10000	265250.00			
+12c67da	bump version to 0.1.5	gap_buffer/from_vec/50000	1326800.00			
+12c67da	bump version to 0.1.5	gap_buffer/insert_sequential/50000	1340800.00			
+12c67da	bump version to 0.1.5	gap_buffer/pos_to_offset_all_lines/50000	47071.00			
+12c67da	bump version to 0.1.5	gap_buffer/offset_to_pos_walk/50000	1250.00			
+12c67da	bump version to 0.1.5	gap_buffer/line_text_all/50000	1343100.00			
+12c67da	bump version to 0.1.5	highlight/rust_into/1000	1589700.00			
+12c67da	bump version to 0.1.5	highlight/rust_into/10000	15518000.00			
+12c67da	bump version to 0.1.5	document/insert_100_seal_undo_all	416010.00			
+12c67da	bump version to 0.1.5	document/insert_delete_interleaved	210770.00			
+12c67da	bump version to 0.1.5	search/search_forward_miss/1000	563130.00			
+12c67da	bump version to 0.1.5	search/search_backward_miss/1000	1126400.00			
+12c67da	bump version to 0.1.5	search/search_forward_miss/10000	5520400.00			
+12c67da	bump version to 0.1.5	search/search_backward_miss/10000	10988000.00			
+12c67da	bump version to 0.1.5	viewport/ensure_cursor_visible_jump	171.09			
+12c67da	bump version to 0.1.5	viewport/wrapped_rows_sweep	109.65			
+12c67da	bump version to 0.1.5	alloc_audit/highlight_1k_into	1534100.00			
+12c67da	bump version to 0.1.5	alloc_audit/highlight_1k_alloc	1566300.00			
+12c67da	bump version to 0.1.5	alloc_audit/pos_to_offset_1k	949.78			
+12c67da	bump version to 0.1.5	alloc_audit/single_insert	36987.00			
+12c67da	bump version to 0.1.5	[alloc] GapBuffer::from_vec		4	85401	85401
+12c67da	bump version to 0.1.5	[alloc] single_insert		4	85401	85401
+12c67da	bump version to 0.1.5	[alloc] doc_100_edit_undo		216	114892	114892
+12c67da	bump version to 0.1.5	[alloc] highlight_1k_into		1	43	43
+12c67da	bump version to 0.1.5	[alloc] highlight_1k_alloc		1000	34406	43
+12c67da	bump version to 0.1.5	[alloc] pos_to_offset_1k		0	0	0
+12c67da	bump version to 0.1.5	[alloc] line_text_all_1k		1000	34406	43
+12c67da	bump version to 0.1.5	[alloc] search_forward_miss_1k		11	1024	1024
+12c67da	bump version to 0.1.5	[alloc] search_backward_miss_1k		3	76	76
