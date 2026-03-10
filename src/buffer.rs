@@ -281,14 +281,9 @@ impl GapBuffer {
 
     /// Get the text of line `line` (0-indexed), without the trailing '\n'.
     pub fn line_text(&self, line: usize) -> Vec<u8> {
-        let start = self.line_start(line);
-        let end = self.line_end(line);
-        let raw = self.slice(start, end);
-        if raw.last() == Some(&b'\n') {
-            raw[..raw.len() - 1].to_vec()
-        } else {
-            raw
-        }
+        let mut buf = Vec::new();
+        self.line_text_into(line, &mut buf);
+        buf
     }
 
     /// Fill `buf` with the text of line `line` (0-indexed), without the trailing '\n'.
@@ -439,6 +434,18 @@ pub fn char_count(bytes: &[u8]) -> usize {
         count += 1;
     }
     count
+}
+
+/// Convert a char column index to a byte offset in a UTF-8 byte slice.
+/// Returns `bytes.len()` if `char_col` is past the end.
+pub fn char_to_byte(bytes: &[u8], char_col: usize) -> usize {
+    let mut bi = 0;
+    let mut ci = 0;
+    while ci < char_col && bi < bytes.len() {
+        bi += utf8_char_len(bytes[bi]);
+        ci += 1;
+    }
+    bi
 }
 
 #[cfg(test)]

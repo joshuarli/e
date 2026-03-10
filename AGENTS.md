@@ -542,8 +542,8 @@ Indentation is treated as a **copy-time property**: the indentation in the paste
 
 ### Find next/prev
 
-- `find.find_next(buf, cursor)`: calls `FindState::search_forward` which scans forward from cursor (wrapping around end of file). Updates `find.current`. O(lines_to_next_match).
-- `find.find_prev(buf, cursor)`: calls `FindState::search_backward` which scans backward from cursor (wrapping around start of file), returning the last match on each line. O(lines_to_prev_match).
+- `find.find_next(buf, cursor)`: calls `FindState::search_forward` which uses `re.find_at()` (zero-alloc) per line, scanning forward from cursor (wrapping around end of file). Updates `find.current`. O(lines_to_next_match).
+- `find.find_prev(buf, cursor)`: calls `FindState::search_backward` which iterates `re.find_at()` to find the last match per line, scanning backward (wrapping around start of file). O(lines_to_prev_match).
 - Both use `take/restore` on `find.re` to avoid borrow conflicts.
 
 ### Replace all (`replace_all`)

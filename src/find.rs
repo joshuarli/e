@@ -121,12 +121,14 @@ impl FindState {
                 let Ok(text) = std::str::from_utf8(&line_buf) else {
                     continue;
                 };
-                for m in re.find_iter(text) {
+                // On the starting line, search from the byte offset of from.col
+                let byte_start = if pass == 0 && line_idx == from.line {
+                    buffer::char_to_byte(&line_buf, from.col)
+                } else {
+                    0
+                };
+                if let Some(m) = re.find_at(text, byte_start) {
                     let start_col = buffer::char_count(&line_buf[..m.start()]);
-                    // On the starting line (pass 0) skip matches before from.col.
-                    if pass == 0 && line_idx == from.line && start_col < from.col {
-                        continue;
-                    }
                     let end_col = buffer::char_count(&line_buf[..m.end()]);
                     return Some((Pos::new(line_idx, start_col), Pos::new(line_idx, end_col)));
                 }
@@ -144,24 +146,35 @@ impl FindState {
         let line_count = buf.line_count();
         let mut line_buf = Vec::new();
         for pass in 0..2 {
-            let range: Box<dyn Iterator<Item = usize>> = if pass == 0 {
-                Box::new((0..=from.line).rev())
+            let (start, end) = if pass == 0 {
+                (0, from.line + 1)
             } else {
-                Box::new((0..line_count).rev())
+                (0, line_count)
             };
-            for line_idx in range {
+            for line_idx in (start..end).rev() {
                 buf.line_text_into(line_idx, &mut line_buf);
                 let Ok(text) = std::str::from_utf8(&line_buf) else {
                     continue;
                 };
+                // Walk re.find_at() to find the last match on this line
                 let mut best: Option<(Pos, Pos)> = None;
-                for m in re.find_iter(text) {
+                let mut at = 0;
+                while let Some(m) = re.find_at(text, at) {
                     let start_col = buffer::char_count(&line_buf[..m.start()]);
                     let end_col = buffer::char_count(&line_buf[..m.end()]);
                     if pass == 0 && line_idx == from.line && end_col >= from.col {
-                        continue;
+                        break;
                     }
                     best = Some((Pos::new(line_idx, start_col), Pos::new(line_idx, end_col)));
+                    // Advance past this match (at least 1 byte to avoid infinite loop)
+                    at = if m.end() > m.start() {
+                        m.end()
+                    } else {
+                        m.end() + 1
+                    };
+                    if at >= text.len() {
+                        break;
+                    }
                 }
                 if best.is_some() {
                     return best;

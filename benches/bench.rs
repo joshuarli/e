@@ -423,6 +423,39 @@ fn bench_alloc_counts(c: &mut Criterion) {
 
     // One-shot allocation reports (printed, not benchmarked for speed)
     {
+        eprintln!();
+        eprintln!("  ── allocation audit (1k-line Rust source) ──");
+
+        // GapBuffer construction
+        let stats = measure_allocs(|| {
+            black_box(GapBuffer::from_vec(data.clone()));
+        });
+        eprintln!("  [alloc] GapBuffer::from_vec:       {stats}");
+
+        let buf = GapBuffer::from_vec(data.clone());
+
+        // Single insert into existing buffer
+        let stats = measure_allocs(|| {
+            let mut buf2 = GapBuffer::from_vec(data.clone());
+            buf2.insert(0, b"hello");
+            black_box(&buf2);
+        });
+        eprintln!("  [alloc] single_insert:             {stats}");
+
+        // Document create + 100 edits + full undo
+        let stats = measure_allocs(|| {
+            let mut doc = Document::new(data.clone(), None);
+            for i in 0..100 {
+                let line = i % doc.buf.line_count();
+                doc.insert(line, 0, b"// ");
+                doc.seal_undo();
+            }
+            while doc.undo().is_some() {}
+            black_box(&doc);
+        });
+        eprintln!("  [alloc] doc_100_edit_undo:         {stats}");
+
+        // Highlight (non-allocating path)
         let mut out = Vec::new();
         let stats = measure_allocs(|| {
             let mut state = HlState::default();
@@ -430,23 +463,9 @@ fn bench_alloc_counts(c: &mut Criterion) {
                 state = highlight::highlight_line_into(line, state, rules, &mut out);
             }
         });
-        eprintln!("  [alloc] highlight_1k_into:  {stats}");
+        eprintln!("  [alloc] highlight_1k_into:         {stats}");
 
-        let buf = GapBuffer::from_vec(data.clone());
-        let stats = measure_allocs(|| {
-            for line in 0..buf.line_count() {
-                buf.pos_to_offset(line, 0);
-            }
-        });
-        eprintln!("  [alloc] pos_to_offset_1k:   {stats}");
-
-        let stats = measure_allocs(|| {
-            let mut buf2 = GapBuffer::from_vec(data.clone());
-            buf2.insert(0, b"hello");
-            black_box(&buf2);
-        });
-        eprintln!("  [alloc] single_insert:      {stats}");
-
+        // Highlight (allocating path)
         let stats = measure_allocs(|| {
             let mut state = HlState::default();
             for line in data.split(|&byte| byte == b'\n') {
@@ -455,7 +474,39 @@ fn bench_alloc_counts(c: &mut Criterion) {
                 black_box(&hl);
             }
         });
-        eprintln!("  [alloc] highlight_1k_alloc: {stats}");
+        eprintln!("  [alloc] highlight_1k_alloc:        {stats}");
+
+        // pos_to_offset (should be 0)
+        let stats = measure_allocs(|| {
+            for line in 0..buf.line_count() {
+                buf.pos_to_offset(line, 0);
+            }
+        });
+        eprintln!("  [alloc] pos_to_offset_1k:          {stats}");
+
+        // line_text for all lines (allocates a String per line)
+        let stats = measure_allocs(|| {
+            for line in 0..buf.line_count() {
+                black_box(buf.line_text(line));
+            }
+        });
+        eprintln!("  [alloc] line_text_all_1k:          {stats}");
+
+        // Search forward (full scan, miss)
+        let re = regex_lite::Regex::new("ZZNOTFOUND").expect("valid regex");
+        let stats = measure_allocs(|| {
+            black_box(FindState::search_forward(&buf, &re, Pos::zero()));
+        });
+        eprintln!("  [alloc] search_forward_miss_1k:    {stats}");
+
+        // Search backward (full scan, miss)
+        let last = Pos::new(buf.line_count().saturating_sub(1), 0);
+        let stats = measure_allocs(|| {
+            black_box(FindState::search_backward(&buf, &re, last));
+        });
+        eprintln!("  [alloc] search_backward_miss_1k:   {stats}");
+
+        eprintln!();
     }
 
     // Criterion timing benchmarks for the same operations
