@@ -70,9 +70,10 @@ impl FindState {
             self.current = Some(m);
         } else {
             // No match in viewport — search forward through the rest of the file.
-            let re = self.re.take().unwrap();
-            self.current = Self::search_forward(buf, &re, cursor);
-            self.re = Some(re);
+            if let Some(re) = self.re.take() {
+                self.current = Self::search_forward(buf, &re, cursor);
+                self.re = Some(re);
+            }
         }
     }
 

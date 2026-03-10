@@ -2247,8 +2247,7 @@ impl Editor {
     }
 
     fn save_file(&mut self) {
-        if self.doc.filename.is_some() {
-            let path = self.doc.filename.clone().unwrap();
+        if let Some(path) = self.doc.filename.clone() {
             let path_ref = std::path::Path::new(&path);
 
             // mkdir -p for parent directory

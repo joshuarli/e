@@ -38,7 +38,8 @@ pub fn gutter_width(line_count: usize) -> usize {
 fn write_line_num(mut n: usize, buf: &mut [u8; 20]) -> &str {
     if n == 0 {
         buf[19] = b'0';
-        return std::str::from_utf8(&buf[19..]).unwrap();
+        // SAFETY: buf contains only ASCII digits — always valid UTF-8.
+        return unsafe { std::str::from_utf8_unchecked(&buf[19..]) };
     }
     let mut pos = 20usize;
     while n > 0 {
@@ -46,7 +47,8 @@ fn write_line_num(mut n: usize, buf: &mut [u8; 20]) -> &str {
         buf[pos] = b'0' + (n % 10) as u8;
         n /= 10;
     }
-    std::str::from_utf8(&buf[pos..]).unwrap()
+    // SAFETY: buf contains only ASCII digits — always valid UTF-8.
+    unsafe { std::str::from_utf8_unchecked(&buf[pos..]) }
 }
 
 /// Expand tabs in `text`, writing expanded bytes into `out` and per-column

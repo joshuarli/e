@@ -7,12 +7,16 @@ use e::{editor, file_io};
 fn confirm(prompt: &str) -> bool {
     // Use alternate screen so the prompt doesn't pollute terminal history
     eprint!("\x1b[?1049h\x1b[2J\x1b[H{} (y/n) ", prompt);
-    io::stderr().flush().unwrap();
+    let _ = io::stderr().flush();
     let mut buf = String::new();
-    io::stdin().read_line(&mut buf).unwrap();
+    if io::stdin().read_line(&mut buf).is_err() {
+        eprint!("\x1b[?1049l");
+        let _ = io::stderr().flush();
+        return false;
+    }
     let result = buf.trim().eq_ignore_ascii_case("y");
     eprint!("\x1b[?1049l");
-    io::stderr().flush().unwrap();
+    let _ = io::stderr().flush();
     result
 }
 
