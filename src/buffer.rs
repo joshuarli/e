@@ -214,16 +214,10 @@ impl GapBuffer {
         }
         let n = bytes.len();
 
-        // Line that contains pos (for min_dirty_line tracking)
-        let insert_line = match self.line_starts.binary_search(&pos) {
-            Ok(i) => i,
-            Err(i) => i.saturating_sub(1),
-        };
-
-        // shift_from: first index whose start is strictly > pos
-        let shift_from = match self.line_starts.binary_search(&pos) {
-            Ok(i) => i + 1, // entry at pos itself stays put
-            Err(i) => i,
+        // Single binary search: derive both insert_line and shift_from.
+        let (insert_line, shift_from) = match self.line_starts.binary_search(&pos) {
+            Ok(i) => (i, i + 1), // exact match: line i contains pos, shift after it
+            Err(i) => (i.saturating_sub(1), i), // between entries: line before, shift from i
         };
         for j in shift_from..self.line_starts.len() {
             self.line_starts[j] += n;
@@ -509,7 +503,9 @@ impl GapBuffer {
 
 pub fn utf8_char_len(first_byte: u8) -> usize {
     if first_byte < 0xC0 {
-        1 // ASCII (0x00-0x7F) or continuation byte (0x80-0xBF)
+        // ASCII (0x00-0x7F) or continuation byte (0x80-0xBF).
+        // Continuation bytes return 1 as a safe fallback for non-UTF-8 input.
+        1
     } else if first_byte < 0xE0 {
         2
     } else if first_byte < 0xF0 {

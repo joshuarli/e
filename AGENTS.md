@@ -73,7 +73,7 @@ pub struct GapBuffer {
 - `move_gap_to(pos)` shifts the gap to a logical byte offset using `copy_within`.
 - `ensure_gap(needed)` grows the buffer if gap is too small, shifting the tail right.
 - `from_vec(data: Vec<u8>) -> Self` — production fast path: takes ownership of the data Vec, pre-allocates `line_starts` and `line_ascii` with heuristic `content_len / 20 + 16`, extends the Vec in-place for the gap. Builds ASCII flags in the same byte-scan pass as line starts (zero extra cost).
-- Line index: always valid, updated incrementally on every insert/delete. `from_vec()` scans bytes once at load. Each edit uses `binary_search` to locate the affected region and shifts/inserts/removes only the changed entries. A trailing `\n` does NOT create a new line entry.
+- Line index: always valid, updated incrementally on every insert/delete. `from_vec()` scans bytes once at load. Each edit uses a single `binary_search` to derive both the containing line and the shift-from index, then shifts/inserts/removes only the changed entries. A trailing `\n` does NOT create a new line entry in `from_vec` (POSIX convention: trailing newline is a line terminator). Note: `update_line_index_insert` always creates entries for newlines (intentional for interactive editing).
 - **ASCII fast path**: `line_ascii[i]` is true when every byte on line `i` is < 0x80. Maintained incrementally: inserts taint the line if non-ASCII bytes are introduced; deletes that merge lines AND the flags (conservative — a line marked non-ASCII stays non-ASCII even if the non-ASCII byte is later deleted). When a line is ASCII, `line_char_len` = O(1), `pos_to_offset` = O(1), `offset_to_pos` col = O(1), and display-column mapping skips `utf8_char_len` calls.
 - `take_dirty_line() -> usize` — returns and resets `min_dirty_line` (used by renderer for incremental highlight invalidation).
 - All line-query methods (`line_count`, `line_start`, `line_end`, `line_text`, `pos_to_offset`, `offset_to_pos`, `line_char_len`, `line_is_ascii`) take `&self` — no mutable borrow needed.
@@ -252,9 +252,10 @@ Channel-based (`std::sync::mpsc`). No async runtime.
 enum EditorEvent {
     Term(Event),      // Terminal event from termion
     Paste(String),    // Bracketed paste (accumulated text)
-    Tick,             // Unused
 }
 ```
+
+SIGWINCH is polled on recv timeout (no Tick variant needed).
 
 ### Background input thread
 
@@ -268,7 +269,7 @@ Bracketed paste detection: when the thread sees `\x1b[200~` (PASTE_START), it en
 2. Call `draw()` to render the frame.
 3. `recv_timeout(500ms)`:
    - On any event: `dispatch_event(ev)`, then **drain all pending events** via `try_recv()` loop before re-rendering. This coalesces bursts (e.g. rapid scroll wheel flicks) into a single frame. The drain loop stops when the channel is empty or `self.running` becomes false.
-   - `dispatch_event` routes: `Term(ev)` → `handle_event(ev)`; `Paste(text)` → if command buffer active: `insert_str(text)`, else `paste_text(text)`; `Tick` → poll SIGWINCH.
+   - `dispatch_event` routes: `Term(ev)` → `handle_event(ev)`; `Paste(text)` → if command buffer active: `insert_str(text)`, else `paste_text(text)`.
    - Timeout → poll SIGWINCH via `take_sigwinch()`, update terminal size if changed.
    - Disconnected → break.
 
@@ -403,6 +404,7 @@ Auto-close pairs: `(→)`, `[→]`, `{→}`, `"→"`, `'→'`, `` `→` ``. Exce
 
 - If selection active: indent all selected lines.
 - Otherwise: insert `\t` for `.c`, `.h`, `.go`, `Makefile` files; `  ` (2 spaces) for everything else.
+- Tab vs spaces decision is centralized in `use_tab_indent()` helper (used by `insert_tab`, `indent_selection`, `insert_newline`).
 
 ### Insert newline (`insert_newline`)
 
@@ -554,9 +556,9 @@ Indentation is treated as a **copy-time property**: the indentation in the paste
 
 1. Same smart-case regex construction.
 2. If selection active: operates within selection range. Otherwise: whole file.
-3. Extracts text in range, applies `re.replace_all`.
-4. If unchanged: reports "Replaced 0 occurrences".
-5. Counts matches, seals undo, deletes range, inserts new text, seals undo.
+3. Extracts text in range, counts matches with `find_iter` first (single scan).
+4. If count is 0: reports "Replaced 0 occurrences" (avoids unnecessary `replace_all`).
+5. Applies `re.replace_all`, seals undo, deletes range, inserts new text, seals undo.
 6. Clears selection, reports count.
 
 ## 11. Commands (`command.rs`)
@@ -665,7 +667,7 @@ pub struct Renderer {
     // Scratch buffers reused across render iterations (no per-frame allocation):
     line_buf: Vec<u8>,                   // Raw line bytes from line_text_into
     expanded_scratch: Vec<u8>,           // Tab-expanded bytes
-    tab_pipes_scratch: Vec<bool>,        // Per-column tab-pipe markers (empty when no tabs)
+    tab_pipes_scratch: Vec<bool>,        // Per-character (not byte) tab-pipe markers (empty when no tabs)
     hl_scratch: Vec<HlType>,             // Byte-indexed highlight output
     char_hl_scratch: Vec<HlType>,        // Char-indexed highlight output
     find_scratch: Vec<(usize, usize, bool)>, // Per-line find-range display columns
@@ -812,7 +814,7 @@ Post-pass on every highlighted line. Finds patterns like `v1.2.3` or `0.3.5-beta
 
 ### Bracket matching (`find_bracket_match`)
 
-Signature: `find_bracket_match(pos, get_line: &mut impl FnMut(usize, &mut Vec<u8>), scratch: &mut Vec<u8>, line_count) -> Option<Pos>`.
+Signature: `find_bracket_match(pos, get_line: &mut impl FnMut(usize, &mut Vec<u8>), scratch: &mut Vec<u8>, line_count) -> Option<Pos>`. Called from `Editor::find_matching_bracket()` which reuses `self.line_scratch` via `std::mem::take` to avoid per-frame allocation.
 
 `get_line(idx, buf)` fills `buf` with raw bytes for line `idx` (no allocation). `scratch` is a reused buffer supplied by the caller — eliminates the up-to-1000 per-line `Vec<u8>` allocations the previous `FnMut(usize) -> Vec<u8>` design incurred on deep bracket searches.
 
@@ -1021,9 +1023,9 @@ Walks from `(scroll_line, scroll_wrap)` through wrapped lines counting screen ro
 
 ### Status bar (second-to-last row)
 
-Reverse video (`\x1b[0;7m`). Full width.
-- Left: `" {filename}{*} [{language}]"` — `*` if dirty, language from detection or "Text".
-- Right: `" e v{VERSION} "` — version from `env!("CARGO_PKG_VERSION")`.
+Dark grey background (`\x1b[0;100m`). Full width.
+- Left: `" {filename}{*} [{language}]"` — `*` if dirty, language from detection or "Text". Truncated by character count (not byte length) for correct display width with multi-byte filenames.
+- Right: `" e v{VERSION} "` — version from `env!("CARGO_PKG_VERSION")` (always ASCII).
 - Padding with spaces between left and right.
 
 ### Command line (last row)

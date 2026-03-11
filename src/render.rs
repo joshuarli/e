@@ -71,7 +71,11 @@ fn expand_tabs_into(text: &[u8], out: &mut Vec<u8>, tab_pipes: &mut Vec<bool>) -
             tab_pipes.push(false);
         } else {
             out.push(b);
-            tab_pipes.push(false);
+            // Only push for character-start bytes, not UTF-8 continuation bytes,
+            // so tab_pipes aligns with character indices (not byte indices).
+            if b & 0xC0 != 0x80 {
+                tab_pipes.push(false);
+            }
         }
     }
     true
@@ -604,13 +608,18 @@ impl Renderer {
             let rb = &mut self.row_buf;
             write!(rb, "\x1b[0;100m")?;
             let width = view.width as usize;
-            let left_len = status_left.len().min(width);
-            let right_len = status_right.len();
-            let padding = width.saturating_sub(left_len + right_len);
+            let right_len = status_right.len(); // always ASCII
+            // Use character count for display width (correct for multi-byte filenames).
+            let left_chars = status_left.chars().count().min(width);
+            let left_byte_end = status_left
+                .char_indices()
+                .nth(left_chars)
+                .map_or(status_left.len(), |(i, _)| i);
+            let padding = width.saturating_sub(left_chars + right_len);
             write!(
                 rb,
                 "{}{}{}",
-                &status_left[..left_len],
+                &status_left[..left_byte_end],
                 " ".repeat(padding),
                 status_right,
             )?;
@@ -833,11 +842,6 @@ impl Renderer {
             self.hl_cache.resize(end, HlState::Normal);
         }
 
-        // Where to start recomputing:
-        //   dirty_from  — explicit invalidation from an edit
-        //   computed-1  — reprocess last known line to recover its output state
-        //                 so we can extend the cache forward from there
-        //
         // Where to start recomputing:
         //   dirty_from  — explicit invalidation from an edit
         //   computed-1  — reprocess last known line to recover its output state

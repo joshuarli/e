@@ -138,8 +138,6 @@ pub struct Editor {
 enum EditorEvent {
     Term(Event),
     Paste(String),
-    #[allow(dead_code)]
-    Tick,
 }
 
 impl Editor {
@@ -319,15 +317,6 @@ impl Editor {
                     self.paste_text(&text);
                 }
             }
-            EditorEvent::Tick => {
-                if crate::signal::take_sigwinch()
-                    && let Ok((w, h)) = termion::terminal_size()
-                {
-                    self.view.width = w;
-                    self.view.height = h;
-                    self.renderer.force_full_redraw();
-                }
-            }
         }
     }
 
@@ -342,6 +331,12 @@ impl Editor {
 
     fn set_cursor(&mut self, pos: Pos) {
         self.sel = Selection::caret(pos);
+    }
+
+    fn use_tab_indent(&self) -> bool {
+        self.doc.filename.as_ref().is_some_and(|f| {
+            f.ends_with(".c") || f.ends_with(".h") || f.ends_with(".go") || f.contains("Makefile")
+        })
     }
 
     fn draw(&mut self, out: &mut impl Write) -> io::Result<()> {
@@ -480,13 +475,15 @@ impl Editor {
     fn find_matching_bracket(&mut self) -> Option<(Pos, Pos)> {
         let cursor = self.cursor();
         let line_count = self.doc.buf.line_count();
-        let mut scratch = Vec::new();
+        // Reuse the editor's scratch buffer to avoid a per-frame allocation.
+        let mut scratch = std::mem::take(&mut self.line_scratch);
         if let Some(match_pos) = highlight::find_bracket_match(
             cursor,
             &mut |line_idx, buf| self.doc.buf.line_text_into(line_idx, buf),
             &mut scratch,
             line_count,
         ) {
+            self.line_scratch = scratch;
             return Some((cursor, match_pos));
         }
         let match_pos = highlight::find_quote_match(
@@ -494,8 +491,9 @@ impl Editor {
             &mut |line_idx, buf| self.doc.buf.line_text_into(line_idx, buf),
             &mut scratch,
             line_count,
-        )?;
-        Some((cursor, match_pos))
+        );
+        self.line_scratch = scratch;
+        match_pos.map(|p| (cursor, p))
     }
 
     fn handle_event(&mut self, ev: Event) {
@@ -989,14 +987,14 @@ impl Editor {
 
         let text_bytes = self.doc.text_in_range(range_start, range_end);
         let text = String::from_utf8_lossy(&text_bytes);
-        let new_text = re.replace_all(&text, replacement);
 
-        if new_text == text {
+        let count = re.find_iter(&text).count();
+        if count == 0 {
             self.set_status("Replaced 0 occurrences".to_string());
             return;
         }
 
-        let count = re.find_iter(&text).count();
+        let new_text = re.replace_all(&text, replacement);
 
         self.doc.seal_undo();
         self.doc.delete_range(range_start, range_end);
@@ -1595,10 +1593,7 @@ impl Editor {
             self.indent_selection();
             return;
         }
-        let use_tab = self.doc.filename.as_ref().is_some_and(|f| {
-            f.ends_with(".c") || f.ends_with(".h") || f.ends_with(".go") || f.contains("Makefile")
-        });
-        let bytes: &[u8] = if use_tab { b"\t" } else { b"  " };
+        let bytes: &[u8] = if self.use_tab_indent() { b"\t" } else { b"  " };
         let pos = self
             .doc
             .insert(self.cursor().line, self.cursor().col, bytes);
@@ -1614,9 +1609,7 @@ impl Editor {
         };
         let start_line = s.line;
 
-        let use_tab = self.doc.filename.as_ref().is_some_and(|f| {
-            f.ends_with(".c") || f.ends_with(".h") || f.ends_with(".go") || f.contains("Makefile")
-        });
+        let use_tab = self.use_tab_indent();
         let indent_bytes: &[u8] = if use_tab { b"\t" } else { b"  " };
         let indent_char_len = if use_tab { 1 } else { 2 };
 
@@ -1681,13 +1674,7 @@ impl Editor {
                 && ls + c.col < le
                 && self.doc.buf.byte_at(ls + c.col) == close
             {
-                let use_tab = self.doc.filename.as_ref().is_some_and(|f| {
-                    f.ends_with(".c")
-                        || f.ends_with(".h")
-                        || f.ends_with(".go")
-                        || f.contains("Makefile")
-                });
-                let extra: &[u8] = if use_tab { b"\t" } else { b"  " };
+                let extra: &[u8] = if self.use_tab_indent() { b"\t" } else { b"  " };
                 let mut split = vec![b'\n'];
                 split.extend_from_slice(&indent);
                 split.extend_from_slice(extra);
