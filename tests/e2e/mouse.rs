@@ -116,3 +116,33 @@ fn scroll_up_from_middle() {
     let r0_back = e.row(0);
     assert_ne!(r0_scrolled, r0_back, "scroll up should change content");
 }
+
+#[test]
+fn scroll_down_and_back_restores_content() {
+    // Regression: skip-clean-lines used to bypass dirty-line checks on rows
+    // invalidated by scroll regions, leaving blank rows after scrolling back.
+    let dir = TempDir::new();
+    let content: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+    let path = create_file(dir.path(), "test.txt", &content);
+    let mut e = TestEditor::new(&[path.to_str().unwrap()]);
+
+    // Capture initial screen (first several text rows)
+    let initial: Vec<String> = (0..10).map(|r| e.row(r)).collect();
+
+    // Scroll down and back up the same amount
+    for _ in 0..4 {
+        e.scroll_down();
+    }
+    for _ in 0..4 {
+        e.scroll_up();
+    }
+
+    // Every row must match the initial content exactly
+    for (r, expected) in initial.iter().enumerate() {
+        let after = e.row(r as u16);
+        assert_eq!(
+            *expected, after,
+            "row {r} content mismatch after scroll roundtrip"
+        );
+    }
+}
