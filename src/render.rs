@@ -236,6 +236,7 @@ impl Renderer {
             self.needs_full_redraw = true;
         }
         // Detect scroll delta and use scroll regions to shift existing content.
+        let mut used_scroll_region = false;
         if !self.needs_full_redraw && self.prev_scroll_line != usize::MAX && text_rows > 1 {
             let delta = self.compute_scroll_delta(view, buf, text_cols, text_rows);
             if delta != 0 && (delta.unsigned_abs()) < text_rows {
@@ -260,6 +261,7 @@ impl Renderer {
                 }
                 // Reset scroll region to full terminal
                 write!(w, "\x1b[r")?;
+                used_scroll_region = true;
             }
         }
 
@@ -293,8 +295,13 @@ impl Renderer {
         // Skip-clean-lines: when the buffer hasn't been edited and find state
         // hasn't changed, we can skip rendering lines that aren't affected by
         // cursor, selection, or bracket-pair changes.
-        let can_skip =
-            !full && buf_version == self.prev_buf_version && !has_find && !self.prev_has_find;
+        // Disabled when scroll regions were used: the shifted content invalidates
+        // prev_rows entries, and the dirty-line check must run for every row.
+        let can_skip = !full
+            && !used_scroll_region
+            && buf_version == self.prev_buf_version
+            && !has_find
+            && !self.prev_has_find;
 
         while screen_row < text_rows && line_idx < line_count {
             // Fast skip: if this line can't have changed, advance screen_row
