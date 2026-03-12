@@ -1,6 +1,5 @@
 NAME   := e
-ARCH   := $(shell uname -m | sed 's/arm64/aarch64/')
-TARGET := $(ARCH)-apple-darwin
+TARGET := $(shell rustc -vV | awk '/^host:/ {print $$2}')
 
 .PHONY: setup build-dev release install test test-ci record gifs pc bump-version
 
@@ -20,7 +19,7 @@ release:
 	  --target $(TARGET)
 
 install: release
-	sudo cp target/$(TARGET)/release/$(NAME) /usr/local/bin/$(NAME)
+	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
 
 test:
 	cargo test -- --test-threads=4
@@ -39,7 +38,7 @@ gifs:
 	@for f in tests/e2e/recordings/*.cast; do \
 	  agg "$$f" "$${f%.cast}.gif" 2>/dev/null; \
 	done
-	@echo "$$(ls tests/e2e/recordings/*.gif | wc -l | tr -d ' ') GIFs → tests/e2e/recordings/"
+	@echo "$$(ls tests/e2e/recordings/*.gif | wc -l | tr -d ' ') GIFs ??? tests/e2e/recordings/"
 
 pc:
 	prek run --all-files

@@ -9,28 +9,62 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    name: Build and Release
-    runs-on: macos-15
+  build:
+    name: Build (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     defaults:
       run:
         shell: bash -euo pipefail {0}
+    strategy:
+      fail-fast: false
+      # Native runners required: -Z build-std makes cross-compilation with
+      # `cross` impractical (needs nightly toolchain + rust-src inside the
+      # container). Native runners let us build and test identically everywhere.
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.runner }}-${{ matrix.target }}
 
-      - name: test and release
-        run: |
-          make test-ci
-          make release
+      - name: Run tests
+        run: make test-ci
+
+      - name: Build release
+        run: make release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/e
+
+  release:
+    name: Create release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
 
       - name: Create GitHub release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
         run: |
           V="${VERSION#release/}"
-          gh release create "$VERSION" "target/aarch64-apple-darwin/release/e#e-${V}-aarch64-apple-darwin" --title "$V"
+          for dir in e-*; do
+            target="${dir#e-}"
+            mv "$dir/e" "e-${V}-${target}"
+          done
+          gh release create "$VERSION" e-"${V}"-* --title "$V"
