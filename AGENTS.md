@@ -48,7 +48,7 @@ src/
   language.rs        Language detection by file extension (~45 languages), comment syntax
   signal.rs          SIGWINCH handler via libc::sigaction + AtomicBool polling (sole unsafe block)
   highlight.rs       Syntax highlighting: byte-by-byte highlighter, 16 language rule sets,
-                     bracket/quote matching, semver detection
+                     bracket/quote matching, semver detection, function/constant/macro detection
 ```
 
 ## 3. Data Structures
@@ -359,8 +359,8 @@ Uses `termion::raw::IntoRawMode` and `termion::screen::IntoAlternateScreen`.
 | Shift+Up/Down/Left/Right | Extend selection (Left/Right also snap to indent stops) |
 | Home | Column 0 |
 | End | End of line |
-| Ctrl+Left/Right | Word left/right (collapse selection, wrap across lines) |
-| Ctrl+Shift+Left/Right | Word left/right (extend selection, wrap across lines) |
+| Ctrl+Left/Right | Word left/right (collapse selection, wrap across lines; jumps to matching bracket if on bracket) |
+| Ctrl+Shift+Left/Right | Word left/right extend selection (wrap across lines; jumps to matching bracket if on bracket) |
 | Ctrl+Shift+Up | Select from cursor to start of file |
 | Ctrl+Shift+Down | Select from cursor to end of file |
 | PageUp/PageDown | Move by `text_rows` lines (preserves desired_col) |
@@ -451,7 +451,7 @@ Inserts `\n` + current line text after the current line end. Moves cursor to sam
 - `indent_snap_left(line, col)`: If col is in leading spaces and all spaces, snap to `(col-1)/2*2`. Otherwise `col-1`.
 - `indent_snap_right(line, col)`: If col is in leading spaces and all spaces, snap to `(col/2+1)*2` clamped to leading whitespace length. Otherwise `col+1`.
 
-**Word left/right**: Collapse selection first. Use `prev_word_boundary`/`next_word_boundary`. Wrap across lines at boundaries.
+**Word left/right**: Collapse selection first. If cursor is on a bracket `()[]{}`, jump to the matching bracket via `bracket_jump_target()` (reuses `find_bracket_match`). Otherwise use `prev_word_boundary`/`next_word_boundary`. Wrap across lines at boundaries. The bracket-jump also works with Ctrl+Shift (extend selection).
 
 **Home/End**: Column 0 / end of line.
 
@@ -741,13 +741,16 @@ Tabs expand to `|` (dark grey pipe) + space (2 display columns total).
 | Number | `\x1b[31m` | red |
 | Bracket | `\x1b[35m` | magenta |
 | Operator | `\x1b[33m` | yellow (same as keyword) |
+| Function | `\x1b[34m` | blue |
+| Constant | `\x1b[31;1m` | bold red |
+| Macro | `\x1b[35;1m` | bold magenta |
 
 ## 14. Syntax Highlighting (`highlight.rs`)
 
 ### Types
 
 ```rust
-enum HlType { Normal, Keyword, Type, String, Comment, Number, Bracket, Operator }
+enum HlType { Normal, Keyword, Type, String, Comment, Number, Bracket, Operator, Function, Constant, Macro }
 enum HlState { Normal, BlockComment, MultiLineString(u8), FencedCodeBlock }
 
 struct StringDelim { open: &'static str, close: &'static str, multiline: bool }
@@ -757,8 +760,13 @@ struct SyntaxRules {
     string_delims: &'static [StringDelim],
     keywords: &'static [&'static str],
     types: &'static [&'static str],
+    constants: &'static [&'static str],
+    macros: &'static [&'static str],
     operators: &'static [&'static str],
     highlight_numbers: bool,
+    highlight_upper_constants: bool,  // UPPER_SNAKE_CASE → Constant
+    highlight_fn_calls: bool,         // ident( → Function
+    highlight_bang_macros: bool,      // ident! → Macro (Rust-style)
     is_markdown: bool,
     is_json: bool,
     is_yaml: bool,
@@ -784,7 +792,11 @@ Byte-by-byte, inspired by kilo/kibi. Produces one `HlType` per byte.
    - **Block comment start**: scan for close on same line. If not found → return BlockComment state.
    - **String delimiters** (longest open first): check each delimiter. Scan for close with backslash escape handling. If multiline and not closed → return MultiLineString(index).
    - **Numbers** (after separator): digit or `.digit` start. Consume digits/alphanumeric/`_`/`.`. Mark as Number.
-   - **Keywords/types** (after separator, followed by separator or end): check keyword list then type list.
+   - **Keywords/types/constants/macros** (after separator, followed by separator or end): check keyword list, then type list, then constants list, then macros list.
+   - **Identifier analysis** (after separator, no keyword/type match): scan full identifier, then:
+     - **Bang macros** (`highlight_bang_macros`): if followed by `!` (not `!=`) → Macro.
+     - **Function calls** (`highlight_fn_calls`): if followed by `(` → Function (don't advance past `(` so it gets Bracket).
+     - **UPPER_SNAKE constants** (`highlight_upper_constants`): 2+ chars, all uppercase/digit/underscore, at least one letter → Constant.
    - **Operators**: check operator list (multi-char like `&&`, `||`, etc.).
    - **Brackets**: `()[]{}` → Bracket.
    - Track `prev_sep` (whether previous character was a separator).
@@ -814,7 +826,7 @@ Post-pass on every highlighted line. Finds patterns like `v1.2.3` or `0.3.5-beta
 
 ### Bracket matching (`find_bracket_match`)
 
-Signature: `find_bracket_match(pos, get_line: &mut impl FnMut(usize, &mut Vec<u8>), scratch: &mut Vec<u8>, line_count) -> Option<Pos>`. Called from `Editor::find_matching_bracket()` which reuses `self.line_scratch` via `std::mem::take` to avoid per-frame allocation.
+Signature: `find_bracket_match(pos, get_line: &mut impl FnMut(usize, &mut Vec<u8>), scratch: &mut Vec<u8>, line_count) -> Option<Pos>`. Called from `Editor::find_matching_bracket()` (for rendering highlights) and `Editor::bracket_jump_target()` (for word movement). Both reuse `self.line_scratch` via `std::mem::take` to avoid per-frame allocation.
 
 `get_line(idx, buf)` fills `buf` with raw bytes for line `idx` (no allocation). `scratch` is a reused buffer supplied by the caller — eliminates the up-to-1000 per-line `Vec<u8>` allocations the previous `FnMut(usize) -> Vec<u8>` design incurred on deep bracket searches.
 

@@ -1370,10 +1370,29 @@ impl Editor {
         }
     }
 
+    /// If the cursor is on a bracket character, return the matching bracket position.
+    fn bracket_jump_target(&mut self) -> Option<Pos> {
+        let c = self.cursor();
+        let line_count = self.doc.buf.line_count();
+        let mut scratch = std::mem::take(&mut self.line_scratch);
+        let result = highlight::find_bracket_match(
+            c,
+            &mut |line_idx, buf| self.doc.buf.line_text_into(line_idx, buf),
+            &mut scratch,
+            line_count,
+        );
+        self.line_scratch = scratch;
+        result
+    }
+
     fn word_left(&mut self) {
         if !self.sel.is_empty() {
             let (start, _) = self.sel.ordered();
             self.set_cursor(start);
+            return;
+        }
+        if let Some(target) = self.bracket_jump_target() {
+            self.set_cursor(target);
             return;
         }
         let c = self.cursor();
@@ -1395,6 +1414,10 @@ impl Editor {
             self.set_cursor(end);
             return;
         }
+        if let Some(target) = self.bracket_jump_target() {
+            self.set_cursor(target);
+            return;
+        }
         let c = self.cursor();
         let line_len = self.doc.buf.line_char_len(c.line);
         if c.col >= line_len {
@@ -1409,6 +1432,10 @@ impl Editor {
     }
 
     fn word_left_extend(&mut self) {
+        if let Some(target) = self.bracket_jump_target() {
+            self.sel.cursor = target;
+            return;
+        }
         let c = self.cursor();
         if c.col == 0 {
             if c.line > 0 {
@@ -1423,6 +1450,10 @@ impl Editor {
     }
 
     fn word_right_extend(&mut self) {
+        if let Some(target) = self.bracket_jump_target() {
+            self.sel.cursor = target;
+            return;
+        }
         let c = self.cursor();
         let line_len = self.doc.buf.line_char_len(c.line);
         if c.col >= line_len {
@@ -5350,6 +5381,89 @@ mod tests {
         assert_eq!(e.cursor(), Pos::new(0, 2));
         e.word_left();
         assert_eq!(e.cursor(), Pos::new(0, 0));
+    }
+
+    // ========================================================================
+    // Bracket-jump on word movement
+    // ========================================================================
+
+    #[test]
+    fn test_word_right_jumps_to_matching_bracket() {
+        let mut e = ed("fn foo() { bar }");
+        // Cursor on '(' at col 6 → should jump to ')' at col 7
+        e.set_cursor(Pos::new(0, 6));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 7));
+    }
+
+    #[test]
+    fn test_word_left_jumps_to_matching_bracket() {
+        let mut e = ed("fn foo() { bar }");
+        // Cursor on ')' at col 7 → should jump to '(' at col 6
+        e.set_cursor(Pos::new(0, 7));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 6));
+    }
+
+    #[test]
+    fn test_bracket_jump_multiline() {
+        let mut e = ed("if x {\n  y\n}");
+        // Cursor on '{' at line 0 col 5 → should jump to '}' at line 2 col 0
+        e.set_cursor(Pos::new(0, 5));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(2, 0));
+        // And back
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 5));
+    }
+
+    #[test]
+    fn test_bracket_jump_nested() {
+        let mut e = ed("((inner))");
+        // Cursor on outer '(' at col 0 → should jump to outer ')' at col 8
+        e.set_cursor(Pos::new(0, 0));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 8));
+        // Cursor on inner '(' at col 1 → should jump to inner ')' at col 7
+        e.set_cursor(Pos::new(0, 1));
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 7));
+    }
+
+    #[test]
+    fn test_bracket_jump_square() {
+        let mut e = ed("a[b[c]]");
+        e.set_cursor(Pos::new(0, 1));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 6)); // outer ]
+    }
+
+    #[test]
+    fn test_bracket_jump_extend_selection() {
+        let mut e = ed("fn foo() {}");
+        e.set_cursor(Pos::new(0, 6)); // on '('
+        e.word_right_extend();
+        assert_eq!(e.sel.cursor, Pos::new(0, 7)); // extends to ')'
+        assert_eq!(e.sel.anchor, Pos::new(0, 6)); // anchor stays
+    }
+
+    #[test]
+    fn test_non_bracket_does_normal_word_jump() {
+        // When not on a bracket, normal word movement should still work
+        let mut e = ed("hello world");
+        e.set_cursor(Pos::new(0, 0));
+        e.word_right();
+        assert_eq!(e.cursor(), Pos::new(0, 6)); // normal word jump
+    }
+
+    #[test]
+    fn test_word_left_selection_collapses_before_bracket_check() {
+        // With a selection, word_left should collapse the selection, not bracket-jump
+        let mut e = ed("(hello)");
+        e.set_cursor(Pos::new(0, 0)); // on '('
+        e.sel.cursor = Pos::new(0, 5); // select "hello"
+        e.word_left();
+        assert_eq!(e.cursor(), Pos::new(0, 0)); // collapsed to start
     }
 
     // ========================================================================

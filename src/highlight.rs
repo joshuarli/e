@@ -18,6 +18,9 @@ pub enum HlType {
     Number,
     Bracket,
     Operator,
+    Function,
+    Constant,
+    Macro,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -41,8 +44,16 @@ pub struct SyntaxRules {
     pub string_delims: &'static [StringDelim],
     pub keywords: &'static [&'static str],
     pub types: &'static [&'static str],
+    pub constants: &'static [&'static str],
+    pub macros: &'static [&'static str],
     pub operators: &'static [&'static str],
     pub highlight_numbers: bool,
+    /// Highlight UPPER_SNAKE_CASE identifiers as constants.
+    pub highlight_upper_constants: bool,
+    /// Highlight identifiers followed by `(` as functions.
+    pub highlight_fn_calls: bool,
+    /// Highlight `ident!` patterns as macros (Rust-style).
+    pub highlight_bang_macros: bool,
     pub is_markdown: bool,
     pub is_json: bool,
     pub is_yaml: bool,
@@ -56,13 +67,16 @@ impl HlType {
     pub fn ansi_code(self) -> &'static str {
         match self {
             HlType::Normal => "",
-            HlType::Comment => "\x1b[90m",  // grey
-            HlType::Keyword => "\x1b[33m",  // yellow
-            HlType::Type => "\x1b[36m",     // cyan
-            HlType::String => "\x1b[32m",   // green
-            HlType::Number => "\x1b[31m",   // red
-            HlType::Bracket => "\x1b[35m",  // magenta
-            HlType::Operator => "\x1b[33m", // yellow (same as keyword)
+            HlType::Comment => "\x1b[90m",    // grey
+            HlType::Keyword => "\x1b[33m",    // yellow
+            HlType::Type => "\x1b[36m",       // cyan
+            HlType::String => "\x1b[32m",     // green
+            HlType::Number => "\x1b[31m",     // red
+            HlType::Bracket => "\x1b[35m",    // magenta
+            HlType::Operator => "\x1b[33m",   // yellow (same as keyword)
+            HlType::Function => "\x1b[34m",   // blue
+            HlType::Constant => "\x1b[31;1m", // bold red
+            HlType::Macro => "\x1b[35;1m",    // bold magenta
         }
     }
 }
@@ -281,7 +295,7 @@ fn highlight_line_code(
             continue;
         }
 
-        // Keywords and types (after separator)
+        // Keywords, types, constants, macros (after separator)
         if prev_sep && (line[i].is_ascii_alphabetic() || line[i] == b'_') {
             if let Some(advance) = try_keyword(line, i, rules.keywords, HlType::Keyword, hl) {
                 i += advance;
@@ -293,6 +307,62 @@ fn highlight_line_code(
                 prev_sep = false;
                 continue;
             }
+            if let Some(advance) = try_keyword(line, i, rules.constants, HlType::Constant, hl) {
+                i += advance;
+                prev_sep = false;
+                continue;
+            }
+            if let Some(advance) = try_keyword(line, i, rules.macros, HlType::Macro, hl) {
+                i += advance;
+                prev_sep = false;
+                continue;
+            }
+            // Identifier: check for function call, macro invocation, or UPPER_SNAKE constant
+            let id_start = i;
+            while i < len && (line[i].is_ascii_alphanumeric() || line[i] == b'_') {
+                i += 1;
+            }
+            let id_end = i;
+            // Rust-style macros: ident!
+            if i < len && line[i] == b'!' && rules.highlight_bang_macros {
+                // Only treat as macro if the `!` is not followed by `=` (i.e. not `!=`)
+                if i + 1 >= len || line[i + 1] != b'=' {
+                    for b in &mut hl[id_start..id_end] {
+                        *b = HlType::Macro;
+                    }
+                    hl[i] = HlType::Macro; // the `!`
+                    i += 1;
+                    prev_sep = true;
+                    continue;
+                }
+            }
+            // Function calls: ident(
+            if rules.highlight_fn_calls && i < len && line[i] == b'(' {
+                for b in &mut hl[id_start..id_end] {
+                    *b = HlType::Function;
+                }
+                // Don't advance i — let the main loop process '(' as a bracket
+                prev_sep = true;
+                continue;
+            }
+            // UPPER_SNAKE_CASE constants (at least 2 chars, all uppercase/digit/underscore,
+            // at least one letter)
+            if rules.highlight_upper_constants && id_end - id_start >= 2 {
+                let id = &line[id_start..id_end];
+                let all_upper = id
+                    .iter()
+                    .all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+                let has_letter = id.iter().any(|&b| b.is_ascii_uppercase());
+                if all_upper && has_letter {
+                    for b in &mut hl[id_start..id_end] {
+                        *b = HlType::Constant;
+                    }
+                    prev_sep = false;
+                    continue;
+                }
+            }
+            prev_sep = false;
+            continue;
         }
 
         // Operators (multi-char like &&, ||, !=, etc.)
@@ -1453,8 +1523,13 @@ static RUST_RULES: SyntaxRules = SyntaxRules {
         "u16", "u32", "u64", "u128", "usize", "String", "Vec", "Option", "Result", "Box", "Self",
         "true", "false", "None", "Some", "Ok", "Err",
     ],
+    constants: &[],
+    macros: &[],
     operators: &["&&", "||", "!=", "==", "<=", ">=", "=>", "->"],
     highlight_numbers: true,
+    highlight_upper_constants: true,
+    highlight_fn_calls: true,
+    highlight_bang_macros: true,
     is_markdown: false,
     is_json: false,
     is_yaml: false,
@@ -1482,8 +1557,13 @@ static PYTHON_RULES: SyntaxRules = SyntaxRules {
         "True", "False", "None", "int", "float", "str", "bool", "list", "dict", "tuple", "set",
         "bytes", "self",
     ],
+    constants: &[],
+    macros: &[],
     operators: &["!=", "==", "<=", ">="],
     highlight_numbers: true,
+    highlight_upper_constants: true,
+    highlight_fn_calls: true,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: false,
     is_yaml: false,
@@ -1553,8 +1633,13 @@ static GO_RULES: SyntaxRules = SyntaxRules {
         "nil",
         "iota",
     ],
+    constants: &[],
+    macros: &[],
     operators: &["&&", "||", "!=", "==", "<=", ">=", ":="],
     highlight_numbers: true,
+    highlight_upper_constants: true,
+    highlight_fn_calls: true,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: false,
     is_yaml: false,
@@ -1641,8 +1726,13 @@ static TS_RULES: SyntaxRules = SyntaxRules {
         "Set",
         "Promise",
     ],
+    constants: &[],
+    macros: &[],
     operators: &["&&", "||", "!==", "===", "!=", "==", "<=", ">=", "=>"],
     highlight_numbers: true,
+    highlight_upper_constants: true,
+    highlight_fn_calls: true,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: false,
     is_yaml: false,
@@ -1716,8 +1806,13 @@ static JS_RULES: SyntaxRules = SyntaxRules {
         "String",
         "Boolean",
     ],
+    constants: &[],
+    macros: &[],
     operators: &["&&", "||", "!==", "===", "!=", "==", "<=", ">=", "=>"],
     highlight_numbers: true,
+    highlight_upper_constants: true,
+    highlight_fn_calls: true,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: false,
     is_yaml: false,
@@ -1739,8 +1834,13 @@ static BASH_RULES: SyntaxRules = SyntaxRules {
         "eval", "exec", "exit", "shift", "trap", "break", "continue",
     ],
     types: &["true", "false"],
+    constants: &[],
+    macros: &[],
     operators: &["&&", "||"],
     highlight_numbers: true,
+    highlight_upper_constants: true,
+    highlight_fn_calls: false,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: false,
     is_yaml: false,
@@ -1766,8 +1866,13 @@ static C_RULES: SyntaxRules = SyntaxRules {
         "size_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t",
         "uint64_t", "bool", "true", "false",
     ],
+    constants: &[],
+    macros: &[],
     operators: &["&&", "||", "!=", "==", "<=", ">=", "->"],
     highlight_numbers: true,
+    highlight_upper_constants: true,
+    highlight_fn_calls: true,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: false,
     is_yaml: false,
@@ -1787,8 +1892,13 @@ static TOML_RULES: SyntaxRules = SyntaxRules {
     string_delims: TOML_STRINGS,
     keywords: &[],
     types: &["true", "false"],
+    constants: &[],
+    macros: &[],
     operators: &[],
     highlight_numbers: true,
+    highlight_upper_constants: false,
+    highlight_fn_calls: false,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: false,
     is_yaml: false,
@@ -1803,8 +1913,13 @@ static JSON_RULES: SyntaxRules = SyntaxRules {
     string_delims: JSON_STRINGS,
     keywords: &[],
     types: &["true", "false", "null"],
+    constants: &[],
+    macros: &[],
     operators: &[],
     highlight_numbers: true,
+    highlight_upper_constants: false,
+    highlight_fn_calls: false,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: true,
     is_yaml: false,
@@ -1822,8 +1937,13 @@ static YAML_RULES: SyntaxRules = SyntaxRules {
     string_delims: YAML_STRINGS,
     keywords: &[],
     types: &["true", "false", "null", "yes", "no"],
+    constants: &[],
+    macros: &[],
     operators: &[],
     highlight_numbers: true,
+    highlight_upper_constants: false,
+    highlight_fn_calls: false,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: false,
     is_yaml: true,
@@ -1844,8 +1964,13 @@ static MAKEFILE_RULES: SyntaxRules = SyntaxRules {
         "override", "export", "unexport", "vpath",
     ],
     types: &[],
+    constants: &[],
+    macros: &[],
     operators: &[],
     highlight_numbers: false,
+    highlight_upper_constants: false,
+    highlight_fn_calls: false,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: false,
     is_yaml: false,
@@ -1863,8 +1988,13 @@ static HTML_RULES: SyntaxRules = SyntaxRules {
     string_delims: HTML_STRINGS,
     keywords: &[],
     types: &[],
+    constants: &[],
+    macros: &[],
     operators: &[],
     highlight_numbers: false,
+    highlight_upper_constants: false,
+    highlight_fn_calls: false,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: false,
     is_yaml: false,
@@ -1882,8 +2012,13 @@ static CSS_RULES: SyntaxRules = SyntaxRules {
     string_delims: CSS_STRINGS,
     keywords: &[],
     types: &[],
+    constants: &[],
+    macros: &[],
     operators: &[],
     highlight_numbers: true,
+    highlight_upper_constants: false,
+    highlight_fn_calls: false,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: false,
     is_yaml: false,
@@ -1920,8 +2055,13 @@ static DOCKERFILE_RULES: SyntaxRules = SyntaxRules {
         "AS",
     ],
     types: &[],
+    constants: &[],
+    macros: &[],
     operators: &[],
     highlight_numbers: false,
+    highlight_upper_constants: false,
+    highlight_fn_calls: false,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: false,
     is_yaml: false,
@@ -1934,8 +2074,13 @@ static MARKDOWN_RULES: SyntaxRules = SyntaxRules {
     string_delims: &[],
     keywords: &[],
     types: &[],
+    constants: &[],
+    macros: &[],
     operators: &[],
     highlight_numbers: false,
+    highlight_upper_constants: false,
+    highlight_fn_calls: false,
+    highlight_bang_macros: false,
     is_markdown: true,
     is_json: false,
     is_yaml: false,
@@ -1953,8 +2098,13 @@ static INI_RULES: SyntaxRules = SyntaxRules {
     string_delims: INI_STRINGS,
     keywords: &[],
     types: &["true", "false", "yes", "no", "on", "off"],
+    constants: &[],
+    macros: &[],
     operators: &[],
     highlight_numbers: true,
+    highlight_upper_constants: false,
+    highlight_fn_calls: false,
+    highlight_bang_macros: false,
     is_markdown: false,
     is_json: false,
     is_yaml: false,
@@ -2103,6 +2253,83 @@ mod tests {
         let hl = hl_types(b"format", &RUST_RULES);
         // "for" should not match inside "format"
         assert!(hl.iter().all(|&h| h == HlType::Normal));
+    }
+
+    // -- Function call highlighting -----------------------------------------
+
+    #[test]
+    fn test_function_call() {
+        let hl = hl_types(b"foo(x)", &RUST_RULES);
+        assert_eq!(hl[0], HlType::Function); // f
+        assert_eq!(hl[1], HlType::Function); // o
+        assert_eq!(hl[2], HlType::Function); // o
+        assert_eq!(hl[3], HlType::Bracket); // (
+    }
+
+    #[test]
+    fn test_method_call() {
+        let hl = hl_types(b"x.method(y)", &RUST_RULES);
+        assert_eq!(hl[0], HlType::Normal); // x
+        assert_eq!(hl[2], HlType::Function); // m
+        assert_eq!(hl[7], HlType::Function); // d
+        assert_eq!(hl[8], HlType::Bracket); // (
+    }
+
+    #[test]
+    fn test_keyword_not_function() {
+        // "if(" should still be keyword, not function
+        let hl = hl_types(b"if(x)", &RUST_RULES);
+        assert_eq!(hl[0], HlType::Keyword); // i
+        assert_eq!(hl[1], HlType::Keyword); // f
+    }
+
+    // -- Constant highlighting ----------------------------------------------
+
+    #[test]
+    fn test_upper_snake_constant() {
+        let hl = hl_types(b"let x = MAX_SIZE;", &RUST_RULES);
+        assert_eq!(hl[8], HlType::Constant); // M
+        assert_eq!(hl[15], HlType::Constant); // E
+    }
+
+    #[test]
+    fn test_single_upper_char_not_constant() {
+        // Single uppercase letter shouldn't be constant (need >=2 chars)
+        let hl = hl_types(b"let X = 1;", &RUST_RULES);
+        assert_eq!(hl[4], HlType::Normal); // X
+    }
+
+    #[test]
+    fn test_mixed_case_not_constant() {
+        let hl = hl_types(b"let MyVar = 1;", &RUST_RULES);
+        assert_eq!(hl[4], HlType::Normal); // M
+    }
+
+    // -- Macro highlighting -------------------------------------------------
+
+    #[test]
+    fn test_rust_bang_macro() {
+        let hl = hl_types(b"println!(\"hi\")", &RUST_RULES);
+        assert_eq!(hl[0], HlType::Macro); // p
+        assert_eq!(hl[6], HlType::Macro); // n
+        assert_eq!(hl[7], HlType::Macro); // !
+        assert_eq!(hl[8], HlType::Bracket); // (
+    }
+
+    #[test]
+    fn test_bang_not_macro_in_python() {
+        // Python doesn't have bang macros, so foo! is not a macro
+        let hl = hl_types(b"foo!(x)", &PYTHON_RULES);
+        assert_eq!(hl[0], HlType::Normal); // f
+        assert_eq!(hl[2], HlType::Normal); // o
+    }
+
+    #[test]
+    fn test_not_equal_not_macro() {
+        // foo != bar — the != should not be treated as a macro invocation
+        let hl = hl_types(b"foo != bar", &RUST_RULES);
+        assert_eq!(hl[0], HlType::Normal); // f
+        assert_eq!(hl[4], HlType::Operator); // !
     }
 
     // -- byte_hl_to_char_hl -------------------------------------------------
@@ -3017,6 +3244,9 @@ mod tests {
         assert!(!HlType::Number.ansi_code().is_empty());
         assert!(!HlType::Bracket.ansi_code().is_empty());
         assert!(!HlType::Operator.ansi_code().is_empty());
+        assert!(!HlType::Function.ansi_code().is_empty());
+        assert!(!HlType::Constant.ansi_code().is_empty());
+        assert!(!HlType::Macro.ansi_code().is_empty());
     }
 
     // -- Coverage gap: multiline string continuation (lines 166-169, 184-185) --
