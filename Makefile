@@ -8,7 +8,7 @@ setup:
 	prek install --install-hooks
 
 build-dev:
-	cargo build
+	cargo build --quiet
 
 release:
 	cargo clean -p $(NAME) --release --target $(TARGET)
@@ -22,7 +22,7 @@ install: release
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
 
 test:
-	cargo test -- --test-threads=4
+	cargo test --quiet -- --test-threads=4
 
 # So we don't do duplicate work (building both debug and release) in CI.
 test-ci:
