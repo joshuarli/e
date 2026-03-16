@@ -196,3 +196,49 @@ fn replace_all_reports_count() {
         "should report 3 replacements, got cl={cl} sb={sb}"
     );
 }
+
+#[test]
+fn find_reports_total_count_not_viewport() {
+    let dir = TempDir::new();
+    // Put "needle" on lines 1, 30, and 55 — only line 1 is in the initial viewport
+    let mut content = String::new();
+    for i in 1..=60 {
+        if i == 1 || i == 30 || i == 55 {
+            content.push_str(&format!("needle line {i}\n"));
+        } else {
+            content.push_str(&format!("filler line {i}\n"));
+        }
+    }
+    let path = create_file(dir.path(), "test.txt", &content);
+    let mut e = TestEditor::new(&[path.to_str().unwrap()]);
+    e.ctrl('f');
+    e.type_text("needle");
+    e.enter();
+    let cl = e.command_line();
+    assert!(
+        cl.contains("match 1 of 3"),
+        "should show match 1 of 3, got: {cl}"
+    );
+    // Navigate to next match
+    e.key(Key::Down);
+    let cl = e.command_line();
+    assert!(
+        cl.contains("match 2 of 3"),
+        "after down, should show match 2 of 3, got: {cl}"
+    );
+    // Navigate to next match
+    e.key(Key::Down);
+    let cl = e.command_line();
+    assert!(
+        cl.contains("match 3 of 3"),
+        "after second down, should show match 3 of 3, got: {cl}"
+    );
+    // Navigate backward
+    e.key(Key::Up);
+    let cl = e.command_line();
+    assert!(
+        cl.contains("match 2 of 3"),
+        "after up, should show match 2 of 3, got: {cl}"
+    );
+    e.escape();
+}

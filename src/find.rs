@@ -10,8 +10,12 @@ pub struct FindState {
     pub re: Option<regex_lite::Regex>,
     /// The currently-navigated match (start, end).
     pub current: Option<(Pos, Pos)>,
+    /// 1-based index of the current match within the file.
+    pub current_index: usize,
     /// True while browsing find results with up/down arrows.
     pub active: bool,
+    /// Total match count across the entire file.
+    pub total_count: usize,
 }
 
 impl Default for FindState {
@@ -27,7 +31,9 @@ impl FindState {
             matches: Vec::new(),
             re: None,
             current: None,
+            current_index: 0,
             active: false,
+            total_count: 0,
         }
     }
 
@@ -36,13 +42,16 @@ impl FindState {
         self.matches.clear();
         self.re = None;
         self.current = None;
+        self.current_index = 0;
+        self.total_count = 0;
     }
 
     /// Update find highlights for a new pattern. Scans viewport and picks
     /// the first match at or after `cursor`.
-    pub fn update_highlights(&mut self, pattern: &str, buf: &GapBuffer, view: &View, cursor: Pos) {
+    pub fn update_highlights(&mut self, pattern: &str, buf: &GapBuffer, view: &View) {
         self.matches.clear();
         self.current = None;
+        self.total_count = 0;
         self.pattern = pattern.to_string();
         if pattern.is_empty() {
             self.re = None;
@@ -58,22 +67,16 @@ impl FindState {
         };
         self.re = Some(re);
 
+        self.total_count = Self::count_all_matches(self.re.as_ref().unwrap(), buf);
         self.refresh_viewport_matches(buf, view);
 
-        let in_viewport = self
-            .matches
-            .iter()
-            .find(|(s, _)| *s >= cursor)
-            .or_else(|| self.matches.first())
-            .copied();
-        if let Some(m) = in_viewport {
-            self.current = Some(m);
-        } else {
-            // No match in viewport — search forward through the rest of the file.
-            if let Some(re) = self.re.take() {
-                self.current = Self::search_forward(buf, &re, cursor);
-                self.re = Some(re);
-            }
+        // Always land on the first match in the file.
+        if let Some(re) = self.re.take() {
+            self.current = Self::search_forward(buf, &re, Pos::zero());
+            self.re = Some(re);
+        }
+        if let Some((start, _)) = self.current {
+            self.current_index = Self::match_index(self.re.as_ref().unwrap(), buf, start);
         }
     }
 
@@ -100,6 +103,42 @@ impl FindState {
             }
         }
         self.re = Some(re);
+    }
+
+    /// Return the 1-based index of the match starting at `pos` in the file.
+    fn match_index(re: &regex_lite::Regex, buf: &GapBuffer, pos: Pos) -> usize {
+        let mut index = 0;
+        let mut line_buf = Vec::new();
+        for line_idx in 0..=pos.line {
+            buf.line_text_into(line_idx, &mut line_buf);
+            let Ok(text) = std::str::from_utf8(&line_buf) else {
+                continue;
+            };
+            for m in re.find_iter(text) {
+                let col = buffer::char_count(&line_buf[..m.start()]);
+                if line_idx == pos.line && col >= pos.col {
+                    return index + 1;
+                }
+                index += 1;
+            }
+        }
+        // Fallback — pos is on the last match of its line
+        index
+    }
+
+    /// Count all matches in the entire file.
+    fn count_all_matches(re: &regex_lite::Regex, buf: &GapBuffer) -> usize {
+        let line_count = buf.line_count();
+        let mut count = 0;
+        let mut line_buf = Vec::new();
+        for line_idx in 0..line_count {
+            buf.line_text_into(line_idx, &mut line_buf);
+            let Ok(text) = std::str::from_utf8(&line_buf) else {
+                continue;
+            };
+            count += re.find_iter(text).count();
+        }
+        count
     }
 
     /// Search forward from `from` (inclusive), wrapping around the file.
@@ -188,10 +227,11 @@ impl FindState {
     pub fn find_next(&mut self, buf: &GapBuffer, cursor: Pos) -> Option<(Pos, Pos)> {
         let re = self.re.take()?;
         let result = Self::search_forward(buf, &re, cursor);
-        self.re = Some(re);
         if let Some(m) = result {
             self.current = Some(m);
+            self.current_index = Self::match_index(&re, buf, m.0);
         }
+        self.re = Some(re);
         result
     }
 
@@ -199,10 +239,11 @@ impl FindState {
     pub fn find_prev(&mut self, buf: &GapBuffer, cursor: Pos) -> Option<(Pos, Pos)> {
         let re = self.re.take()?;
         let result = Self::search_backward(buf, &re, cursor);
-        self.re = Some(re);
         if let Some(m) = result {
             self.current = Some(m);
+            self.current_index = Self::match_index(&re, buf, m.0);
         }
+        self.re = Some(re);
         result
     }
 
@@ -213,18 +254,29 @@ impl FindState {
         self.matches.clear();
         self.re = None;
         self.current = None;
+        self.current_index = 0;
+        self.total_count = 0;
         current
     }
 
     /// Format the find status text.
     pub fn status_text(&self) -> String {
-        let n = self.matches.len();
-        format!(
-            "Find: {} ({} match{})",
-            self.pattern,
-            n,
-            if n == 1 { "" } else { "es" }
-        )
+        if self.total_count == 0 {
+            return format!("Find: {} (no matches)", self.pattern);
+        }
+        if self.current_index > 0 {
+            format!(
+                "Find: {} (match {} of {})",
+                self.pattern, self.current_index, self.total_count
+            )
+        } else {
+            format!(
+                "Find: {} ({} match{})",
+                self.pattern,
+                self.total_count,
+                if self.total_count == 1 { "" } else { "es" }
+            )
+        }
     }
 
     /// Compile a regex with smart-case: case-insensitive if pattern is all lowercase.

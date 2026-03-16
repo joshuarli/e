@@ -862,10 +862,12 @@ impl Editor {
         };
         self.set_cursor(Pos::new(target, 0));
         self.center_view_on_line(target);
+        self.renderer.force_full_redraw();
     }
 
     fn goto_top(&mut self) {
         self.set_cursor(Pos::zero());
+        self.renderer.force_full_redraw();
     }
 
     fn goto_end(&mut self) {
@@ -873,6 +875,7 @@ impl Editor {
         let last_line = line_count.saturating_sub(1);
         let last_col = self.doc.buf.line_char_len(last_line);
         self.set_cursor(Pos::new(last_line, last_col));
+        self.renderer.force_full_redraw();
     }
 
     fn kill_line(&mut self) {
@@ -901,9 +904,8 @@ impl Editor {
     // -- find ---------------------------------------------------------------
 
     fn update_find_highlights(&mut self, pattern: &str) {
-        let cursor = self.cursor();
         self.find
-            .update_highlights(pattern, &self.doc.buf, &self.view, cursor);
+            .update_highlights(pattern, &self.doc.buf, &self.view);
     }
 
     fn find_next_from_submit(&mut self, pattern: &str) {

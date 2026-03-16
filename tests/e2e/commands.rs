@@ -194,3 +194,30 @@ fn find_command_via_palette() {
     );
     e.escape();
 }
+
+#[test]
+fn goto_line_large_file_repaints_full_screen() {
+    let dir = TempDir::new();
+    // 60 lines — more than the 24-row terminal can show at once
+    let content: String = (1..=60).map(|i| format!("line {i}\n")).collect();
+    let path = create_file(dir.path(), "test.txt", &content);
+    let mut e = TestEditor::new(&[path.to_str().unwrap()]);
+    e.ctrl('l');
+    e.type_text("50");
+    e.enter();
+    // After goto, the full viewport should be painted — not just line 50.
+    // Check that surrounding lines are visible too.
+    let screen = e.screen_text();
+    assert!(
+        screen.contains("line 50"),
+        "goto 50 should show line 50: {screen}"
+    );
+    assert!(
+        screen.contains("line 48") || screen.contains("line 49"),
+        "goto 50 should repaint surrounding lines: {screen}"
+    );
+    assert!(
+        screen.contains("line 51") || screen.contains("line 52"),
+        "goto 50 should repaint lines after target: {screen}"
+    );
+}

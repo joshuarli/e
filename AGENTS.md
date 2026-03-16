@@ -31,7 +31,7 @@ Ownership chain: `main.rs` → `Editor` → `Document` → `GapBuffer`
 src/
   main.rs            Entry point, arg parsing, file safety, file locking, piped stdin
   editor.rs          Editor struct: event loop, action dispatch, editing/movement/commands
-  find.rs            FindState: regex compilation, viewport match scanning, forward/backward search
+  find.rs            FindState: regex compilation, viewport match scanning, total_count, forward/backward search
   mouse.rs           MouseState: multi-click detection, screen-to-buffer coordinate mapping
   buffer.rs          GapBuffer: Vec<u8> with gap, incremental line-start index
   document.rs        Wraps GapBuffer + UndoStack + dirty flag + filename
@@ -535,7 +535,7 @@ Indentation is treated as a **copy-time property**: the indentation in the paste
 4. Sets `find.current` to the first viewport match at/after cursor; if none, calls `FindState::search_forward` to scan forward through the file until the first match is found.
 5. Multi-line patterns won't match across line boundaries. Stores matches as `Vec<(Pos, Pos)>`.
 
-`find.refresh_viewport_matches()`: uses `take/restore` on `find.re` to satisfy the borrow checker while calling `buf.line_text_into`. Repopulates `find.matches` from scratch; called every `draw()` so highlights stay correct after scrolling.
+`find.refresh_viewport_matches()`: uses `take/restore` on `find.re` to satisfy the borrow checker while calling `buf.line_text_into`. Repopulates `find.matches` from scratch; called every `draw()` so highlights stay correct after scrolling. Also calls `count_all_matches()` to populate `find.total_count` — a full-file match count used for status display. `total_count` reflects matches across the entire file, not just the viewport; `find.matches.len()` is viewport-only and must not be used for count display.
 
 ### Find workflow
 
@@ -698,7 +698,7 @@ pub struct Renderer {
 7. Hide cursor (`\x1b[?25l`).
 8. **Syntax cache** (lazy, viewport-bounded): compute `visible_end = scroll_line + text_rows + 1`. If buffer version changed, read `buf.take_dirty_line()` to get `hl_dirty_from`. Call `refresh_hl_cache(visible_end, scroll_line)` which: truncates if file shrank; extends the cache to `visible_end` if the user scrolled past the current coverage (reprocesses the last cached line to recover its output state, then continues forward); recomputes from `hl_dirty_from` on edits with early-exit when the cached state matches. **Large-jump fast path**: when `scroll_line > computed + 50` (viewport jumped far past the end of the computed cache, e.g. select-all on a 1M-line file), the intermediate gap is left as `HlState::Normal` and recomputation starts only from `scroll_line - 200`. Multi-line constructs starting in the skipped gap are cosmetically approximated as Normal. On first open of a 1M-line file only ~`text_rows` lines are highlighted — O(viewport) not O(file).
 9. **Wrap-aware render loop**: walk from `(scroll_line, scroll_wrap)` through logical lines:
-   - **Skip-clean-lines**: when `can_skip` is true (no edits = same `buf_version`, no find active), `line_needs_render()` checks if the line is affected by cursor/selection/bracket changes. If not, the entire per-line pipeline (line_text_into, expand_tabs, highlight, char iteration) is skipped — only `display_col_at` is called to compute the wrap count for advancing `screen_row`. Checks: cursor line (old + new), selection range (old + new), bracket pair endpoints (old + new).
+   - **Skip-clean-lines**: when `can_skip` is true (no edits = same `buf_version`, no find active), `line_needs_render()` checks if the line is affected by cursor/selection/bracket changes. If not, the entire per-line pipeline (line_text_into, expand_tabs, highlight, char iteration) is skipped — only `display_col_at` is called to compute the wrap count for advancing `screen_row`. Checks: cursor line (old + new), selection range (old + new), bracket pair endpoints (old + new). **Caveat**: after a large jump (goto_line, goto_top, goto_end), the buffer version has not changed, so `can_skip` would be true and most lines would be skipped even though the viewport has moved entirely. These functions call `self.renderer.force_full_redraw()` to clear `prev_rows` and force a complete repaint.
    - Expand tabs in each line (`\t` → `|` + space, 2 display columns).
    - Convert to chars. Compute wrapped rows.
    - For each wrapped chunk:
@@ -819,7 +819,7 @@ Post-pass on every highlighted line. Finds patterns like `v1.2.3` or `0.3.5-beta
 - Optional `v`/`V` prefix.
 - Must not be preceded by alphanumeric/underscore.
 - MAJOR.MINOR.PATCH (each one or more digits).
-- Optional pre-release (`-alpha.1`) and build metadata (`+build.123`).
+- Optional pre- (`-alpha.1`) and build metadata (`+build.123`).
 - Must not be followed by alphanumeric/underscore.
 - Skips bytes already marked as Comment.
 - Highlighted as Type (cyan).
