@@ -1,14 +1,14 @@
 NAME   := e
 TARGET := $(shell rustc -vV | awk '/^host:/ {print $$2}')
 
-.PHONY: setup build-dev release install test test-ci record gifs pc bump-version
+.PHONY: setup build release install test test-ci record gifs pc bump-version
 
 setup:
 	rustup show active-toolchain
 	prek install --install-hooks
 
-build-dev:
-	cargo build --quiet
+build:
+	cargo build
 
 release:
 	cargo clean -p $(NAME) --release --target $(TARGET)
@@ -22,11 +22,11 @@ install: release
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
 
 test:
-	cargo test --quiet -- --test-threads=4
+	@OUT=$$(cargo nextest run 2>&1) || { echo "$$OUT"; exit 1; }
 
 # So we don't do duplicate work (building both debug and release) in CI.
 test-ci:
-	cargo test --release -- --test-threads=4
+	@OUT=$$(cargo nextest run --release 2>&1) || { echo "$$OUT"; exit 1; }
 
 # Record e2e tests as asciicast .cast files (single-threaded for clean capture)
 record:
@@ -41,7 +41,7 @@ gifs:
 	@echo "$$(ls tests/e2e/recordings/*.gif | wc -l | tr -d ' ') GIFs ??? tests/e2e/recordings/"
 
 pc:
-	prek run --all-files
+	prek --quiet run --all-files
 
 # Usage: make bump-version [V=x.y.z]
 # Without V, increments the patch version.
