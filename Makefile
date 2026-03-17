@@ -52,11 +52,11 @@ install: release-pgo
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
 
 test:
-	@OUT=$$(cargo nextest run 2>&1) || { echo "$$OUT"; exit 1; }
+	@OUT=$$(cargo test --quiet -- --test-threads=32 2>&1) || { echo "$$OUT"; exit 1; }
 
 # So we don't do duplicate work (building both debug and release) in CI.
 test-ci:
-	@OUT=$$(cargo nextest run --release 2>&1) || { echo "$$OUT"; exit 1; }
+	@OUT=$$(cargo test --quiet --release -- --test-threads=32 2>&1) || { echo "$$OUT"; exit 1; }
 
 # Record e2e tests as asciicast .cast files (single-threaded for clean capture)
 record:
