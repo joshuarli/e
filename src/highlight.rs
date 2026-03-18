@@ -297,37 +297,40 @@ fn highlight_line_code(
 
         // Keywords, types, constants, macros (after separator)
         if prev_sep && (line[i].is_ascii_alphabetic() || line[i] == b'_') {
-            if let Some(advance) = try_keyword(line, i, rules.keywords, HlType::Keyword, hl) {
-                i += advance;
-                prev_sep = false;
-                continue;
-            }
-            if let Some(advance) = try_keyword(line, i, rules.types, HlType::Type, hl) {
-                i += advance;
-                prev_sep = false;
-                continue;
-            }
-            if let Some(advance) = try_keyword(line, i, rules.constants, HlType::Constant, hl) {
-                i += advance;
-                prev_sep = false;
-                continue;
-            }
-            if let Some(advance) = try_keyword(line, i, rules.macros, HlType::Macro, hl) {
-                i += advance;
-                prev_sep = false;
-                continue;
-            }
-            // Identifier: check for function call, macro invocation, or UPPER_SNAKE constant
+            // Extract the full identifier once.
             let id_start = i;
+            i += 1;
             while i < len && (line[i].is_ascii_alphanumeric() || line[i] == b'_') {
                 i += 1;
             }
-            let id_end = i;
+            let id = &line[id_start..i];
+
+            // Binary search each sorted keyword list.
+            let matched = if keyword_search(id, rules.keywords) {
+                Some(HlType::Keyword)
+            } else if keyword_search(id, rules.types) {
+                Some(HlType::Type)
+            } else if keyword_search(id, rules.constants) {
+                Some(HlType::Constant)
+            } else if keyword_search(id, rules.macros) {
+                Some(HlType::Macro)
+            } else {
+                None
+            };
+
+            if let Some(hl_type) = matched {
+                for b in &mut hl[id_start..i] {
+                    *b = hl_type;
+                }
+                prev_sep = false;
+                continue;
+            }
+
             // Rust-style macros: ident!
             if i < len && line[i] == b'!' && rules.highlight_bang_macros {
                 // Only treat as macro if the `!` is not followed by `=` (i.e. not `!=`)
                 if i + 1 >= len || line[i + 1] != b'=' {
-                    for b in &mut hl[id_start..id_end] {
+                    for b in &mut hl[id_start..i] {
                         *b = HlType::Macro;
                     }
                     hl[i] = HlType::Macro; // the `!`
@@ -338,7 +341,7 @@ fn highlight_line_code(
             }
             // Function calls: ident(
             if rules.highlight_fn_calls && i < len && line[i] == b'(' {
-                for b in &mut hl[id_start..id_end] {
+                for b in &mut hl[id_start..i] {
                     *b = HlType::Function;
                 }
                 // Don't advance i — let the main loop process '(' as a bracket
@@ -347,14 +350,13 @@ fn highlight_line_code(
             }
             // UPPER_SNAKE_CASE constants (at least 2 chars, all uppercase/digit/underscore,
             // at least one letter)
-            if rules.highlight_upper_constants && id_end - id_start >= 2 {
-                let id = &line[id_start..id_end];
+            if rules.highlight_upper_constants && i - id_start >= 2 {
                 let all_upper = id
                     .iter()
                     .all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
                 let has_letter = id.iter().any(|&b| b.is_ascii_uppercase());
                 if all_upper && has_letter {
-                    for b in &mut hl[id_start..id_end] {
+                    for b in &mut hl[id_start..i] {
                         *b = HlType::Constant;
                     }
                     prev_sep = false;
@@ -413,27 +415,9 @@ fn try_operator(line: &[u8], pos: usize, ops: &[&str], hl: &mut [HlType]) -> Opt
     None
 }
 
-fn try_keyword(
-    line: &[u8],
-    pos: usize,
-    words: &[&str],
-    hl_type: HlType,
-    hl: &mut [HlType],
-) -> Option<usize> {
-    for &word in words {
-        let wb = word.as_bytes();
-        if starts_with_at(line, wb, pos) {
-            let end = pos + wb.len();
-            // Must be followed by separator or end of line
-            if end >= line.len() || is_separator(line[end]) {
-                for b in &mut hl[pos..end] {
-                    *b = hl_type;
-                }
-                return Some(wb.len());
-            }
-        }
-    }
-    None
+/// Binary search a **sorted** keyword list for an exact match.
+fn keyword_search(id: &[u8], words: &[&str]) -> bool {
+    words.binary_search_by(|w| w.as_bytes().cmp(id)).is_ok()
 }
 
 // -- Semver highlighting ----------------------------------------------------
@@ -1519,9 +1503,9 @@ static RUST_RULES: SyntaxRules = SyntaxRules {
         "use", "where", "while", "yield",
     ],
     types: &[
-        "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "str", "u8",
-        "u16", "u32", "u64", "u128", "usize", "String", "Vec", "Option", "Result", "Box", "Self",
-        "true", "false", "None", "Some", "Ok", "Err",
+        "Box", "Err", "None", "Ok", "Option", "Result", "Self", "Some", "String", "Vec", "bool",
+        "char", "f32", "f64", "false", "i128", "i16", "i32", "i64", "i8", "isize", "str", "true",
+        "u128", "u16", "u32", "u64", "u8", "usize",
     ],
     constants: &[],
     macros: &[],
@@ -1554,8 +1538,8 @@ static PYTHON_RULES: SyntaxRules = SyntaxRules {
         "yield",
     ],
     types: &[
-        "True", "False", "None", "int", "float", "str", "bool", "list", "dict", "tuple", "set",
-        "bytes", "self",
+        "False", "None", "True", "bool", "bytes", "dict", "float", "int", "list", "self", "set",
+        "str", "tuple",
     ],
     constants: &[],
     macros: &[],
@@ -1610,28 +1594,28 @@ static GO_RULES: SyntaxRules = SyntaxRules {
     types: &[
         "bool",
         "byte",
-        "complex64",
         "complex128",
+        "complex64",
         "error",
+        "false",
         "float32",
         "float64",
         "int",
-        "int8",
         "int16",
         "int32",
         "int64",
+        "int8",
+        "iota",
+        "nil",
         "rune",
         "string",
+        "true",
         "uint",
-        "uint8",
         "uint16",
         "uint32",
         "uint64",
+        "uint8",
         "uintptr",
-        "true",
-        "false",
-        "nil",
-        "iota",
     ],
     constants: &[],
     macros: &[],
@@ -1707,24 +1691,24 @@ static TS_RULES: SyntaxRules = SyntaxRules {
         "yield",
     ],
     types: &[
+        "Array",
+        "Map",
+        "Promise",
+        "Set",
         "any",
-        "boolean",
         "bigint",
+        "boolean",
+        "false",
         "never",
         "null",
         "number",
         "object",
         "string",
         "symbol",
+        "true",
         "undefined",
         "unknown",
         "void",
-        "true",
-        "false",
-        "Array",
-        "Map",
-        "Set",
-        "Promise",
     ],
     constants: &[],
     macros: &[],
@@ -1791,20 +1775,20 @@ static JS_RULES: SyntaxRules = SyntaxRules {
         "yield",
     ],
     types: &[
-        "null",
-        "undefined",
-        "true",
-        "false",
-        "NaN",
-        "Infinity",
         "Array",
-        "Object",
-        "Map",
-        "Set",
-        "Promise",
-        "Number",
-        "String",
         "Boolean",
+        "Infinity",
+        "Map",
+        "NaN",
+        "Number",
+        "Object",
+        "Promise",
+        "Set",
+        "String",
+        "false",
+        "null",
+        "true",
+        "undefined",
     ],
     constants: &[],
     macros: &[],
@@ -1829,11 +1813,11 @@ static BASH_RULES: SyntaxRules = SyntaxRules {
     block_comment: ("", ""),
     string_delims: BASH_STRINGS,
     keywords: &[
-        "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac", "in",
-        "function", "return", "local", "export", "source", "set", "unset", "readonly", "declare",
-        "eval", "exec", "exit", "shift", "trap", "break", "continue",
+        "break", "case", "continue", "declare", "do", "done", "elif", "else", "esac", "eval",
+        "exec", "exit", "export", "fi", "for", "function", "if", "in", "local", "readonly",
+        "return", "set", "shift", "source", "then", "trap", "unset", "while",
     ],
-    types: &["true", "false"],
+    types: &["false", "true"],
     constants: &[],
     macros: &[],
     operators: &["&&", "||"],
@@ -1862,9 +1846,9 @@ static C_RULES: SyntaxRules = SyntaxRules {
         "struct", "switch", "typedef", "union", "volatile", "while",
     ],
     types: &[
-        "char", "double", "float", "int", "long", "short", "signed", "unsigned", "void", "NULL",
-        "size_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t",
-        "uint64_t", "bool", "true", "false",
+        "NULL", "bool", "char", "double", "false", "float", "int", "int16_t", "int32_t", "int64_t",
+        "int8_t", "long", "short", "signed", "size_t", "true", "uint16_t", "uint32_t", "uint64_t",
+        "uint8_t", "unsigned", "void",
     ],
     constants: &[],
     macros: &[],
@@ -1891,7 +1875,7 @@ static TOML_RULES: SyntaxRules = SyntaxRules {
     block_comment: ("", ""),
     string_delims: TOML_STRINGS,
     keywords: &[],
-    types: &["true", "false"],
+    types: &["false", "true"],
     constants: &[],
     macros: &[],
     operators: &[],
@@ -1912,7 +1896,7 @@ static JSON_RULES: SyntaxRules = SyntaxRules {
     block_comment: ("", ""),
     string_delims: JSON_STRINGS,
     keywords: &[],
-    types: &["true", "false", "null"],
+    types: &["false", "null", "true"],
     constants: &[],
     macros: &[],
     operators: &[],
@@ -1936,7 +1920,7 @@ static YAML_RULES: SyntaxRules = SyntaxRules {
     block_comment: ("", ""),
     string_delims: YAML_STRINGS,
     keywords: &[],
-    types: &["true", "false", "null", "yes", "no"],
+    types: &["false", "no", "null", "true", "yes"],
     constants: &[],
     macros: &[],
     operators: &[],
@@ -1960,8 +1944,8 @@ static MAKEFILE_RULES: SyntaxRules = SyntaxRules {
     block_comment: ("", ""),
     string_delims: MAKEFILE_STRINGS,
     keywords: &[
-        "ifeq", "ifneq", "ifdef", "ifndef", "else", "endif", "define", "endef", "include",
-        "override", "export", "unexport", "vpath",
+        "define", "else", "endef", "endif", "export", "ifdef", "ifeq", "ifndef", "ifneq",
+        "include", "override", "unexport", "vpath",
     ],
     types: &[],
     constants: &[],
@@ -2035,24 +2019,24 @@ static DOCKERFILE_RULES: SyntaxRules = SyntaxRules {
     block_comment: ("", ""),
     string_delims: DOCKERFILE_STRINGS,
     keywords: &[
-        "FROM",
-        "RUN",
-        "CMD",
-        "LABEL",
-        "EXPOSE",
-        "ENV",
         "ADD",
+        "ARG",
+        "AS",
+        "CMD",
         "COPY",
         "ENTRYPOINT",
-        "VOLUME",
-        "USER",
-        "WORKDIR",
-        "ARG",
-        "ONBUILD",
-        "STOPSIGNAL",
+        "ENV",
+        "EXPOSE",
+        "FROM",
         "HEALTHCHECK",
+        "LABEL",
+        "ONBUILD",
+        "RUN",
         "SHELL",
-        "AS",
+        "STOPSIGNAL",
+        "USER",
+        "VOLUME",
+        "WORKDIR",
     ],
     types: &[],
     constants: &[],
@@ -2097,7 +2081,7 @@ static INI_RULES: SyntaxRules = SyntaxRules {
     block_comment: ("", ""),
     string_delims: INI_STRINGS,
     keywords: &[],
-    types: &["true", "false", "yes", "no", "on", "off"],
+    types: &["false", "no", "off", "on", "true", "yes"],
     constants: &[],
     macros: &[],
     operators: &[],
@@ -3332,6 +3316,45 @@ mod tests {
         highlight_yaml_content(line, &mut hl);
         assert_eq!(hl[2], HlType::Keyword); // 'n' of name
         assert_eq!(hl[5], HlType::Keyword); // 'e' of name
+    }
+
+    // -- Keyword lists must be sorted for binary search -----------------------
+
+    #[test]
+    fn test_keyword_lists_sorted() {
+        let languages = [
+            "Rust",
+            "Python",
+            "Go",
+            "TypeScript",
+            "JavaScript",
+            "Shell",
+            "C",
+            "TOML",
+            "JSON",
+            "YAML",
+            "Makefile",
+            "Dockerfile",
+            "Config",
+        ];
+        for lang in languages {
+            let rules = rules_for_language(lang).unwrap();
+            for (name, list) in [
+                ("keywords", rules.keywords),
+                ("types", rules.types),
+                ("constants", rules.constants),
+                ("macros", rules.macros),
+            ] {
+                for w in list.windows(2) {
+                    assert!(
+                        w[0] < w[1],
+                        "{lang} {name} not sorted: {:?} >= {:?}",
+                        w[0],
+                        w[1]
+                    );
+                }
+            }
+        }
     }
 
     // -- Coverage gap: YAML negative number (lines 744-745) -------------------
