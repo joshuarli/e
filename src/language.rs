@@ -382,6 +382,67 @@ pub fn detect(filename: &str) -> Option<Language> {
     None
 }
 
+/// Map interpreter names (from shebangs) to languages.
+/// Only covers languages that have syntax-highlighting rules.
+const SHEBANGS: &[(&[&str], Language)] = &[
+    (
+        &["sh", "bash", "zsh", "fish", "dash", "ash", "ksh"],
+        Language {
+            name: "Shell",
+            comment: "#",
+        },
+    ),
+    (
+        &["python", "python3", "python2"],
+        Language {
+            name: "Python",
+            comment: "#",
+        },
+    ),
+    (
+        &["node", "nodejs", "deno", "bun"],
+        Language {
+            name: "JavaScript",
+            comment: "//",
+        },
+    ),
+];
+
+/// Detect language from a shebang line (the first line of file content).
+pub fn detect_from_shebang(first_line: &[u8]) -> Option<Language> {
+    let line = first_line.strip_prefix(b"#!")?;
+    // Extract the interpreter: split on whitespace to get the command and args.
+    let line = line.trim_ascii();
+    let mut parts = line
+        .split(|&b| b == b' ' || b == b'\t')
+        .filter(|p| !p.is_empty());
+    let cmd = parts.next()?;
+    // If the command ends with "/env", the interpreter is the next argument.
+    let interpreter = if cmd.ends_with(b"/env") {
+        // Skip flags like -S
+        parts.find(|p| !p.starts_with(b"-"))?
+    } else {
+        cmd
+    };
+    // Take the basename of the interpreter path.
+    let basename = interpreter
+        .rsplit(|&b| b == b'/')
+        .next()
+        .unwrap_or(interpreter);
+    // Strip version suffixes (e.g. "python3.11" -> "python3")
+    let name = match basename.iter().position(|&b| b == b'.') {
+        Some(i) => &basename[..i],
+        None => basename,
+    };
+    let name = std::str::from_utf8(name).ok()?;
+    for (interpreters, lang) in SHEBANGS {
+        if interpreters.contains(&name) {
+            return Some(*lang);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +493,61 @@ mod tests {
     fn test_detect_makefile_prefix() {
         assert_eq!(detect("Makefile").unwrap().name, "Makefile");
         assert_eq!(detect("/path/Makefile").unwrap().name, "Makefile");
+    }
+
+    #[test]
+    fn test_shebang_direct_path() {
+        assert_eq!(detect_from_shebang(b"#!/bin/bash").unwrap().name, "Shell");
+        assert_eq!(detect_from_shebang(b"#!/bin/sh").unwrap().name, "Shell");
+        assert_eq!(
+            detect_from_shebang(b"#!/usr/bin/python3").unwrap().name,
+            "Python"
+        );
+    }
+
+    #[test]
+    fn test_shebang_env() {
+        assert_eq!(
+            detect_from_shebang(b"#!/usr/bin/env bash").unwrap().name,
+            "Shell"
+        );
+        assert_eq!(
+            detect_from_shebang(b"#!/usr/bin/env python3").unwrap().name,
+            "Python"
+        );
+        assert_eq!(
+            detect_from_shebang(b"#!/usr/bin/env node").unwrap().name,
+            "JavaScript"
+        );
+    }
+
+    #[test]
+    fn test_shebang_env_with_flags() {
+        assert_eq!(
+            detect_from_shebang(b"#!/usr/bin/env -S python3")
+                .unwrap()
+                .name,
+            "Python"
+        );
+    }
+
+    #[test]
+    fn test_shebang_version_suffix() {
+        assert_eq!(
+            detect_from_shebang(b"#!/usr/bin/python3.11").unwrap().name,
+            "Python"
+        );
+    }
+
+    #[test]
+    fn test_shebang_not_present() {
+        assert!(detect_from_shebang(b"# just a comment").is_none());
+        assert!(detect_from_shebang(b"print('hello')").is_none());
+        assert!(detect_from_shebang(b"").is_none());
+    }
+
+    #[test]
+    fn test_shebang_unknown_interpreter() {
+        assert!(detect_from_shebang(b"#!/usr/bin/unknown").is_none());
     }
 }

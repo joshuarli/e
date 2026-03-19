@@ -36,7 +36,6 @@ use crate::document::Document;
 use crate::find::FindState;
 use crate::highlight;
 use crate::keybind::{EditorAction, KeybindingTable};
-use crate::language;
 use crate::mouse::MouseState;
 use crate::render::{Renderer, gutter_width};
 use crate::selection::{Pos, Selection, is_word_char, next_word_boundary, prev_word_boundary};
@@ -362,7 +361,7 @@ impl Editor {
         self.view
             .ensure_cursor_visible(cursor_line, display_col, gw, &mut line_display_width);
 
-        let lang = self.doc.filename.as_deref().and_then(language::detect);
+        let lang = self.doc.detect_language();
         let lang_name = lang.map(|l| l.name).unwrap_or("Text");
         let sel = if self.sel.is_empty() {
             None
@@ -1543,12 +1542,7 @@ impl Editor {
     // -- editing ------------------------------------------------------------
 
     fn insert_char(&mut self, c: char) {
-        let lang_name = self
-            .doc
-            .filename
-            .as_deref()
-            .and_then(language::detect)
-            .map(|l| l.name);
+        let lang_name = self.doc.detect_language().map(|l| l.name);
         if !self.sel.is_empty() {
             // Wrap selection with matching pairs
             if let Some(close) = auto_close_char(c, lang_name) {
@@ -1766,12 +1760,7 @@ impl Editor {
             let prev = self.doc.buf.byte_at(ls + c.col - 1);
             if ls + c.col < le {
                 let next = self.doc.buf.byte_at(ls + c.col);
-                let lang_name = self
-                    .doc
-                    .filename
-                    .as_deref()
-                    .and_then(language::detect)
-                    .map(|l| l.name);
+                let lang_name = self.doc.detect_language().map(|l| l.name);
                 if auto_close_char(prev as char, lang_name) == Some(next as char) {
                     let start = Pos::new(c.line, c.col - 1);
                     let end = Pos::new(c.line, c.col + 1);
@@ -1863,7 +1852,7 @@ impl Editor {
 
     /// `force`: None = toggle, Some(true) = comment, Some(false) = uncomment.
     fn comment_impl(&mut self, force: Option<bool>) {
-        let comment = match self.doc.filename.as_deref().and_then(language::detect) {
+        let comment = match self.doc.detect_language() {
             Some(lang) => lang.comment,
             None => {
                 self.set_status("No language detected for commenting".to_string());
@@ -3837,13 +3826,7 @@ mod tests {
     #[test]
     fn test_status_left_named_clean() {
         let e = ed_named("hello", "test.rs");
-        let lang_name = e
-            .doc
-            .filename
-            .as_deref()
-            .and_then(language::detect)
-            .map(|l| l.name)
-            .unwrap_or("Text");
+        let lang_name = e.doc.detect_language().map(|l| l.name).unwrap_or("Text");
         let left = e.status_left(lang_name);
         assert!(left.contains("test.rs"));
         assert!(left.contains("Rust"));
@@ -3854,13 +3837,7 @@ mod tests {
     fn test_status_left_named_dirty() {
         let mut e = ed_named("hello", "test.rs");
         e.doc.dirty = true;
-        let lang_name = e
-            .doc
-            .filename
-            .as_deref()
-            .and_then(language::detect)
-            .map(|l| l.name)
-            .unwrap_or("Text");
+        let lang_name = e.doc.detect_language().map(|l| l.name).unwrap_or("Text");
         let left = e.status_left(lang_name);
         assert!(left.contains("test.rs*"));
     }

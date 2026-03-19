@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::buffer::GapBuffer;
+use crate::language::{self, Language};
 use crate::operation::{Operation, UndoStack};
 use crate::selection::Pos;
 
@@ -143,6 +144,14 @@ impl Document {
             cursor_after,
         );
         self.dirty = true;
+    }
+
+    /// Detect language from filename, falling back to shebang on the first line.
+    pub fn detect_language(&self) -> Option<Language> {
+        self.filename
+            .as_deref()
+            .and_then(language::detect)
+            .or_else(|| language::detect_from_shebang(&self.buf.line_text(0)))
     }
 
     /// Get text in a range (for clipboard, etc.).
