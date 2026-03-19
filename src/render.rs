@@ -5,6 +5,25 @@ use crate::highlight::{self, HlState, HlType, SyntaxRules};
 use crate::selection::{Pos, Selection};
 use crate::view::View;
 
+// -- ANSI styling sequences -------------------------------------------------
+
+const RESET: &str = "\x1b[0m";
+const ERASE_EOL: &str = "\x1b[K";
+const REVERSE: &str = "\x1b[7m";
+const REVERSE_OFF: &str = "\x1b[27m";
+const CURSOR_STYLE: &str = "\x1b[1;7m";
+const SEL_TAB_PIPE: &str = "\x1b[7;90m";
+const DIM: &str = "\x1b[90m";
+const GUTTER: &str = "\x1b[0;90m";
+const GUTTER_ACTIVE: &str = "\x1b[0;47;30m";
+const GUTTER_EMPTY: &str = "\x1b[0;2m";
+const FAINT: &str = "\x1b[2m";
+const FIND_CURRENT: &str = "\x1b[42;30m";
+const FIND_MATCH: &str = "\x1b[43;30m";
+const BRACKET_MATCH: &str = "\x1b[45;30m";
+const STATUS_BG: &str = "\x1b[0;100m";
+const CMD_LINE_BG: &str = "\x1b[30;43m";
+
 /// Wraps a `char` for safe terminal output.
 /// Control characters (U+0000–U+001F except tab/newline, and U+007F) are
 /// rendered as `^X` notation in reverse video instead of being written raw,
@@ -14,8 +33,12 @@ struct CtrlSafe(char);
 impl std::fmt::Display for CtrlSafe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 as u32 {
-            0..=8 | 11..=31 => write!(f, "\x1b[7m^{}\x1b[27m", char::from(b'@' + self.0 as u8)),
-            127 => f.write_str("\x1b[7m^?\x1b[27m"),
+            0..=8 | 11..=31 => write!(
+                f,
+                "{REVERSE}^{}{REVERSE_OFF}",
+                char::from(b'@' + self.0 as u8)
+            ),
+            127 => write!(f, "{REVERSE}^?{REVERSE_OFF}"),
             _ => write!(f, "{}", self.0),
         }
     }
@@ -438,14 +461,19 @@ impl Renderer {
                         let num_str = write_line_num(line_idx + 1, &mut num_buf);
                         let pad = gw - 1;
                         if is_cursor_line {
-                            write!(rb, "\x1b[0;47;30m{:>width$}\x1b[0m ", num_str, width = pad)?;
+                            write!(
+                                rb,
+                                "{GUTTER_ACTIVE}{:>width$}{RESET} ",
+                                num_str,
+                                width = pad
+                            )?;
                         } else {
-                            write!(rb, "\x1b[0;90m{:>width$} \x1b[0m", num_str, width = pad)?;
+                            write!(rb, "{GUTTER}{:>width$} {RESET}", num_str, width = pad)?;
                         }
                     } else if is_cursor_line {
-                        write!(rb, "\x1b[0;47;30m{:>width$}\x1b[0m ", "", width = gw - 1)?;
+                        write!(rb, "{GUTTER_ACTIVE}{:>width$}{RESET} ", "", width = gw - 1)?;
                     } else {
-                        write!(rb, "\x1b[0;90m{:>width$} \x1b[0m", "", width = gw - 1)?;
+                        write!(rb, "{GUTTER}{:>width$} {RESET}", "", width = gw - 1)?;
                     }
                 }
 
@@ -482,23 +510,23 @@ impl Renderer {
                                 HlType::Normal
                             };
                             let code = ht.ansi_code();
-                            write!(rb, "{}\x1b[1;7m{}\x1b[0m", code, CtrlSafe(ch))?;
+                            write!(rb, "{}{CURSOR_STYLE}{}{RESET}", code, CtrlSafe(ch))?;
                         } else if in_sel {
                             if is_tab_pipe {
-                                write!(rb, "\x1b[7;90m{}\x1b[0m", ch)?;
+                                write!(rb, "{SEL_TAB_PIPE}{}{RESET}", ch)?;
                             } else {
-                                write!(rb, "\x1b[7m{}\x1b[0m", CtrlSafe(ch))?;
+                                write!(rb, "{REVERSE}{}{RESET}", CtrlSafe(ch))?;
                             }
                         } else if let Some((_, _, is_current)) = find_hit {
                             if *is_current {
-                                write!(rb, "\x1b[42;30m{}\x1b[0m", CtrlSafe(ch))?;
+                                write!(rb, "{FIND_CURRENT}{}{RESET}", CtrlSafe(ch))?;
                             } else {
-                                write!(rb, "\x1b[43;30m{}\x1b[0m", CtrlSafe(ch))?;
+                                write!(rb, "{FIND_MATCH}{}{RESET}", CtrlSafe(ch))?;
                             }
                         } else if is_bracket_match {
-                            write!(rb, "\x1b[45;30m{}\x1b[0m", CtrlSafe(ch))?;
+                            write!(rb, "{BRACKET_MATCH}{}{RESET}", CtrlSafe(ch))?;
                         } else if is_tab_pipe {
-                            write!(rb, "\x1b[90m{}\x1b[0m", ch)?;
+                            write!(rb, "{DIM}{}{RESET}", ch)?;
                         } else {
                             let ht = if has_char_hl {
                                 self.char_hl_scratch
@@ -512,7 +540,7 @@ impl Renderer {
                             if code.is_empty() {
                                 write!(rb, "{}", CtrlSafe(ch))?;
                             } else {
-                                write!(rb, "{}{}\x1b[0m", code, CtrlSafe(ch))?;
+                                write!(rb, "{}{}{RESET}", code, CtrlSafe(ch))?;
                             }
                         }
                     }
@@ -530,10 +558,10 @@ impl Renderer {
                             && self.tab_pipes_scratch[i];
                         if is_tab_pipe {
                             if current_hl != HlType::Normal {
-                                write!(rb, "\x1b[0m")?;
+                                write!(rb, "{RESET}")?;
                                 current_hl = HlType::Normal;
                             }
-                            write!(rb, "\x1b[90m{}\x1b[0m", ch)?;
+                            write!(rb, "{DIM}{}{RESET}", ch)?;
                         } else {
                             let ht = if has_char_hl {
                                 self.char_hl_scratch
@@ -545,7 +573,7 @@ impl Renderer {
                             };
                             if ht != current_hl {
                                 if ht == HlType::Normal {
-                                    write!(rb, "\x1b[0m")?;
+                                    write!(rb, "{RESET}")?;
                                 } else {
                                     write!(rb, "{}", ht.ansi_code())?;
                                 }
@@ -555,16 +583,16 @@ impl Renderer {
                         }
                     }
                     if current_hl != HlType::Normal {
-                        write!(rb, "\x1b[0m")?;
+                        write!(rb, "{RESET}")?;
                     }
                 }
 
                 // End-of-line cursor: draw reverse-video space when cursor is past last char
                 if cursor_on_line && cursor_col == chunk_end && chunk_end == char_count {
-                    write!(rb, "\x1b[1;7m \x1b[0m")?;
+                    write!(rb, "{CURSOR_STYLE} {RESET}")?;
                 }
 
-                write!(rb, "\x1b[0m\x1b[K")?;
+                write!(rb, "{RESET}{ERASE_EOL}")?;
 
                 // Dirty-line check: only emit this row if it changed from the previous frame
                 if full || self.prev_rows[screen_row] != self.row_buf {
@@ -584,9 +612,14 @@ impl Renderer {
             let rb = &mut self.row_buf;
             if ruler_on {
                 let pad = gw - 1;
-                write!(rb, "\x1b[0;2m{:>width$} \x1b[0m\x1b[K", "", width = pad)?;
+                write!(
+                    rb,
+                    "{GUTTER_EMPTY}{:>width$} {RESET}{ERASE_EOL}",
+                    "",
+                    width = pad
+                )?;
             } else {
-                write!(rb, "\x1b[K")?;
+                write!(rb, "{ERASE_EOL}")?;
             }
             if full || self.prev_rows[screen_row] != self.row_buf {
                 write!(w, "\x1b[{};1H", screen_row + 1)?;
@@ -600,7 +633,7 @@ impl Renderer {
         for (i, comp) in completions.iter().enumerate() {
             let idx = text_rows + i;
             self.row_buf.clear();
-            write!(&mut self.row_buf, "\x1b[2m  {}\x1b[0m\x1b[K", comp)?;
+            write!(&mut self.row_buf, "{FAINT}  {}{RESET}{ERASE_EOL}", comp)?;
             if full || self.prev_rows[idx] != self.row_buf {
                 write!(w, "\x1b[{};1H", idx + 1)?;
                 w.write_all(&self.row_buf)?;
@@ -613,7 +646,7 @@ impl Renderer {
         self.row_buf.clear();
         {
             let rb = &mut self.row_buf;
-            write!(rb, "\x1b[0;100m")?;
+            write!(rb, "{STATUS_BG}")?;
             let width = view.width as usize;
             let right_len = status_right.len(); // always ASCII
             // Use character count for display width (correct for multi-byte filenames).
@@ -630,7 +663,7 @@ impl Renderer {
                 " ".repeat(padding),
                 status_right,
             )?;
-            write!(rb, "\x1b[0m")?;
+            write!(rb, "{RESET}")?;
         }
         if full || self.prev_rows[status_idx] != self.row_buf {
             write!(w, "\x1b[{};1H", status_idx + 1)?;
@@ -642,9 +675,9 @@ impl Renderer {
         let cmd_idx = text_rows + completion_rows + 1;
         self.row_buf.clear();
         if let Some(cmd) = command_line {
-            write!(&mut self.row_buf, "\x1b[30;43m{}\x1b[K\x1b[0m", cmd)?;
+            write!(&mut self.row_buf, "{CMD_LINE_BG}{}{ERASE_EOL}{RESET}", cmd)?;
         } else {
-            write!(&mut self.row_buf, "\x1b[K")?;
+            write!(&mut self.row_buf, "{ERASE_EOL}")?;
         }
         if full || self.prev_rows[cmd_idx] != self.row_buf {
             write!(w, "\x1b[{};1H", cmd_idx + 1)?;
@@ -660,7 +693,7 @@ impl Renderer {
             // Software cursor in command line
             write!(w, "\x1b[{};{}H", cmd_idx + 1, col + 1)?;
             let ch = command_line.and_then(|s| s.chars().nth(col)).unwrap_or(' ');
-            write!(w, "\x1b[1;7m{}\x1b[0m", ch)?;
+            write!(w, "{CURSOR_STYLE}{}{RESET}", ch)?;
         }
         // Always emit cursor position so the vt parser tracks it
         {
@@ -1243,7 +1276,7 @@ mod tests {
 
         let s = String::from_utf8_lossy(&output);
         // Should contain reverse video escape codes for selection
-        assert!(s.contains("\x1b[7m"));
+        assert!(s.contains(REVERSE));
     }
 
     #[test]
@@ -1278,9 +1311,9 @@ mod tests {
         .unwrap();
 
         let s = String::from_utf8_lossy(&output);
-        // Current match → green bg \x1b[42;30m, other → yellow bg \x1b[43;30m
-        assert!(s.contains("\x1b[42;30m"));
-        assert!(s.contains("\x1b[43;30m"));
+        // Current match → green bg, other → yellow bg
+        assert!(s.contains(FIND_CURRENT));
+        assert!(s.contains(FIND_MATCH));
     }
 
     #[test]
@@ -1311,8 +1344,8 @@ mod tests {
         .unwrap();
 
         let s = String::from_utf8_lossy(&output);
-        // Bracket match → magenta bg \x1b[45;30m
-        assert!(s.contains("\x1b[45;30m"));
+        // Bracket match → magenta bg
+        assert!(s.contains(BRACKET_MATCH));
     }
 
     #[test]
@@ -1377,7 +1410,7 @@ mod tests {
 
         let s = String::from_utf8_lossy(&output);
         // Software cursor drawn as bold+reverse in command line area
-        assert!(s.contains("\x1b[1;7m"));
+        assert!(s.contains(CURSOR_STYLE));
     }
 
     #[test]
@@ -1409,7 +1442,7 @@ mod tests {
 
         // find_active=true: no software cursor (no bold+reverse)
         let s = String::from_utf8_lossy(&output);
-        assert!(!s.contains("\x1b[1;7m"));
+        assert!(!s.contains(CURSOR_STYLE));
     }
 
     #[test]
@@ -1465,9 +1498,9 @@ mod tests {
         )
         .unwrap();
 
-        // Should contain comment coloring (grey = \x1b[90m)
+        // Should contain comment coloring (grey)
         let s = String::from_utf8_lossy(&output);
-        assert!(s.contains("\x1b[90m"));
+        assert!(s.contains(DIM));
     }
 
     #[test]

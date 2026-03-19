@@ -71,9 +71,8 @@ impl FindState {
         self.refresh_viewport_matches(buf, view);
 
         // Always land on the first match in the file.
-        if let Some(re) = self.re.take() {
-            self.current = Self::search_forward(buf, &re, Pos::zero());
-            self.re = Some(re);
+        if let Some(re) = self.re.as_ref() {
+            self.current = Self::search_forward(buf, re, Pos::zero());
         }
         if let Some((start, _)) = self.current {
             self.current_index = Self::match_index(self.re.as_ref().unwrap(), buf, start);
@@ -83,10 +82,7 @@ impl FindState {
     /// Scan only the current viewport lines and populate `matches`.
     pub fn refresh_viewport_matches(&mut self, buf: &GapBuffer, view: &View) {
         self.matches.clear();
-        let re = match self.re.take() {
-            Some(r) => r,
-            None => return,
-        };
+        let Some(re) = self.re.as_ref() else { return };
         let line_count = buf.line_count();
         let viewport_end = (view.scroll_line + view.text_rows() + 4).min(line_count);
         let mut line_buf = Vec::new();
@@ -102,7 +98,6 @@ impl FindState {
                     .push((Pos::new(line_idx, start_col), Pos::new(line_idx, end_col)));
             }
         }
-        self.re = Some(re);
     }
 
     /// Return the 1-based index of the match starting at `pos` in the file.
@@ -225,25 +220,23 @@ impl FindState {
 
     /// Navigate to the next match. Returns the match position if found.
     pub fn find_next(&mut self, buf: &GapBuffer, cursor: Pos) -> Option<(Pos, Pos)> {
-        let re = self.re.take()?;
-        let result = Self::search_forward(buf, &re, cursor);
+        let re = self.re.as_ref()?;
+        let result = Self::search_forward(buf, re, cursor);
         if let Some(m) = result {
             self.current = Some(m);
-            self.current_index = Self::match_index(&re, buf, m.0);
+            self.current_index = Self::match_index(re, buf, m.0);
         }
-        self.re = Some(re);
         result
     }
 
     /// Navigate to the previous match. Returns the match position if found.
     pub fn find_prev(&mut self, buf: &GapBuffer, cursor: Pos) -> Option<(Pos, Pos)> {
-        let re = self.re.take()?;
-        let result = Self::search_backward(buf, &re, cursor);
+        let re = self.re.as_ref()?;
+        let result = Self::search_backward(buf, re, cursor);
         if let Some(m) = result {
             self.current = Some(m);
-            self.current_index = Self::match_index(&re, buf, m.0);
+            self.current_index = Self::match_index(re, buf, m.0);
         }
-        self.re = Some(re);
         result
     }
 

@@ -333,6 +333,14 @@ impl Editor {
         self.sel = Selection::caret(pos);
     }
 
+    fn move_cursor(&mut self, pos: Pos, extend: bool) {
+        if extend {
+            self.sel.cursor = pos;
+        } else {
+            self.set_cursor(pos);
+        }
+    }
+
     fn use_tab_indent(&self) -> bool {
         self.doc.filename.as_ref().is_some_and(|f| {
             f.ends_with(".c") || f.ends_with(".h") || f.ends_with(".go") || f.contains("Makefile")
@@ -1276,25 +1284,33 @@ impl Editor {
 
     // -- movement (no selection) --------------------------------------------
 
-    fn move_up(&mut self) {
+    fn move_up_impl(&mut self, extend: bool) {
         if self.cursor().line > 0 {
             let target_col = self.desired_col.unwrap_or(self.cursor().col);
             self.desired_col = Some(target_col);
             let new_line = self.cursor().line - 1;
             let line_len = self.doc.buf.line_char_len(new_line);
-            self.set_cursor(Pos::new(new_line, target_col.min(line_len)));
+            self.move_cursor(Pos::new(new_line, target_col.min(line_len)), extend);
         }
     }
 
-    fn move_down(&mut self) {
+    fn move_up(&mut self) {
+        self.move_up_impl(false);
+    }
+
+    fn move_down_impl(&mut self, extend: bool) {
         let line_count = self.doc.buf.line_count();
         if self.cursor().line + 1 < line_count {
             let target_col = self.desired_col.unwrap_or(self.cursor().col);
             self.desired_col = Some(target_col);
             let new_line = self.cursor().line + 1;
             let line_len = self.doc.buf.line_char_len(new_line);
-            self.set_cursor(Pos::new(new_line, target_col.min(line_len)));
+            self.move_cursor(Pos::new(new_line, target_col.min(line_len)), extend);
         }
+    }
+
+    fn move_down(&mut self) {
+        self.move_down_impl(false);
     }
 
     fn indent_snap_left(&mut self, line: usize, col: usize) -> usize {
@@ -1340,8 +1356,8 @@ impl Editor {
         col + 1
     }
 
-    fn move_left(&mut self) {
-        if !self.sel.is_empty() {
+    fn move_left_impl(&mut self, extend: bool) {
+        if !extend && !self.sel.is_empty() {
             let (start, _) = self.sel.ordered();
             self.set_cursor(start);
             return;
@@ -1349,15 +1365,19 @@ impl Editor {
         let c = self.cursor();
         if c.col > 0 {
             let new_col = self.indent_snap_left(c.line, c.col);
-            self.set_cursor(Pos::new(c.line, new_col));
+            self.move_cursor(Pos::new(c.line, new_col), extend);
         } else if c.line > 0 {
             let prev_len = self.doc.buf.line_char_len(c.line - 1);
-            self.set_cursor(Pos::new(c.line - 1, prev_len));
+            self.move_cursor(Pos::new(c.line - 1, prev_len), extend);
         }
     }
 
-    fn move_right(&mut self) {
-        if !self.sel.is_empty() {
+    fn move_left(&mut self) {
+        self.move_left_impl(false);
+    }
+
+    fn move_right_impl(&mut self, extend: bool) {
+        if !extend && !self.sel.is_empty() {
             let (_, end) = self.sel.ordered();
             self.set_cursor(end);
             return;
@@ -1366,10 +1386,14 @@ impl Editor {
         let line_len = self.doc.buf.line_char_len(c.line);
         if c.col < line_len {
             let new_col = self.indent_snap_right(c.line, c.col);
-            self.set_cursor(Pos::new(c.line, new_col));
+            self.move_cursor(Pos::new(c.line, new_col), extend);
         } else if c.line + 1 < self.doc.buf.line_count() {
-            self.set_cursor(Pos::new(c.line + 1, 0));
+            self.move_cursor(Pos::new(c.line + 1, 0), extend);
         }
+    }
+
+    fn move_right(&mut self) {
+        self.move_right_impl(false);
     }
 
     /// If the cursor is on a bracket character, return the matching bracket position.
@@ -1501,44 +1525,19 @@ impl Editor {
     // -- movement (extend selection) ----------------------------------------
 
     fn move_up_extend(&mut self) {
-        if self.cursor().line > 0 {
-            let target_col = self.desired_col.unwrap_or(self.cursor().col);
-            self.desired_col = Some(target_col);
-            let new_line = self.cursor().line - 1;
-            let line_len = self.doc.buf.line_char_len(new_line);
-            self.sel.cursor = Pos::new(new_line, target_col.min(line_len));
-        }
+        self.move_up_impl(true);
     }
 
     fn move_down_extend(&mut self) {
-        let line_count = self.doc.buf.line_count();
-        if self.cursor().line + 1 < line_count {
-            let target_col = self.desired_col.unwrap_or(self.cursor().col);
-            self.desired_col = Some(target_col);
-            let new_line = self.cursor().line + 1;
-            let line_len = self.doc.buf.line_char_len(new_line);
-            self.sel.cursor = Pos::new(new_line, target_col.min(line_len));
-        }
+        self.move_down_impl(true);
     }
 
     fn move_left_extend(&mut self) {
-        let c = self.cursor();
-        if c.col > 0 {
-            self.sel.cursor = Pos::new(c.line, self.indent_snap_left(c.line, c.col));
-        } else if c.line > 0 {
-            let prev_len = self.doc.buf.line_char_len(c.line - 1);
-            self.sel.cursor = Pos::new(c.line - 1, prev_len);
-        }
+        self.move_left_impl(true);
     }
 
     fn move_right_extend(&mut self) {
-        let c = self.cursor();
-        let line_len = self.doc.buf.line_char_len(c.line);
-        if c.col < line_len {
-            self.sel.cursor = Pos::new(c.line, self.indent_snap_right(c.line, c.col));
-        } else if c.line + 1 < self.doc.buf.line_count() {
-            self.sel.cursor = Pos::new(c.line + 1, 0);
-        }
+        self.move_right_impl(true);
     }
 
     // -- editing ------------------------------------------------------------
