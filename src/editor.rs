@@ -219,17 +219,19 @@ impl Editor {
             let stdin_handle;
             let events: Box<dyn Iterator<Item = Result<Event, io::Error>>> =
                 if let Some(f) = tty_file {
-                    Box::new(CtrlJReader(f).events())
+                    Box::new(CtrlJReader(io::BufReader::new(f)).events())
                 } else {
                     stdin_handle = io::stdin();
                     Box::new(CtrlJReader(stdin_handle.lock()).events())
                 };
             let mut in_paste = false;
             let mut paste_buf = String::new();
+            let mut saw_cr = false;
             for ev in events.flatten() {
                 if is_paste_start(&ev) {
                     in_paste = true;
                     paste_buf.clear();
+                    saw_cr = false;
                     continue;
                 }
                 if is_paste_end(&ev) {
@@ -244,11 +246,30 @@ impl Editor {
                 }
                 if in_paste {
                     match &ev {
-                        Event::Key(Key::Char(c)) => paste_buf.push(*c),
-                        // Key::Null = 0x0A (NL) remapped by CtrlJReader; restore as newline in paste.
-                        Event::Key(Key::Null) => paste_buf.push('\n'),
-                        Event::Key(Key::Backspace) => paste_buf.push('\x7f'),
-                        _ => {}
+                        // \r (0x0D) → termion Key::Char('\n'); treat as newline.
+                        Event::Key(Key::Char('\n')) => {
+                            paste_buf.push('\n');
+                            saw_cr = true;
+                        }
+                        Event::Key(Key::Char(c)) => {
+                            saw_cr = false;
+                            paste_buf.push(*c);
+                        }
+                        // \n (0x0A) → CtrlJReader remaps to 0x00 → Key::Null.
+                        // Skip if preceded by \r (CRLF) to avoid double newlines.
+                        Event::Key(Key::Null) => {
+                            if !saw_cr {
+                                paste_buf.push('\n');
+                            }
+                            saw_cr = false;
+                        }
+                        Event::Key(Key::Backspace) => {
+                            saw_cr = false;
+                            paste_buf.push('\x7f');
+                        }
+                        _ => {
+                            saw_cr = false;
+                        }
                     }
                     continue;
                 }
