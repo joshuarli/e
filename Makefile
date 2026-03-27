@@ -50,6 +50,7 @@ $(PGO_MERGED):
 
 install: release-pgo
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
+	codesign -fs - ~/usr/bin/$(NAME)
 
 test:
 	@OUT=$$(cargo test --quiet -- --test-threads=32 2>&1) || { echo "$$OUT"; exit 1; }
