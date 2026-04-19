@@ -56,6 +56,9 @@ const CTRL_SHIFT_LEFT: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'D'];
 const CTRL_SHIFT_RIGHT: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'C'];
 // CSI u encoding for Ctrl+Backspace (kitty, ghostty, etc.)
 const CTRL_BACKSPACE_CSI_U: &[u8] = &[0x1b, b'[', b'1', b'2', b'7', b';', b'5', b'u'];
+// Xterm-style Ctrl+Delete. In terminals where the Mac Delete key is remapped
+// to forward delete, this is the practical Ctrl+Backspace equivalent.
+const CTRL_DELETE_XTERM: &[u8] = &[0x1b, b'[', b'3', b';', b'5', b'~'];
 const FOCUS_IN: &[u8] = &[0x1b, b'[', b'I'];
 
 fn auto_close_char(c: char, lang_name: Option<&str>) -> Option<char> {
@@ -557,7 +560,7 @@ impl Editor {
                         self.word_left_extend();
                     } else if bytes == CTRL_SHIFT_RIGHT {
                         self.word_right_extend();
-                    } else if bytes == CTRL_BACKSPACE_CSI_U {
+                    } else if bytes == CTRL_BACKSPACE_CSI_U || bytes == CTRL_DELETE_XTERM {
                         self.ctrl_backspace();
                     }
                 }

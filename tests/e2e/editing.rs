@@ -290,6 +290,22 @@ fn ctrl_backspace_deletes_word() {
 }
 
 #[test]
+fn xterm_ctrl_delete_deletes_word_backward() {
+    let dir = TempDir::new();
+    let path = create_file(dir.path(), "test.txt", "hello world\n");
+    let mut e = TestEditor::new(&[path.to_str().unwrap()]);
+    e.key(Key::End);
+    e.send_raw(b"\x1b[3;5~");
+    e.wait();
+    let r = e.row(0);
+    assert!(r.contains("hello"), "should keep 'hello', got: {r}");
+    assert!(
+        !r.contains("world"),
+        "should have deleted 'world', got: {r}"
+    );
+}
+
+#[test]
 fn auto_close_wraps_selection() {
     let dir = TempDir::new();
     let path = create_file(dir.path(), "test.txt", "foo\n");
