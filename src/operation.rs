@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::selection::Pos;
+use crate::selection::{CaretSnapshot, Pos};
 
 /// A single atomic text change.
 #[derive(Debug, Clone)]
@@ -35,10 +35,10 @@ enum OpKind {
 #[derive(Debug, Clone)]
 pub struct OperationGroup {
     pub ops: Vec<Operation>,
-    /// Cursor position before the first op in this group.
-    pub cursor_before: Pos,
-    /// Cursor position after the last op in this group.
-    pub cursor_after: Pos,
+    /// Caret layout before the first op in this group.
+    pub carets_before: CaretSnapshot,
+    /// Caret layout after the last op in this group.
+    pub carets_after: CaretSnapshot,
 }
 
 /// Undo/redo stack with grouping heuristics.
@@ -107,11 +107,16 @@ impl UndoStack {
     }
 
     /// Record an operation. Determines whether to extend current group or start new.
-    pub fn record(&mut self, op: Operation, cursor_before: Pos, cursor_after: Pos) {
+    pub fn record(
+        &mut self,
+        op: Operation,
+        carets_before: CaretSnapshot,
+        carets_after: CaretSnapshot,
+    ) {
         // Clear redo on new edit
         self.redo.clear();
 
-        let should_break = self.should_break_group(&op, cursor_before);
+        let should_break = self.should_break_group(&op, carets_before.primary_cursor());
 
         if should_break {
             self.flush_current();
@@ -119,16 +124,16 @@ impl UndoStack {
 
         let group = self.current.get_or_insert_with(|| OperationGroup {
             ops: Vec::new(),
-            cursor_before,
-            cursor_after,
+            carets_before,
+            carets_after: carets_after.clone(),
         });
         let kind = op.kind();
         group.ops.push(op);
-        group.cursor_after = cursor_after;
+        group.carets_after = carets_after;
 
         self.last_kind = Some(kind);
         self.last_time = Some(Instant::now());
-        self.last_cursor = cursor_after;
+        self.last_cursor = group.carets_after.primary_cursor();
     }
 
     fn should_break_group(&self, op: &Operation, cursor_before: Pos) -> bool {
@@ -175,33 +180,41 @@ impl UndoStack {
 
     /// Undo the last group. Calls `apply` for each operation in reverse order.
     /// Returns the cursor position to restore.
-    pub fn undo(&mut self, mut apply: impl FnMut(&Operation)) -> Option<Pos> {
+    pub fn undo(&mut self, mut apply: impl FnMut(&Operation)) -> Option<CaretSnapshot> {
         self.flush_current();
         let group = self.undo.pop()?;
-        let cursor = group.cursor_before;
+        let carets = group.carets_before.clone();
         for op in group.ops.iter().rev() {
             apply(op);
         }
         self.redo.push(group);
-        Some(cursor)
+        Some(carets)
     }
 
     /// Redo the last undone group. Calls `apply` for each operation in order.
     /// Returns the cursor position to restore.
-    pub fn redo(&mut self, mut apply: impl FnMut(&Operation)) -> Option<Pos> {
+    pub fn redo(&mut self, mut apply: impl FnMut(&Operation)) -> Option<CaretSnapshot> {
         let group = self.redo.pop()?;
-        let cursor = group.cursor_after;
+        let carets = group.carets_after.clone();
         for op in &group.ops {
             apply(op);
         }
         self.undo.push(group);
-        Some(cursor)
+        Some(carets)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selection::Selection;
+
+    fn snap(pos: Pos) -> CaretSnapshot {
+        CaretSnapshot {
+            selections: vec![Selection::caret(pos)],
+            primary: 0,
+        }
+    }
 
     fn ins(pos: usize, data: &[u8]) -> Operation {
         Operation::Insert {
@@ -232,77 +245,77 @@ mod tests {
     #[test]
     fn test_record_and_undo() {
         let mut stack = UndoStack::new();
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
         let mut count = 0;
         let cursor = stack.undo(|_| count += 1).unwrap();
-        assert_eq!(cursor, Pos::new(0, 0));
+        assert_eq!(cursor, snap(Pos::new(0, 0)));
         assert_eq!(count, 1);
     }
 
     #[test]
     fn test_undo_then_redo() {
         let mut stack = UndoStack::new();
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
         stack.undo(|_| {});
         let mut count = 0;
         let cursor = stack.redo(|_| count += 1).unwrap();
-        assert_eq!(cursor, Pos::new(0, 1));
+        assert_eq!(cursor, snap(Pos::new(0, 1)));
         assert_eq!(count, 1);
     }
 
     #[test]
     fn test_new_record_clears_redo() {
         let mut stack = UndoStack::new();
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
         stack.undo(|_| {});
         // New edit should clear redo
-        stack.record(ins(0, b"b"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(ins(0, b"b"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
         assert!(stack.redo(|_| {}).is_none());
     }
 
     #[test]
     fn test_seal_forces_new_group() {
         let mut stack = UndoStack::new();
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
         stack.seal();
-        stack.record(ins(1, b"b"), Pos::new(0, 1), Pos::new(0, 2));
+        stack.record(ins(1, b"b"), snap(Pos::new(0, 1)), snap(Pos::new(0, 2)));
 
         // Undo should only undo "b"
         let mut count = 0;
         let cursor = stack.undo(|_| count += 1).unwrap();
         assert_eq!(count, 1);
-        assert_eq!(cursor, Pos::new(0, 1));
+        assert_eq!(cursor, snap(Pos::new(0, 1)));
 
         // Undo should undo "a"
         count = 0;
         let cursor = stack.undo(|_| count += 1).unwrap();
         assert_eq!(count, 1);
-        assert_eq!(cursor, Pos::new(0, 0));
+        assert_eq!(cursor, snap(Pos::new(0, 0)));
     }
 
     #[test]
     fn test_kind_change_breaks_group() {
         let mut stack = UndoStack::new();
         // Insert then delete should be separate groups
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
-        stack.record(del(0, b"a"), Pos::new(0, 1), Pos::new(0, 0));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
+        stack.record(del(0, b"a"), snap(Pos::new(0, 1)), snap(Pos::new(0, 0)));
 
         // Undo first undoes the delete
         let cursor = stack.undo(|_| {}).unwrap();
-        assert_eq!(cursor, Pos::new(0, 1));
+        assert_eq!(cursor, snap(Pos::new(0, 1)));
 
         // Then the insert
         let cursor = stack.undo(|_| {}).unwrap();
-        assert_eq!(cursor, Pos::new(0, 0));
+        assert_eq!(cursor, snap(Pos::new(0, 0)));
     }
 
     #[test]
     fn test_space_insert_breaks_group() {
         let mut stack = UndoStack::new();
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
-        stack.record(ins(1, b"b"), Pos::new(0, 1), Pos::new(0, 2));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
+        stack.record(ins(1, b"b"), snap(Pos::new(0, 1)), snap(Pos::new(0, 2)));
         // Space should start new group
-        stack.record(ins(2, b" "), Pos::new(0, 2), Pos::new(0, 3));
+        stack.record(ins(2, b" "), snap(Pos::new(0, 2)), snap(Pos::new(0, 3)));
 
         // Undo: first undoes the space
         let mut count = 0;
@@ -318,8 +331,8 @@ mod tests {
     #[test]
     fn test_newline_insert_breaks_group() {
         let mut stack = UndoStack::new();
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
-        stack.record(ins(1, b"\n"), Pos::new(0, 1), Pos::new(1, 0));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
+        stack.record(ins(1, b"\n"), snap(Pos::new(0, 1)), snap(Pos::new(1, 0)));
 
         // Newline should be separate
         let mut count = 0;
@@ -330,9 +343,9 @@ mod tests {
     #[test]
     fn test_cursor_jump_breaks_group() {
         let mut stack = UndoStack::new();
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
         // cursor_before doesn't match last cursor_after — should break
-        stack.record(ins(5, b"b"), Pos::new(0, 5), Pos::new(0, 6));
+        stack.record(ins(5, b"b"), snap(Pos::new(0, 5)), snap(Pos::new(0, 6)));
 
         let mut count = 0;
         stack.undo(|_| count += 1);
@@ -342,9 +355,9 @@ mod tests {
     #[test]
     fn test_contiguous_inserts_grouped() {
         let mut stack = UndoStack::new();
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
-        stack.record(ins(1, b"b"), Pos::new(0, 1), Pos::new(0, 2));
-        stack.record(ins(2, b"c"), Pos::new(0, 2), Pos::new(0, 3));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
+        stack.record(ins(1, b"b"), snap(Pos::new(0, 1)), snap(Pos::new(0, 2)));
+        stack.record(ins(2, b"c"), snap(Pos::new(0, 2)), snap(Pos::new(0, 3)));
 
         // All three should be one group
         let mut count = 0;
@@ -363,9 +376,9 @@ mod tests {
     #[test]
     fn test_stacks_returns_committed_groups() {
         let mut stack = UndoStack::new();
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
         stack.seal();
-        stack.record(ins(1, b"b"), Pos::new(0, 1), Pos::new(0, 2));
+        stack.record(ins(1, b"b"), snap(Pos::new(0, 1)), snap(Pos::new(0, 2)));
         stack.seal();
         let (undo, redo) = stack.stacks();
         assert_eq!(undo.len(), 2);
@@ -375,9 +388,9 @@ mod tests {
     #[test]
     fn test_stacks_after_undo() {
         let mut stack = UndoStack::new();
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
         stack.seal();
-        stack.record(ins(1, b"b"), Pos::new(0, 1), Pos::new(0, 2));
+        stack.record(ins(1, b"b"), snap(Pos::new(0, 1)), snap(Pos::new(0, 2)));
         stack.seal();
         stack.undo(|_| {});
         let (undo, redo) = stack.stacks();
@@ -388,18 +401,18 @@ mod tests {
     #[test]
     fn test_restore_replaces_stacks() {
         let mut stack = UndoStack::new();
-        stack.record(ins(0, b"x"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(ins(0, b"x"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
         stack.seal();
 
         let undo_groups = vec![OperationGroup {
             ops: vec![ins(0, b"a")],
-            cursor_before: Pos::new(0, 0),
-            cursor_after: Pos::new(0, 1),
+            carets_before: snap(Pos::new(0, 0)),
+            carets_after: snap(Pos::new(0, 1)),
         }];
         let redo_groups = vec![OperationGroup {
             ops: vec![ins(1, b"b")],
-            cursor_before: Pos::new(0, 1),
-            cursor_after: Pos::new(0, 2),
+            carets_before: snap(Pos::new(0, 1)),
+            carets_after: snap(Pos::new(0, 2)),
         }];
 
         stack.restore(undo_groups, redo_groups);
@@ -412,13 +425,13 @@ mod tests {
     fn test_restore_resets_transient_state() {
         let mut stack = UndoStack::new();
         // Build up transient state
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
         // Don't seal — there's a current group
 
         stack.restore(Vec::new(), Vec::new());
 
         // After restore, recording should work cleanly
-        stack.record(ins(0, b"b"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(ins(0, b"b"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
         stack.seal();
         let (undo, redo) = stack.stacks();
         assert_eq!(undo.len(), 1);
@@ -429,9 +442,9 @@ mod tests {
     fn test_begin_end_group() {
         let mut stack = UndoStack::new();
         stack.begin_group();
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
-        stack.record(ins(1, b" "), Pos::new(0, 1), Pos::new(0, 2));
-        stack.record(ins(2, b"b"), Pos::new(0, 2), Pos::new(0, 3));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
+        stack.record(ins(1, b" "), snap(Pos::new(0, 1)), snap(Pos::new(0, 2)));
+        stack.record(ins(2, b"b"), snap(Pos::new(0, 2)), snap(Pos::new(0, 3)));
         stack.end_group();
 
         // All three ops in one group, even though space normally breaks
@@ -445,8 +458,8 @@ mod tests {
     fn test_force_group_ignores_kind_change() {
         let mut stack = UndoStack::new();
         stack.begin_group();
-        stack.record(ins(0, b"a"), Pos::new(0, 0), Pos::new(0, 1));
-        stack.record(del(0, b"a"), Pos::new(0, 1), Pos::new(0, 0));
+        stack.record(ins(0, b"a"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
+        stack.record(del(0, b"a"), snap(Pos::new(0, 1)), snap(Pos::new(0, 0)));
         stack.end_group();
 
         // Insert then delete should still be one group when force_group is on
@@ -458,9 +471,9 @@ mod tests {
     #[test]
     fn test_multiple_undo_redo_cycles() {
         let mut stack = UndoStack::new();
-        stack.record(ins(0, b"x"), Pos::new(0, 0), Pos::new(0, 1));
+        stack.record(ins(0, b"x"), snap(Pos::new(0, 0)), snap(Pos::new(0, 1)));
         stack.seal();
-        stack.record(ins(1, b"y"), Pos::new(0, 1), Pos::new(0, 2));
+        stack.record(ins(1, b"y"), snap(Pos::new(0, 1)), snap(Pos::new(0, 2)));
 
         stack.undo(|_| {}); // undo "y"
         stack.undo(|_| {}); // undo "x"

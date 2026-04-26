@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::buffer::GapBuffer;
 use crate::language::{self, Language};
 use crate::operation::{Operation, UndoStack};
-use crate::selection::Pos;
+use crate::selection::{CaretSnapshot, Pos, Selection};
 
 /// Wraps a GapBuffer with undo/redo and dirty tracking.
 pub struct Document {
@@ -13,7 +13,21 @@ pub struct Document {
     pub filename: Option<String>,
 }
 
+pub struct RawEdit {
+    pub start: usize,
+    pub end: usize,
+    pub insert: Vec<u8>,
+    pub deleted: Vec<u8>,
+}
+
 impl Document {
+    fn snapshot_for_pos(pos: Pos) -> CaretSnapshot {
+        CaretSnapshot {
+            selections: vec![Selection::caret(pos)],
+            primary: 0,
+        }
+    }
+
     pub fn new(text: Vec<u8>, filename: Option<String>) -> Self {
         let buf = if text.is_empty() {
             GapBuffer::new()
@@ -41,8 +55,8 @@ impl Document {
                 pos: offset,
                 data: Arc::from(bytes),
             },
-            cursor_before,
-            cursor_after,
+            Self::snapshot_for_pos(cursor_before),
+            Self::snapshot_for_pos(cursor_after),
         );
         self.dirty = true;
         cursor_after
@@ -63,8 +77,8 @@ impl Document {
                 pos: start_offset,
                 data: Arc::from(deleted.as_slice()),
             },
-            end_pos,
-            start_pos,
+            Self::snapshot_for_pos(end_pos),
+            Self::snapshot_for_pos(start_pos),
         );
         self.dirty = true;
         start_pos
@@ -84,23 +98,23 @@ impl Document {
     }
 
     /// Undo the last operation group. Returns new cursor position.
-    pub fn undo(&mut self) -> Option<Pos> {
-        let cursor = self.undo_stack.undo(|op| match op {
+    pub fn undo(&mut self) -> Option<CaretSnapshot> {
+        let carets = self.undo_stack.undo(|op| match op {
             Operation::Insert { pos, data } => self.buf.delete(*pos, data.len()),
             Operation::Delete { pos, data } => self.buf.insert(*pos, data.as_ref()),
         })?;
         self.dirty = true;
-        Some(cursor)
+        Some(carets)
     }
 
     /// Redo the last undone group. Returns new cursor position.
-    pub fn redo(&mut self) -> Option<Pos> {
-        let cursor = self.undo_stack.redo(|op| match op {
+    pub fn redo(&mut self) -> Option<CaretSnapshot> {
+        let carets = self.undo_stack.redo(|op| match op {
             Operation::Insert { pos, data } => self.buf.insert(*pos, data.as_ref()),
             Operation::Delete { pos, data } => self.buf.delete(*pos, data.len()),
         })?;
         self.dirty = true;
-        Some(cursor)
+        Some(carets)
     }
 
     /// Insert bytes at a raw byte offset (avoids line-cache lookups).
@@ -118,8 +132,8 @@ impl Document {
                 pos: offset,
                 data: Arc::from(bytes),
             },
-            cursor_before,
-            cursor_after,
+            Self::snapshot_for_pos(cursor_before),
+            Self::snapshot_for_pos(cursor_after),
         );
         self.dirty = true;
     }
@@ -140,10 +154,118 @@ impl Document {
                 pos: offset,
                 data: Arc::from(deleted.as_slice()),
             },
-            cursor_before,
-            cursor_after,
+            Self::snapshot_for_pos(cursor_before),
+            Self::snapshot_for_pos(cursor_after),
         );
         self.dirty = true;
+    }
+
+    pub fn insert_at_byte_with_carets(
+        &mut self,
+        offset: usize,
+        bytes: &[u8],
+        carets_before: CaretSnapshot,
+        carets_after: CaretSnapshot,
+    ) {
+        self.buf.insert(offset, bytes);
+        self.undo_stack.record(
+            Operation::Insert {
+                pos: offset,
+                data: Arc::from(bytes),
+            },
+            carets_before,
+            carets_after,
+        );
+        self.dirty = true;
+    }
+
+    pub fn delete_at_byte_with_carets(
+        &mut self,
+        offset: usize,
+        count: usize,
+        carets_before: CaretSnapshot,
+        carets_after: CaretSnapshot,
+    ) {
+        let deleted = self.buf.slice(offset, offset + count);
+        self.buf.delete(offset, count);
+        self.undo_stack.record(
+            Operation::Delete {
+                pos: offset,
+                data: Arc::from(deleted.as_slice()),
+            },
+            carets_before,
+            carets_after,
+        );
+        self.dirty = true;
+    }
+
+    pub fn apply_batch(
+        &mut self,
+        edits: &[RawEdit],
+        carets_before: &CaretSnapshot,
+        carets_after_offsets: &[(usize, usize)],
+        primary: usize,
+    ) -> CaretSnapshot {
+        if edits.is_empty() {
+            return carets_before.clone();
+        }
+        debug_assert_eq!(carets_before.selections.len(), carets_after_offsets.len());
+        debug_assert!(
+            edits
+                .windows(2)
+                .all(|window| window[0].end <= window[1].start)
+        );
+
+        for edit in edits.iter().rev() {
+            if edit.end > edit.start {
+                self.buf.delete(edit.start, edit.end - edit.start);
+            }
+            if !edit.insert.is_empty() {
+                self.buf.insert(edit.start, &edit.insert);
+            }
+        }
+
+        let carets_after = CaretSnapshot {
+            selections: carets_after_offsets
+                .iter()
+                .map(|(anchor, cursor)| {
+                    let (anchor_line, anchor_col) = self.buf.offset_to_pos(*anchor);
+                    let (cursor_line, cursor_col) = self.buf.offset_to_pos(*cursor);
+                    Selection {
+                        anchor: Pos::new(anchor_line, anchor_col),
+                        cursor: Pos::new(cursor_line, cursor_col),
+                    }
+                })
+                .collect(),
+            primary,
+        };
+
+        self.undo_stack.begin_group();
+        for edit in edits.iter().rev() {
+            if !edit.deleted.is_empty() {
+                self.undo_stack.record(
+                    Operation::Delete {
+                        pos: edit.start,
+                        data: Arc::from(edit.deleted.as_slice()),
+                    },
+                    carets_before.clone(),
+                    carets_after.clone(),
+                );
+            }
+            if !edit.insert.is_empty() {
+                self.undo_stack.record(
+                    Operation::Insert {
+                        pos: edit.start,
+                        data: Arc::from(edit.insert.as_slice()),
+                    },
+                    carets_before.clone(),
+                    carets_after.clone(),
+                );
+            }
+        }
+        self.undo_stack.end_group();
+        self.dirty = true;
+        carets_after
     }
 
     /// Detect language from filename, falling back to shebang on the first line.
@@ -165,6 +287,13 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snap(pos: Pos) -> CaretSnapshot {
+        CaretSnapshot {
+            selections: vec![Selection::caret(pos)],
+            primary: 0,
+        }
+    }
 
     #[test]
     fn test_new_empty() {
@@ -244,8 +373,8 @@ mod tests {
         doc.insert(0, 5, b" world");
         assert_eq!(doc.buf.contents(), b"hello world");
 
-        let pos = doc.undo().unwrap();
-        assert_eq!(pos, Pos::new(0, 5));
+        let carets = doc.undo().unwrap();
+        assert_eq!(carets, snap(Pos::new(0, 5)));
         assert_eq!(doc.buf.contents(), b"hello");
     }
 
@@ -255,8 +384,8 @@ mod tests {
         doc.delete_range(Pos::new(0, 5), Pos::new(0, 11));
         assert_eq!(doc.buf.contents(), b"hello");
 
-        let pos = doc.undo().unwrap();
-        assert_eq!(pos, Pos::new(0, 11));
+        let carets = doc.undo().unwrap();
+        assert_eq!(carets, snap(Pos::new(0, 11)));
         assert_eq!(doc.buf.contents(), b"hello world");
     }
 
@@ -267,8 +396,8 @@ mod tests {
         doc.undo();
         assert_eq!(doc.buf.contents(), b"hello");
 
-        let pos = doc.redo().unwrap();
-        assert_eq!(pos, Pos::new(0, 11));
+        let carets = doc.redo().unwrap();
+        assert_eq!(carets, snap(Pos::new(0, 11)));
         assert_eq!(doc.buf.contents(), b"hello world");
     }
 

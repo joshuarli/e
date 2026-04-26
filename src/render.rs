@@ -214,6 +214,8 @@ impl Renderer {
         status_right: &str,
         command_line: Option<&str>,
         selection: Option<Selection>,
+        secondary_selections: &[Selection],
+        secondary_cursors: &[Pos],
         find_matches: Option<&[(Pos, Pos)]>,
         find_current: Option<(Pos, Pos)>,
         completions: &[String],
@@ -234,7 +236,8 @@ impl Renderer {
         let (sel_start, sel_end) = selection
             .map(|s| s.ordered())
             .unwrap_or((Pos::zero(), Pos::zero()));
-        let has_sel = selection.is_some_and(|s| !s.is_empty());
+        let has_sel = selection.is_some_and(|s| !s.is_empty())
+            || secondary_selections.iter().any(|sel| !sel.is_empty());
         // Software cursor: draw reverse-video block when no selection/find/command cursor
         let draw_cursor = !find_active && !has_sel && cmd_cursor.is_none();
 
@@ -324,7 +327,9 @@ impl Renderer {
             && !used_scroll_region
             && buf_version == self.prev_buf_version
             && !has_find
-            && !self.prev_has_find;
+            && !self.prev_has_find
+            && secondary_selections.is_empty()
+            && secondary_cursors.is_empty();
 
         while screen_row < text_rows && line_idx < line_count {
             // Fast skip: if this line can't have changed, advance screen_row
@@ -400,10 +405,48 @@ impl Renderer {
 
             // Per-character highlight info
             let need_per_char = has_sel && line_idx >= sel_start.line && line_idx <= sel_end.line;
+            let line_has_secondary_sel = secondary_selections.iter().any(|sel| {
+                !sel.is_empty()
+                    && line_idx >= sel.ordered().0.line
+                    && line_idx <= sel.ordered().1.line
+            });
             let line_has_find = find_matches.is_some_and(|m| {
                 m.iter()
                     .any(|(s, e)| line_idx >= s.line && line_idx <= e.line)
             });
+            let line_secondary_cursors: Vec<usize> = secondary_cursors
+                .iter()
+                .filter_map(|pos| {
+                    if pos.line == line_idx {
+                        Some(display_col_for_char_col(raw_text, pos.col))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let line_secondary_sel_ranges: Vec<(usize, usize)> = secondary_selections
+                .iter()
+                .filter_map(|sel| {
+                    if sel.is_empty() {
+                        return None;
+                    }
+                    let (start, end) = sel.ordered();
+                    if line_idx < start.line || line_idx > end.line {
+                        return None;
+                    }
+                    let range_start = if line_idx == start.line {
+                        display_col_for_char_col(raw_text, start.col)
+                    } else {
+                        0
+                    };
+                    let range_end = if line_idx == end.line {
+                        display_col_for_char_col(raw_text, end.col)
+                    } else {
+                        char_count
+                    };
+                    Some((range_start, range_end))
+                })
+                .collect();
 
             // Pre-compute selection and find ranges once per logical line
             let (line_sel_start, line_sel_end) = if need_per_char {
@@ -483,15 +526,25 @@ impl Renderer {
                 // Is the software cursor on this line?
                 let cursor_on_line = draw_cursor && line_idx == cursor_line;
 
-                if need_per_char || line_has_find || has_bracket || cursor_on_line {
+                if need_per_char
+                    || line_has_secondary_sel
+                    || !line_secondary_cursors.is_empty()
+                    || line_has_find
+                    || has_bracket
+                    || cursor_on_line
+                {
                     for (i, ch) in line_str
                         .chars()
                         .enumerate()
                         .take(chunk_end)
                         .skip(chunk_start)
                     {
-                        let is_cursor = cursor_on_line && i == cursor_col;
-                        let in_sel = need_per_char && i >= line_sel_start && i < line_sel_end;
+                        let is_cursor = (cursor_on_line && i == cursor_col)
+                            || line_secondary_cursors.contains(&i);
+                        let in_sel = (need_per_char && i >= line_sel_start && i < line_sel_end)
+                            || line_secondary_sel_ranges
+                                .iter()
+                                .any(|(start, end)| i >= *start && i < *end);
                         let find_hit = self
                             .find_scratch
                             .iter()
@@ -588,7 +641,11 @@ impl Renderer {
                 }
 
                 // End-of-line cursor: draw reverse-video space when cursor is past last char
-                if cursor_on_line && cursor_col == chunk_end && chunk_end == char_count {
+                let cursor_at_eol = (cursor_on_line && cursor_col == chunk_end)
+                    || line_secondary_cursors
+                        .iter()
+                        .any(|col| *col == chunk_end && chunk_end == char_count);
+                if cursor_at_eol && chunk_end == char_count {
                     write!(rb, "{CURSOR_STYLE} {RESET}")?;
                 }
 
@@ -963,6 +1020,47 @@ pub(crate) fn display_col_for_char_col(raw_text: &[u8], char_col: usize) -> usiz
 mod tests {
     use super::*;
 
+    fn render_test(
+        r: &mut Renderer,
+        output: &mut Vec<u8>,
+        buf: &mut GapBuffer,
+        view: &View,
+        cursor_line: usize,
+        cursor_col: usize,
+        ruler_on: bool,
+        status_left: &str,
+        status_right: &str,
+        command_line: Option<&str>,
+        selection: Option<Selection>,
+        find_matches: Option<&[(Pos, Pos)]>,
+        find_current: Option<(Pos, Pos)>,
+        completions: &[String],
+        cmd_cursor: Option<usize>,
+        find_active: bool,
+        bracket_pair: Option<(Pos, Pos)>,
+    ) -> io::Result<()> {
+        r.render(
+            output,
+            buf,
+            view,
+            cursor_line,
+            cursor_col,
+            ruler_on,
+            status_left,
+            status_right,
+            command_line,
+            selection,
+            &[],
+            &[],
+            find_matches,
+            find_current,
+            completions,
+            cmd_cursor,
+            find_active,
+            bracket_pair,
+        )
+    }
+
     // -- gutter_width ---------------------------------------------------------
 
     #[test]
@@ -1117,7 +1215,8 @@ mod tests {
         let view = View::new(80, 24);
         let mut output = Vec::new();
 
-        r.render(
+        render_test(
+            &mut r,
             &mut output,
             &mut buf,
             &view,
@@ -1152,7 +1251,8 @@ mod tests {
         let view = View::new(80, 24);
         let mut output = Vec::new();
 
-        r.render(
+        render_test(
+            &mut r,
             &mut output,
             &mut buf,
             &view,
@@ -1186,7 +1286,8 @@ mod tests {
         let view = View::new(80, 24);
         let mut output = Vec::new();
 
-        r.render(
+        render_test(
+            &mut r,
             &mut output,
             &mut buf,
             &view,
@@ -1219,7 +1320,8 @@ mod tests {
         let view = View::new(80, 24);
         let mut output = Vec::new();
 
-        r.render(
+        render_test(
+            &mut r,
             &mut output,
             &mut buf,
             &view,
@@ -1254,7 +1356,8 @@ mod tests {
             cursor: Pos::new(0, 7),
         };
 
-        r.render(
+        render_test(
+            &mut r,
             &mut output,
             &mut buf,
             &view,
@@ -1290,7 +1393,8 @@ mod tests {
             (Pos::new(0, 12), Pos::new(0, 17)),
         ];
 
-        r.render(
+        render_test(
+            &mut r,
             &mut output,
             &mut buf,
             &view,
@@ -1323,7 +1427,8 @@ mod tests {
         let view = View::new(80, 24);
         let mut output = Vec::new();
 
-        r.render(
+        render_test(
+            &mut r,
             &mut output,
             &mut buf,
             &view,
@@ -1356,7 +1461,8 @@ mod tests {
         let mut output = Vec::new();
         let comps = vec!["save".to_string(), "quit".to_string()];
 
-        r.render(
+        render_test(
+            &mut r,
             &mut output,
             &mut buf,
             &view,
@@ -1388,7 +1494,8 @@ mod tests {
         let view = View::new(80, 24);
         let mut output = Vec::new();
 
-        r.render(
+        render_test(
+            &mut r,
             &mut output,
             &mut buf,
             &view,
@@ -1420,7 +1527,8 @@ mod tests {
         let view = View::new(80, 24);
         let mut output = Vec::new();
 
-        r.render(
+        render_test(
+            &mut r,
             &mut output,
             &mut buf,
             &view,
@@ -1455,7 +1563,8 @@ mod tests {
         let view = View::new(80, 24);
         let mut output = Vec::new();
 
-        r.render(
+        render_test(
+            &mut r,
             &mut output,
             &mut buf,
             &view,
@@ -1478,7 +1587,8 @@ mod tests {
         // Modify buffer (version changes) and render again
         buf.insert(0, b"// ");
         output.clear();
-        r.render(
+        render_test(
+            &mut r,
             &mut output,
             &mut buf,
             &view,
@@ -1521,7 +1631,8 @@ mod tests {
         let view = View::new(80, 24);
         let mut output = Vec::new();
 
-        r.render(
+        render_test(
+            &mut r,
             &mut output,
             &mut buf,
             &view,

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::operation::{Operation, OperationGroup, UndoStack};
-use crate::selection::Pos;
+use crate::selection::{CaretSnapshot, Pos, Selection};
 
 /// Read a file. Returns the raw bytes as-is.
 pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
@@ -131,7 +131,7 @@ pub fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
 // On load, entries are scanned linearly; only the matching one is deserialized.
 
 const UNDO_MAGIC: &[u8; 4] = b"eUND";
-const UNDO_VERSION: u8 = 1;
+const UNDO_VERSION: u8 = 2;
 const MAX_GROUPS: u32 = 100_000;
 const MAX_ENTRIES: u32 = 10_000;
 
@@ -209,11 +209,51 @@ fn read_i64(data: &[u8], pos: &mut usize) -> Option<i64> {
     Some(v)
 }
 
+fn serialize_selection(buf: &mut Vec<u8>, sel: Selection) {
+    write_u32(buf, sel.anchor.line as u32);
+    write_u32(buf, sel.anchor.col as u32);
+    write_u32(buf, sel.cursor.line as u32);
+    write_u32(buf, sel.cursor.col as u32);
+}
+
+fn deserialize_selection(data: &[u8], pos: &mut usize) -> Option<Selection> {
+    let anchor_line = read_u32(data, pos)? as usize;
+    let anchor_col = read_u32(data, pos)? as usize;
+    let cursor_line = read_u32(data, pos)? as usize;
+    let cursor_col = read_u32(data, pos)? as usize;
+    Some(Selection {
+        anchor: Pos::new(anchor_line, anchor_col),
+        cursor: Pos::new(cursor_line, cursor_col),
+    })
+}
+
+fn serialize_snapshot(buf: &mut Vec<u8>, snapshot: &CaretSnapshot) {
+    write_u32(buf, snapshot.selections.len() as u32);
+    write_u32(buf, snapshot.primary as u32);
+    for sel in &snapshot.selections {
+        serialize_selection(buf, *sel);
+    }
+}
+
+fn deserialize_snapshot(data: &[u8], pos: &mut usize) -> Option<CaretSnapshot> {
+    let count = read_u32(data, pos)? as usize;
+    if count > MAX_GROUPS as usize {
+        return None;
+    }
+    let primary = read_u32(data, pos)? as usize;
+    let mut selections = Vec::with_capacity(count);
+    for _ in 0..count {
+        selections.push(deserialize_selection(data, pos)?);
+    }
+    Some(CaretSnapshot {
+        selections,
+        primary,
+    })
+}
+
 fn serialize_group(buf: &mut Vec<u8>, group: &OperationGroup) {
-    write_u32(buf, group.cursor_before.line as u32);
-    write_u32(buf, group.cursor_before.col as u32);
-    write_u32(buf, group.cursor_after.line as u32);
-    write_u32(buf, group.cursor_after.col as u32);
+    serialize_snapshot(buf, &group.carets_before);
+    serialize_snapshot(buf, &group.carets_after);
     write_u32(buf, group.ops.len() as u32);
     for op in &group.ops {
         match op {
@@ -234,10 +274,8 @@ fn serialize_group(buf: &mut Vec<u8>, group: &OperationGroup) {
 }
 
 fn deserialize_group(data: &[u8], pos: &mut usize) -> Option<OperationGroup> {
-    let cb_line = read_u32(data, pos)? as usize;
-    let cb_col = read_u32(data, pos)? as usize;
-    let ca_line = read_u32(data, pos)? as usize;
-    let ca_col = read_u32(data, pos)? as usize;
+    let carets_before = deserialize_snapshot(data, pos)?;
+    let carets_after = deserialize_snapshot(data, pos)?;
     let op_count = read_u32(data, pos)?;
     if op_count > MAX_GROUPS {
         return None;
@@ -267,8 +305,8 @@ fn deserialize_group(data: &[u8], pos: &mut usize) -> Option<OperationGroup> {
     }
     Some(OperationGroup {
         ops,
-        cursor_before: Pos::new(cb_line, cb_col),
-        cursor_after: Pos::new(ca_line, ca_col),
+        carets_before,
+        carets_after,
     })
 }
 
@@ -677,6 +715,7 @@ pub mod fuzz {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selection::Selection;
 
     // -- strip_trailing_whitespace_and_ensure_newline -----------------------
 
@@ -803,6 +842,13 @@ mod tests {
 
     // -- undo history persistence -------------------------------------------
 
+    fn snap(pos: Pos) -> CaretSnapshot {
+        CaretSnapshot {
+            selections: vec![Selection::caret(pos)],
+            primary: 0,
+        }
+    }
+
     fn make_test_stack() -> UndoStack {
         let mut stack = UndoStack::new();
         stack.record(
@@ -810,8 +856,8 @@ mod tests {
                 pos: 0,
                 data: Arc::from(b"hello".as_ref()),
             },
-            Pos::new(0, 0),
-            Pos::new(0, 5),
+            snap(Pos::new(0, 0)),
+            snap(Pos::new(0, 5)),
         );
         stack.seal();
         stack.record(
@@ -819,8 +865,8 @@ mod tests {
                 pos: 3,
                 data: Arc::from(b"lo".as_ref()),
             },
-            Pos::new(0, 5),
-            Pos::new(0, 3),
+            snap(Pos::new(0, 5)),
+            snap(Pos::new(0, 3)),
         );
         stack.seal();
         stack
@@ -843,11 +889,11 @@ mod tests {
         assert_eq!(undo.len(), 2);
         assert!(redo.is_empty());
 
-        assert_eq!(undo[0].cursor_before, Pos::new(0, 0));
-        assert_eq!(undo[0].cursor_after, Pos::new(0, 5));
+        assert_eq!(undo[0].carets_before, snap(Pos::new(0, 0)));
+        assert_eq!(undo[0].carets_after, snap(Pos::new(0, 5)));
         assert_eq!(undo[0].ops.len(), 1);
-        assert_eq!(undo[1].cursor_before, Pos::new(0, 5));
-        assert_eq!(undo[1].cursor_after, Pos::new(0, 3));
+        assert_eq!(undo[1].carets_before, snap(Pos::new(0, 5)));
+        assert_eq!(undo[1].carets_after, snap(Pos::new(0, 3)));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -993,8 +1039,8 @@ mod tests {
                 pos: 0,
                 data: Arc::from(b"x".as_ref()),
             },
-            Pos::new(0, 0),
-            Pos::new(0, 1),
+            snap(Pos::new(0, 0)),
+            snap(Pos::new(0, 1)),
         );
         stack_b.seal();
         save_undo_history_to(&db, &path_b, &stack_b);
@@ -1029,8 +1075,8 @@ mod tests {
                 pos: 0,
                 data: Arc::from(b"x".as_ref()),
             },
-            Pos::new(0, 0),
-            Pos::new(0, 1),
+            snap(Pos::new(0, 0)),
+            snap(Pos::new(0, 1)),
         );
         stack2.seal();
         save_undo_history_to(&db, &path, &stack2);
