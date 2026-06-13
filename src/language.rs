@@ -357,6 +357,13 @@ const LANGUAGES: &[(&[&str], Language)] = &[
             comment: "<!--",
         },
     ),
+    (
+        &[".xsh"],
+        Language {
+            name: "XSH",
+            comment: "#",
+        },
+    ),
 ];
 
 /// Detect language from a filename.
@@ -404,6 +411,13 @@ const SHEBANGS: &[(&[&str], Language)] = &[
         Language {
             name: "JavaScript",
             comment: "//",
+        },
+    ),
+    (
+        &["xsh", "xshi", "xsht"],
+        Language {
+            name: "XSH",
+            comment: "#",
         },
     ),
 ];
@@ -549,5 +563,24 @@ mod tests {
     #[test]
     fn test_shebang_unknown_interpreter() {
         assert!(detect_from_shebang(b"#!/usr/bin/unknown").is_none());
+    }
+
+    #[test]
+    fn test_xsh_extension() {
+        assert_eq!(detect("script.xsh").unwrap().name, "XSH");
+        assert_eq!(detect("/path/to/build.xsh").unwrap().name, "XSH");
+    }
+
+    #[test]
+    fn test_xsh_shebang() {
+        assert_eq!(
+            detect_from_shebang(b"#!/usr/bin/env xsh").unwrap().name,
+            "XSH"
+        );
+        assert_eq!(detect_from_shebang(b"#!/usr/bin/xsh").unwrap().name, "XSH");
+        assert_eq!(
+            detect_from_shebang(b"#!/usr/bin/env xshi").unwrap().name,
+            "XSH"
+        );
     }
 }

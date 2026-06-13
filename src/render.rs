@@ -145,6 +145,8 @@ pub struct Renderer {
     prev_sel: Option<Selection>,
     prev_bracket_pair: Option<(Pos, Pos)>,
     prev_has_find: bool,
+    /// User-defined type names from `type` declarations (flat, deduplicated).
+    user_types: Vec<Vec<u8>>,
 }
 
 impl Default for Renderer {
@@ -180,6 +182,7 @@ impl Renderer {
             prev_bracket_pair: None,
             prev_has_find: false,
             prev_text_rows: 0,
+            user_types: Vec::new(),
         }
     }
 
@@ -199,6 +202,24 @@ impl Renderer {
 
     pub fn force_full_redraw(&mut self) {
         self.needs_full_redraw = true;
+    }
+
+    /// Rescan all lines for `type` declarations.  The scan is gated by the
+    /// buffer-version check in `render()`, so it only runs after edits.
+    fn update_user_types(&mut self, buf: &mut crate::buffer::GapBuffer, line_count: usize) {
+        let mut seen = std::collections::HashSet::new();
+        self.user_types.clear();
+        let mut in_continuation = false;
+        for line_idx in 0..line_count {
+            buf.line_text_into(line_idx, &mut self.line_buf);
+            let (names, continues) = highlight::scan_type_line(&self.line_buf, in_continuation);
+            for name in names {
+                if seen.insert(name.clone()) {
+                    self.user_types.push(name);
+                }
+            }
+            in_continuation = continues;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -303,6 +324,7 @@ impl Renderer {
                     self.hl_dirty_from = 0;
                 }
                 self.hl_cache_version = buf_version;
+                self.update_user_types(buf, line_count);
             }
             self.refresh_hl_cache(visible_end, view.scroll_line, line_count, buf, rules);
             self.hl_dirty_from = usize::MAX;
@@ -381,7 +403,13 @@ impl Renderer {
             // Results go into self.char_hl_scratch; has_char_hl tracks whether it's valid.
             let has_char_hl =
                 if let (Some(rules), Some(&state)) = (self.syntax, hl_states.get(line_idx)) {
-                    highlight::highlight_line_into(raw_text, state, rules, &mut self.hl_scratch);
+                    highlight::highlight_line_into(
+                        raw_text,
+                        state,
+                        rules,
+                        &self.user_types,
+                        &mut self.hl_scratch,
+                    );
                     highlight::byte_hl_to_char_hl_into(
                         raw_text,
                         &self.hl_scratch,
@@ -976,8 +1004,13 @@ impl Renderer {
         let mut line = start;
         while line < end {
             buf.line_text_into(line, &mut self.line_buf);
-            let next_state =
-                highlight::highlight_line_into(&self.line_buf, state, rules, &mut self.hl_scratch);
+            let next_state = highlight::highlight_line_into(
+                &self.line_buf,
+                state,
+                rules,
+                &self.user_types,
+                &mut self.hl_scratch,
+            );
             state = next_state;
 
             if line + 1 < end {

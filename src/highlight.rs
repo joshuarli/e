@@ -126,7 +126,7 @@ fn starts_with_at(haystack: &[u8], needle: &[u8], pos: usize) -> bool {
 /// Highlight a single line. Returns (per-byte HlType vec, next-line state).
 pub fn highlight_line(line: &[u8], state: HlState, rules: &SyntaxRules) -> (Vec<HlType>, HlState) {
     let mut hl = Vec::new();
-    let next_state = highlight_line_into(line, state, rules, &mut hl);
+    let next_state = highlight_line_into(line, state, rules, &[], &mut hl);
     (hl, next_state)
 }
 
@@ -134,6 +134,7 @@ fn highlight_line_code(
     line: &[u8],
     state: HlState,
     rules: &SyntaxRules,
+    user_types: &[Vec<u8>],
     hl: &mut [HlType],
 ) -> HlState {
     let len = line.len();
@@ -321,6 +322,15 @@ fn highlight_line_code(
             if let Some(hl_type) = matched {
                 for b in &mut hl[id_start..i] {
                     *b = hl_type;
+                }
+                prev_sep = false;
+                continue;
+            }
+
+            // User-defined types (scanned from type declarations)
+            if !user_types.is_empty() && user_types.iter().any(|t| t.as_slice() == id) {
+                for b in &mut hl[id_start..i] {
+                    *b = HlType::Type;
                 }
                 prev_sep = false;
                 continue;
@@ -1456,6 +1466,7 @@ pub fn highlight_line_into(
     line: &[u8],
     state: HlState,
     rules: &SyntaxRules,
+    user_types: &[Vec<u8>],
     out: &mut Vec<HlType>,
 ) -> HlState {
     out.clear();
@@ -1469,7 +1480,7 @@ pub fn highlight_line_into(
     } else if rules.is_ini {
         highlight_line_ini(line, state, out)
     } else {
-        highlight_line_code(line, state, rules, out)
+        highlight_line_code(line, state, rules, user_types, out)
     };
     highlight_semver(line, out);
     next_state
@@ -1508,7 +1519,12 @@ static RUST_RULES: SyntaxRules = SyntaxRules {
         "u128", "u16", "u32", "u64", "u8", "usize",
     ],
     constants: &[],
-    macros: &[],
+    macros: &[
+        "abort", "archive", "args", "bytes", "cli", "cpu", "diff", "dns", "env", "eprint", "fs",
+        "group", "hash", "io", "json", "linux", "list", "map", "module", "net", "patch", "path",
+        "print", "process", "range", "record", "regex", "system", "test", "text", "time", "tui",
+        "unix", "user",
+    ],
     operators: &["&&", "||", "!=", "==", "<=", ">=", "=>", "->"],
     highlight_numbers: true,
     highlight_upper_constants: true,
@@ -2095,6 +2111,226 @@ static INI_RULES: SyntaxRules = SyntaxRules {
     is_ini: true,
 };
 
+// XSH: ordered longest-open-first so the generic string scanner picks the
+// right delimiter.  Triple-quoted forms are multiline.
+static XSH_STRINGS: &[StringDelim] = &[
+    string_delim!("fp\"\"\"", "\"\"\"", true),
+    string_delim!("f\"\"\"", "\"\"\"", true),
+    string_delim!("r\"\"\"", "\"\"\"", true),
+    string_delim!("\"\"\"", "\"\"\"", true),
+    string_delim!("fp\"", "\"", false),
+    string_delim!("b\"", "\"", false),
+    string_delim!("p\"", "\"", false),
+    string_delim!("f\"", "\"", false),
+    string_delim!("g\"", "\"", false),
+    string_delim!("r\"", "\"", false),
+    string_delim!("\"", "\"", false),
+];
+
+static XSH_RULES: SyntaxRules = SyntaxRules {
+    line_comment: "#",
+    block_comment: ("", ""),
+    string_delims: XSH_STRINGS,
+    keywords: &[
+        "and", "break", "continue", "defer", "else", "false", "for", "if", "in", "let", "match",
+        "not", "null", "or", "proc", "pure", "retry", "return", "run", "spawn", "true", "type",
+        "use", "var", "wait", "while",
+    ],
+    types: &[
+        "Any",
+        "Bool",
+        "Bytes",
+        "Command",
+        "Digest",
+        "Duration",
+        "Err",
+        "Error",
+        "Float",
+        "Int",
+        "List",
+        "Map",
+        "Module",
+        "Null",
+        "Ok",
+        "Path",
+        "Proc",
+        "ProcessError",
+        "ProcessHandle",
+        "Pure",
+        "Record",
+        "Regex",
+        "Result",
+        "Status",
+        "Str",
+        "Stream",
+        "UInt",
+        "Unit",
+    ],
+    constants: &[],
+    macros: &[
+        "abort", "archive", "args", "bytes", "cli", "cpu", "diff", "dns", "env", "eprint", "fs",
+        "group", "hash", "io", "json", "linux", "list", "map", "module", "net", "patch", "path",
+        "print", "process", "range", "record", "regex", "system", "test", "text", "time", "tui",
+        "unix", "user",
+    ],
+    operators: &[
+        "!=", "%=", "*=", "+=", "-=", "->", "/=", "<=", "==", "=>", ">=", "|>", "?.", "??",
+    ],
+    highlight_numbers: true,
+    highlight_upper_constants: true,
+    highlight_fn_calls: true,
+    highlight_bang_macros: false,
+    is_markdown: false,
+    is_json: false,
+    is_yaml: false,
+    is_ini: false,
+};
+
+/// Scan a single line for `type` declaration names and tag-union variants.
+///
+/// When `in_continuation` is true the line is treated as a continuation of a
+/// previous tag-union declaration: a leading `|` is expected before variant
+/// names.  When the line does not start with `|`, the scanner falls through
+/// and checks for a *new* `type` declaration instead.
+///
+/// Returns `(names, continues)` where *names* contains the type name (for a
+/// new declaration) and/or variant names, and *continues* indicates whether
+/// the declaration spans to the next line.
+pub fn scan_type_line(line: &[u8], in_continuation: bool) -> (Vec<Vec<u8>>, bool) {
+    let len = line.len();
+    let mut i = 0;
+
+    // Skip leading whitespace
+    while i < len && (line[i] == b' ' || line[i] == b'\t') {
+        i += 1;
+    }
+
+    // --- continuation: expect leading '|' -----------------------------------
+    if in_continuation && i < len && line[i] == b'|' {
+        i += 1; // skip '|'
+        return (extract_variants(line, &mut i), true);
+    }
+
+    // --- new type declaration -----------------------------------------------
+    if i + 4 > len || &line[i..i + 4] != b"type" {
+        return (Vec::new(), false);
+    }
+    i += 4;
+    if i >= len || !line[i].is_ascii_whitespace() {
+        return (Vec::new(), false);
+    }
+    i += 1;
+
+    while i < len && (line[i] == b' ' || line[i] == b'\t') {
+        i += 1;
+    }
+
+    // Extract type name
+    if i >= len || !(line[i].is_ascii_alphabetic() || line[i] == b'_') {
+        return (Vec::new(), false);
+    }
+    let name_start = i;
+    i += 1;
+    while i < len && (line[i].is_ascii_alphanumeric() || line[i] == b'_') {
+        i += 1;
+    }
+    let type_name = line[name_start..i].to_vec();
+
+    // Find '='
+    let Some(offset) = line[i..].iter().position(|&b| b == b'=') else {
+        return (vec![type_name], false);
+    };
+    i += offset + 1;
+
+    while i < len && (line[i] == b' ' || line[i] == b'\t') {
+        i += 1;
+    }
+    if i >= len {
+        // Nothing after '=' — multi-line, continues
+        return (vec![type_name], true);
+    }
+
+    // Record schemas and module contracts: no variants
+    if line[i] == b'{' || line[i..].starts_with(b"module") {
+        return (vec![type_name], false);
+    }
+
+    // No '|' → simple alias (or empty continuation trigger)
+    if !line[i..].contains(&b'|') {
+        let rest_is_blank = line[i..].iter().all(|&b| b == b' ' || b == b'\t');
+        return (vec![type_name], rest_is_blank);
+    }
+
+    // Tag union with '|' — extract variants
+    let mut names = vec![type_name];
+    names.extend(extract_variants(line, &mut i));
+    (names, line_continues(line, len))
+}
+
+/// Extract `|`-separated variant identifiers starting at `*i`.
+fn extract_variants(line: &[u8], i: &mut usize) -> Vec<Vec<u8>> {
+    let len = line.len();
+    let mut names = Vec::new();
+    loop {
+        while *i < len && (line[*i] == b' ' || line[*i] == b'\t' || line[*i] == b'|') {
+            *i += 1;
+        }
+        if *i >= len || !(line[*i].is_ascii_alphabetic() || line[*i] == b'_') {
+            break;
+        }
+        let vstart = *i;
+        *i += 1;
+        while *i < len && (line[*i].is_ascii_alphanumeric() || line[*i] == b'_') {
+            *i += 1;
+        }
+        names.push(line[vstart..*i].to_vec());
+        // Skip optional (payload) parens
+        if *i < len && line[*i] == b'(' {
+            let mut depth = 1u32;
+            *i += 1;
+            while *i < len && depth > 0 {
+                match line[*i] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                *i += 1;
+            }
+        }
+    }
+    names
+}
+
+/// True when the last non-whitespace byte on the line is `|`.
+fn line_continues(line: &[u8], len: usize) -> bool {
+    let mut j = len;
+    while j > 0 && (line[j - 1] == b' ' || line[j - 1] == b'\t') {
+        j -= 1;
+    }
+    j > 0 && line[j - 1] == b'|'
+}
+
+/// Full-file scan for `type` declarations.  Used by tests only; the renderer
+/// calls `scan_type_line` per-line directly.
+#[cfg(test)]
+pub fn collect_user_types(buf: &buffer::GapBuffer) -> Vec<Vec<u8>> {
+    let mut all = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut line_buf = Vec::new();
+    let mut in_continuation = false;
+    for line_idx in 0..buf.line_count() {
+        buf.line_text_into(line_idx, &mut line_buf);
+        let (names, continues) = scan_type_line(&line_buf, in_continuation);
+        for name in names {
+            if seen.insert(name.clone()) {
+                all.push(name);
+            }
+        }
+        in_continuation = continues;
+    }
+    all
+}
+
 /// Look up syntax rules for a language name (from `language::Language::name`).
 pub fn rules_for_language(name: &str) -> Option<&'static SyntaxRules> {
     match name {
@@ -2114,6 +2350,7 @@ pub fn rules_for_language(name: &str) -> Option<&'static SyntaxRules> {
         "Dockerfile" => Some(&DOCKERFILE_RULES),
         "Markdown" => Some(&MARKDOWN_RULES),
         "Config" => Some(&INI_RULES),
+        "XSH" => Some(&XSH_RULES),
         _ => None,
     }
 }
@@ -3336,6 +3573,7 @@ mod tests {
             "Makefile",
             "Dockerfile",
             "Config",
+            "XSH",
         ];
         for lang in languages {
             let rules = rules_for_language(lang).unwrap();
@@ -3378,5 +3616,308 @@ mod tests {
         // The colon inside quotes should not split key/value
         // The actual key ends at the colon after the closing quote
         assert_eq!(hl[0], HlType::Keyword);
+    }
+
+    // -- XSH -----------------------------------------------------------------
+
+    #[test]
+    fn test_xsh_keyword() {
+        let hl = hl_types(b"let x = 1", &XSH_RULES);
+        assert_eq!(hl[0], HlType::Keyword);
+        assert_eq!(hl[1], HlType::Keyword);
+        assert_eq!(hl[2], HlType::Keyword);
+    }
+
+    #[test]
+    fn test_xsh_comment() {
+        let hl = hl_types(b"# a comment", &XSH_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::Comment));
+    }
+
+    #[test]
+    fn test_xsh_string() {
+        let hl = hl_types(b"let s = \"hello\";", &XSH_RULES);
+        assert_eq!(hl[8], HlType::String); // "
+        assert_eq!(hl[9], HlType::String); // h
+        assert_eq!(hl[14], HlType::String); // closing "
+    }
+
+    #[test]
+    fn test_xsh_prefixed_strings() {
+        // bytes literal
+        let hl = hl_types(b"b\"data\"", &XSH_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::String));
+
+        // path literal
+        let hl = hl_types(b"p\"/usr/bin\"", &XSH_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::String));
+
+        // format string
+        let hl = hl_types(b"f\"hello ${name}\"", &XSH_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::String));
+
+        // raw string
+        let hl = hl_types(b"r\"raw\\n\"", &XSH_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::String));
+
+        // glob literal
+        let hl = hl_types(b"g\"*.rs\"", &XSH_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::String));
+
+        // formatted path
+        let hl = hl_types(b"fp\"${root}/child\"", &XSH_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::String));
+    }
+
+    #[test]
+    fn test_xsh_triple_quoted() {
+        let hl = hl_types(b"\"\"\"multi\nline\"\"\"", &XSH_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::String));
+    }
+
+    #[test]
+    fn test_xsh_type() {
+        let hl = hl_types(b"Result[Int]", &XSH_RULES);
+        assert_eq!(hl[0], HlType::Type); // R
+        assert_eq!(hl[5], HlType::Type); // t
+    }
+
+    #[test]
+    fn test_xsh_operator() {
+        let hl = hl_types(b"x ?? y", &XSH_RULES);
+        assert_eq!(hl[2], HlType::Operator);
+        assert_eq!(hl[3], HlType::Operator);
+
+        let hl = hl_types(b"a |> b", &XSH_RULES);
+        assert_eq!(hl[2], HlType::Operator);
+        assert_eq!(hl[3], HlType::Operator);
+
+        let hl = hl_types(b"x?.y", &XSH_RULES);
+        assert_eq!(hl[1], HlType::Operator);
+        assert_eq!(hl[2], HlType::Operator);
+    }
+
+    #[test]
+    fn test_xsh_number() {
+        let hl = hl_types(b"let x = 42;", &XSH_RULES);
+        assert_eq!(hl[8], HlType::Number);
+        assert_eq!(hl[9], HlType::Number);
+
+        // octal
+        let hl = hl_types(b"0o755", &XSH_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::Number));
+
+        // float
+        let hl = hl_types(b"3.14", &XSH_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::Number));
+
+        // duration
+        let hl = hl_types(b"100ms", &XSH_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::Number));
+    }
+
+    #[test]
+    fn test_xsh_function_call() {
+        let hl = hl_types(b"my_func(\"hi\")", &XSH_RULES);
+        assert_eq!(hl[0], HlType::Function); // m
+        assert_eq!(hl[6], HlType::Function); // c
+        assert_eq!(hl[7], HlType::Bracket); // (
+    }
+
+    #[test]
+    fn test_xsh_stdlib_purple() {
+        // stdlib names are Macro (bold magenta / purple)
+        let hl = hl_types(b"print(\"hi\")", &XSH_RULES);
+        assert_eq!(hl[0], HlType::Macro); // p
+        assert_eq!(hl[4], HlType::Macro); // t
+
+        let hl = hl_types(b"fs.mkdir(\"dir\")", &XSH_RULES);
+        assert_eq!(hl[0], HlType::Macro); // f
+        assert_eq!(hl[1], HlType::Macro); // s
+
+        let hl = hl_types(b"abort(1)", &XSH_RULES);
+        assert_eq!(hl[0], HlType::Macro);
+    }
+
+    #[test]
+    fn test_xsh_multiline_string_state() {
+        let (hl, state) = highlight_line(b"\"\"\"hello", HlState::Normal, &XSH_RULES);
+        assert!(hl.iter().all(|&h| h == HlType::String));
+        assert!(matches!(state, HlState::MultiLineString(_)));
+    }
+
+    #[test]
+    fn test_xsh_proc_definition() {
+        let hl = hl_types(b"proc build() [fs] -> Result[Unit] {", &XSH_RULES);
+        assert_eq!(hl[0], HlType::Keyword); // proc
+        assert_eq!(hl[5], HlType::Function); // build
+    }
+
+    #[test]
+    fn test_xsh_user_type_highlight() {
+        let user = vec![b"MyType".to_vec(), b"MyVariant".to_vec()];
+        let rules = &XSH_RULES;
+
+        // Simple alias
+        let hl = highlight_line(b"let x: MyType = 1", HlState::Normal, rules).0;
+        assert_eq!(hl[8], HlType::Normal); // MyType not highlighted without user_types
+
+        let mut out = Vec::new();
+        highlight_line_into(
+            b"let x: MyType = 1",
+            HlState::Normal,
+            rules,
+            &user,
+            &mut out,
+        );
+        assert_eq!(out[8], HlType::Type); // M
+        assert_eq!(out[12], HlType::Type); // e
+
+        // Tag variant
+        let mut out = Vec::new();
+        highlight_line_into(
+            b"match x { MyVariant => 1 }",
+            HlState::Normal,
+            rules,
+            &user,
+            &mut out,
+        );
+        assert_eq!(out[10], HlType::Type); // M
+        assert_eq!(out[18], HlType::Type); // t
+    }
+
+    #[test]
+    fn test_collect_user_types_simple_alias() {
+        let buf = crate::buffer::GapBuffer::from_vec(b"type Foo = Bar\n".to_vec());
+        let types = collect_user_types(&buf);
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0], b"Foo");
+    }
+
+    #[test]
+    fn test_collect_user_types_tag_union() {
+        let buf =
+            crate::buffer::GapBuffer::from_vec(b"type Level = Info | Warn | Error(Str)\n".to_vec());
+        let types = collect_user_types(&buf);
+        assert_eq!(types.len(), 4); // Level, Info, Warn, Error
+        assert_eq!(types[0], b"Level");
+        assert_eq!(types[1], b"Info");
+        assert_eq!(types[2], b"Warn");
+        assert_eq!(types[3], b"Error");
+    }
+
+    #[test]
+    fn test_collect_user_types_record_schema() {
+        let buf = crate::buffer::GapBuffer::from_vec(
+            b"type Config = { name: Str, version: Int }\n".to_vec(),
+        );
+        let types = collect_user_types(&buf);
+        assert_eq!(types.len(), 1); // only Config, no variants
+        assert_eq!(types[0], b"Config");
+    }
+
+    #[test]
+    fn test_collect_user_types_module_contract() {
+        let buf = crate::buffer::GapBuffer::from_vec(
+            b"type Plugin = module { export let name: Str }\n".to_vec(),
+        );
+        let types = collect_user_types(&buf);
+        assert_eq!(types.len(), 1); // only Plugin
+        assert_eq!(types[0], b"Plugin");
+    }
+
+    #[test]
+    fn test_collect_user_types_multiple() {
+        let buf = crate::buffer::GapBuffer::from_vec(
+            b"type Foo = A | B\ntype Bar = { x: Int }\n".to_vec(),
+        );
+        let types = collect_user_types(&buf);
+        assert_eq!(types.len(), 4); // Foo, A, B, Bar
+        assert!(types.contains(&b"Foo".to_vec()));
+        assert!(types.contains(&b"A".to_vec()));
+        assert!(types.contains(&b"B".to_vec()));
+        assert!(types.contains(&b"Bar".to_vec()));
+    }
+
+    // -- Multi-line tag unions -----------------------------------------------
+
+    #[test]
+    fn test_collect_multiline_bare_equals() {
+        // type Foo =\n  | A\n  | B(Str)\n  | C
+        let buf =
+            crate::buffer::GapBuffer::from_vec(b"type Foo =\n  | A\n  | B(Str)\n  | C\n".to_vec());
+        let types = collect_user_types(&buf);
+        assert!(types.contains(&b"Foo".to_vec()));
+        assert!(types.contains(&b"A".to_vec()));
+        assert!(types.contains(&b"B".to_vec()));
+        assert!(types.contains(&b"C".to_vec()));
+    }
+
+    #[test]
+    fn test_collect_multiline_trailing_pipe() {
+        // type Foo = A |\n  | B |\n  | C   (trailing pipe triggers continuation,
+        // subsequent lines use leading |)
+        let buf = crate::buffer::GapBuffer::from_vec(b"type Foo = A |\n  | B |\n  | C\n".to_vec());
+        let types = collect_user_types(&buf);
+        assert!(types.contains(&b"Foo".to_vec()));
+        assert!(types.contains(&b"A".to_vec()));
+        assert!(types.contains(&b"B".to_vec()));
+        assert!(types.contains(&b"C".to_vec()));
+    }
+
+    #[test]
+    fn test_scan_type_line_unit() {
+        // Not a type declaration
+        let (names, cont) = scan_type_line(b"let x = 1", false);
+        assert!(names.is_empty());
+        assert!(!cont);
+
+        // Simple alias
+        let (names, cont) = scan_type_line(b"type Foo = Bar", false);
+        assert_eq!(names, vec![b"Foo".to_vec()]);
+        assert!(!cont);
+
+        // Bare = continuation trigger
+        let (names, cont) = scan_type_line(b"type Foo =", false);
+        assert_eq!(names, vec![b"Foo".to_vec()]);
+        assert!(cont);
+
+        // Continuation line with variants (always continues when leading |)
+        let (names, cont) = scan_type_line(b"  | A | B", true);
+        assert_eq!(names, vec![b"A".to_vec(), b"B".to_vec()]);
+        assert!(cont);
+
+        // Continuation line ending with pipe
+        let (names, cont) = scan_type_line(b"  | A |", true);
+        assert_eq!(names, vec![b"A".to_vec()]);
+        assert!(cont);
+
+        // Continuation line without leading '|' — falls through, no type keyword
+        let (names, cont) = scan_type_line(b"  something", true);
+        assert!(names.is_empty());
+        assert!(!cont);
+
+        // Record schema
+        let (names, cont) = scan_type_line(b"type Config = { x: Int }", false);
+        assert_eq!(names, vec![b"Config".to_vec()]);
+        assert!(!cont);
+    }
+
+    /// Regression: a freshly loaded buffer has `take_dirty_line() == usize::MAX`.
+    /// The renderer must still discover user types on first render despite this.
+    #[test]
+    fn test_user_types_found_on_fresh_buffer() {
+        let mut buf = crate::buffer::GapBuffer::from_vec(
+            b"type Stats = {blanks: Int, code: Int}\ntype FileReport = {stats: Stats, name: Str}\n"
+                .to_vec(),
+        );
+        // Fresh buffer reports no dirty line — the exact scenario that caused
+        // the initial-load miss before the fix.
+        assert_eq!(buf.take_dirty_line(), usize::MAX);
+
+        // collect_user_types scans the full file and must still find them.
+        let types = collect_user_types(&buf);
+        assert!(types.contains(&b"Stats".to_vec()));
+        assert!(types.contains(&b"FileReport".to_vec()));
     }
 }

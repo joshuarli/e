@@ -286,7 +286,7 @@ fn bench_highlight(c: &mut Criterion) {
             b.iter(|| {
                 let mut state = HlState::default();
                 for line in data.split(|&b| b == b'\n') {
-                    state = highlight::highlight_line_into(line, state, rules, &mut out);
+                    state = highlight::highlight_line_into(line, state, rules, &[], &mut out);
                     black_box(&out);
                 }
             });
@@ -461,7 +461,7 @@ fn bench_alloc_counts(c: &mut Criterion) {
         let stats = measure_allocs(|| {
             let mut state = HlState::default();
             for line in data.split(|&byte| byte == b'\n') {
-                state = highlight::highlight_line_into(line, state, rules, &mut out);
+                state = highlight::highlight_line_into(line, state, rules, &[], &mut out);
             }
         });
         eprintln!("  [alloc] highlight_1k_into:         {stats}");
@@ -516,7 +516,7 @@ fn bench_alloc_counts(c: &mut Criterion) {
         b.iter(|| {
             let mut state = HlState::default();
             for line in data.split(|&byte| byte == b'\n') {
-                state = highlight::highlight_line_into(line, state, rules, &mut out);
+                state = highlight::highlight_line_into(line, state, rules, &[], &mut out);
             }
             black_box(&out);
         });
@@ -603,6 +603,8 @@ fn bench_render(c: &mut Criterion) {
                 " e v0.1.5 ",
                 None,
                 None,
+                &[],
+                &[],
                 None,
                 None,
                 &[],
@@ -634,6 +636,8 @@ fn bench_render(c: &mut Criterion) {
                 " e v0.1.5 ",
                 None,
                 None,
+                &[],
+                &[],
                 None,
                 None,
                 &[],
@@ -669,6 +673,8 @@ fn bench_render(c: &mut Criterion) {
                 " e v0.1.5 ",
                 None,
                 Some(sel),
+                &[],
+                &[],
                 None,
                 None,
                 &[],
@@ -700,6 +706,8 @@ fn bench_render(c: &mut Criterion) {
                 " e v0.1.5 ",
                 None,
                 None,
+                &[],
+                &[],
                 None,
                 None,
                 &[],
@@ -730,6 +738,8 @@ fn bench_render(c: &mut Criterion) {
             " e v0.1.5 ",
             None,
             None,
+            &[],
+            &[],
             None,
             None,
             &[],
@@ -752,6 +762,8 @@ fn bench_render(c: &mut Criterion) {
                 " e v0.1.5 ",
                 None,
                 None,
+                &[],
+                &[],
                 None,
                 None,
                 &[],
@@ -781,6 +793,8 @@ fn bench_render(c: &mut Criterion) {
             " e v0.1.5 ",
             None,
             None,
+            &[],
+            &[],
             None,
             None,
             &[],
@@ -809,6 +823,8 @@ fn bench_render(c: &mut Criterion) {
                 " e v0.1.5 ",
                 None,
                 None,
+                &[],
+                &[],
                 None,
                 None,
                 &[],
@@ -838,6 +854,8 @@ fn bench_render(c: &mut Criterion) {
             " e v0.1.5 ",
             None,
             None,
+            &[],
+            &[],
             None,
             None,
             &[],
@@ -862,6 +880,8 @@ fn bench_render(c: &mut Criterion) {
                 " e v0.1.5 ",
                 None,
                 None,
+                &[],
+                &[],
                 None,
                 None,
                 &[],
@@ -882,6 +902,8 @@ fn bench_render(c: &mut Criterion) {
                 " e v0.1.5 ",
                 None,
                 None,
+                &[],
+                &[],
                 None,
                 None,
                 &[],
@@ -911,6 +933,8 @@ fn bench_render(c: &mut Criterion) {
             " e v0.1.5 ",
             None,
             None,
+            &[],
+            &[],
             None,
             None,
             &[],
@@ -941,6 +965,8 @@ fn bench_render(c: &mut Criterion) {
                 " e v0.1.5 ",
                 None,
                 None,
+                &[],
+                &[],
                 None,
                 None,
                 &[],
@@ -966,6 +992,8 @@ fn bench_render(c: &mut Criterion) {
             " e v0.1.5 ",
             None,
             None,
+            &[],
+            &[],
             None,
             None,
             &[],
@@ -989,6 +1017,8 @@ fn bench_render(c: &mut Criterion) {
             " e v0.1.5 ",
             None,
             None,
+            &[],
+            &[],
             None,
             None,
             &[],
@@ -1014,6 +1044,8 @@ fn bench_render(c: &mut Criterion) {
             " e v0.1.5 ",
             None,
             None,
+            &[],
+            &[],
             None,
             None,
             &[],
