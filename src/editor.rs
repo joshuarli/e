@@ -1037,6 +1037,7 @@ impl Editor {
                     self.cmd_buf
                         .open(CommandBufferMode::Find, "find: ", &prefill);
                     self.find.clear();
+                    self.find.search_start = self.cursor();
                 }
                 EditorAction::CtrlBackspace => self.ctrl_backspace(),
                 EditorAction::ToggleComment => self.toggle_comment(),
@@ -1242,7 +1243,10 @@ impl Editor {
             } => {
                 self.replace_all(&pattern, &replacement);
             }
-            CommandAction::Find(pattern) => self.find_next_from_submit(&pattern),
+            CommandAction::Find(pattern) => {
+                self.find.search_start = self.cursor();
+                self.find_next_from_submit(&pattern);
+            }
             CommandAction::ToggleComment => self.toggle_comment(),
             CommandAction::CommentOn => self.set_comment(true),
             CommandAction::CommentOff => self.set_comment(false),
