@@ -15,7 +15,7 @@ test:
 	cargo test --quiet
 
 test-ci:
-	cargo test --quiet --release
+	cargo test --quiet --release -- --test-threads=1
 
 release:
 	cargo clean -p $(NAME) --release --target $(TARGET)
