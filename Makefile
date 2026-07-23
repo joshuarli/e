@@ -4,14 +4,16 @@ LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(TARGET)/bin
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 
-.PHONY: setup build release release-pgo pgo-profile bench-pgo install test test-ci record gifs pc bump-version
-
-setup:
-	rustup show active-toolchain
-	prek install --install-hooks
+.PHONY: build release release-pgo pgo-profile bench-pgo install test test-ci record gifs
 
 build:
 	cargo build
+
+test:
+	cargo test --quiet
+
+test-ci:
+	cargo test --quiet --release
 
 release:
 	cargo clean -p $(NAME) --release --target $(TARGET)
@@ -20,6 +22,10 @@ release:
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
+
+lint:
+	cargo fmt --all
+	cargo clippy --fix --allow-dirty --all-targets --all-features -- --deny warnings
 
 # Collect PGO profiles from benchmarks — only re-run when hot paths change.
 # No build-std or -Cpanic=immediate-abort here: the profiler runtime needs unwinding.
@@ -52,13 +58,6 @@ install: release-pgo
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
 	codesign -fs - ~/usr/bin/$(NAME)
 
-test:
-	@OUT=$$(cargo test --quiet -- --test-threads=32 2>&1) || { echo "$$OUT"; exit 1; }
-
-# So we don't do duplicate work (building both debug and release) in CI.
-test-ci:
-	@OUT=$$(cargo test --quiet --release -- --test-threads=32 2>&1) || { echo "$$OUT"; exit 1; }
-
 # Record e2e tests as asciicast .cast files (single-threaded for clean capture)
 record:
 	rm -rf tests/e2e/recordings/*.cast tests/e2e/recordings/*.gif
@@ -71,18 +70,3 @@ gifs:
 	done
 	@echo "$$(ls tests/e2e/recordings/*.gif | wc -l | tr -d ' ') GIFs ??? tests/e2e/recordings/"
 
-pc:
-	prek --quiet run --all-files
-
-# Usage: make bump-version [V=x.y.z]
-# Without V, increments the patch version.
-bump-version:
-ifndef V
-	$(eval OLD := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml))
-	$(eval V := $(shell echo "$(OLD)" | awk -F. '{printf "%d.%d.%d", $$1, $$2, $$3+1}'))
-endif
-	sed -i '' 's/^version = ".*"/version = "$(V)"/' Cargo.toml
-	cargo check --quiet 2>/dev/null
-	git add Cargo.toml Cargo.lock
-	git commit -m "bump version to $(V)"
-	git tag "release/$(V)"

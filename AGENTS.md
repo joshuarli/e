@@ -1054,7 +1054,7 @@ Dark grey background (`\x1b[0;100m`). Full width.
 
 ## 21. Testing
 
-- Run: `cargo clippy && cargo test`
+- Run: `make test`
 - All modules have inline `#[cfg(test)] mod tests`.
 - Test helper: `ed("text")` / `ed_named("text", "file.rs")` creates an 80x24 Editor with internal-only clipboard, no disk I/O, default keybindings.
 - Integration tests use `std::env::temp_dir()` for file I/O, clean up with `remove_dir_all`.
