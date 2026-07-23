@@ -2,22 +2,69 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn sigwinch_handler(_: libc::c_int) {
+#[cfg(target_os = "macos")]
+extern "C" fn sigwinch_handler(_: core::ffi::c_int) {
+    SIGWINCH_RECEIVED.store(true, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn sigwinch_handler(_: core::ffi::c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::Relaxed);
 }
 
 pub fn register_sigwinch() {
-    // SAFETY: `sigaction` struct is zeroed (valid for this POD type), then populated with:
-    // - `sa_sigaction`: a valid `extern "C" fn(c_int)` cast to `sighandler_t`. The handler
-    //   only writes to an `AtomicBool`, which is async-signal-safe.
-    // - `sa_flags`: SA_RESTART so interrupted syscalls are transparently restarted.
-    // - `sa_mask`: zeroed, meaning no additional signals are blocked during the handler.
-    // The old action is discarded (null_mut) since we never need to restore it.
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sigwinch_handler as *const () as libc::sighandler_t;
-        sa.sa_flags = libc::SA_RESTART;
-        libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::runtime::{
+            KernelSigSet, KernelSigaction, KernelSigactionFlags, kernel_sigaction,
+        };
+        use rustix::signal::Signal;
+
+        // SAFETY: The handler only writes to an `AtomicBool`, which is async-signal-safe.
+        // The action uses an empty signal mask and requests SA_RESTART, matching the previous
+        // libc implementation. `kernel_sigaction` is unsafe because signal handlers are
+        // inherently unsafe and its caller must uphold the platform ABI requirements.
+        unsafe {
+            let action = KernelSigaction {
+                sa_handler_kernel: Some(sigwinch_handler),
+                sa_flags: KernelSigactionFlags::RESTART,
+                sa_restorer: None,
+                sa_mask: KernelSigSet::empty(),
+            };
+            let _ = kernel_sigaction(Signal::WINCH, Some(action));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        struct MacSigaction {
+            sa_sigaction: usize,
+            sa_mask: u32,
+            sa_flags: core::ffi::c_int,
+        }
+
+        unsafe extern "C" {
+            fn sigaction(
+                signal: core::ffi::c_int,
+                action: *const MacSigaction,
+                old_action: *mut MacSigaction,
+            ) -> core::ffi::c_int;
+        }
+
+        // SAFETY: The Darwin `sigaction` ABI uses a function pointer, 32-bit signal mask, and
+        // integer flags in this order. The handler is a valid C ABI function, the mask is empty,
+        // and the old action is not needed. These definitions are kept local because rustix's
+        // signal-installation runtime API is Linux-only and libc is intentionally not a
+        // dependency of this crate.
+        unsafe {
+            let action = MacSigaction {
+                sa_sigaction: sigwinch_handler as *const () as usize,
+                sa_mask: 0,
+                sa_flags: 0x0002,
+            };
+            let _ = sigaction(28, &action, core::ptr::null_mut());
+        }
     }
 }
 

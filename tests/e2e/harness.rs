@@ -8,6 +8,43 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+type CInt = i32;
+
+#[repr(C)]
+struct WinSize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+#[cfg_attr(target_os = "linux", link(name = "util"))]
+unsafe extern "C" {
+    fn openpty(
+        master: *mut CInt,
+        slave: *mut CInt,
+        name: *mut u8,
+        termp: *const u8,
+        winp: *const WinSize,
+    ) -> CInt;
+    fn ioctl(fd: CInt, request: usize, ...) -> CInt;
+    fn dup(fd: CInt) -> CInt;
+    fn fcntl(fd: CInt, command: CInt, argument: CInt) -> CInt;
+    fn setsid() -> CInt;
+    fn close(fd: CInt) -> CInt;
+}
+
+#[cfg(target_os = "linux")]
+const TIOCSWINSZ: usize = 0x5414;
+#[cfg(target_os = "macos")]
+const TIOCSWINSZ: usize = 0x8008_7467;
+#[cfg(target_os = "linux")]
+const TIOCSCTTY: usize = 0x540e;
+#[cfg(target_os = "macos")]
+const TIOCSCTTY: usize = 0x2000_7461;
+const F_SETFD: CInt = 2;
+const FD_CLOEXEC: CInt = 1;
+
 // ---------------------------------------------------------------------------
 // Key — escape sequences for special keys
 // ---------------------------------------------------------------------------
@@ -208,41 +245,41 @@ impl TestEditor {
     pub fn with_size(args: &[&str], rows: u16, cols: u16) -> Self {
         let home = TempDir::new();
 
-        // --- open PTY pair ---
+        // Open a PTY pair.
         let (master_fd, slave_fd) = unsafe {
-            let mut m: libc::c_int = 0;
-            let mut s: libc::c_int = 0;
+            let mut m: CInt = 0;
+            let mut s: CInt = 0;
             assert_eq!(
-                libc::openpty(
+                openpty(
                     &mut m,
                     &mut s,
                     std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
                 ),
                 0,
                 "openpty failed: {}",
                 std::io::Error::last_os_error()
             );
-            let ws = libc::winsize {
+            let ws = WinSize {
                 ws_row: rows,
                 ws_col: cols,
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             };
-            libc::ioctl(m, libc::TIOCSWINSZ as _, &ws);
+            ioctl(m, TIOCSWINSZ, &ws);
             (m, s)
         };
 
         // Dup master for the reader thread; set CLOEXEC on both.
-        let reader_fd = unsafe { libc::dup(master_fd) };
+        let reader_fd = unsafe { dup(master_fd) };
         assert!(reader_fd >= 0, "dup master failed");
         unsafe {
-            libc::fcntl(master_fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(reader_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            fcntl(master_fd, F_SETFD, FD_CLOEXEC);
+            fcntl(reader_fd, F_SETFD, FD_CLOEXEC);
         }
 
-        // --- spawn the editor ---
+        // Spawn the editor.
         let binary = env!("CARGO_BIN_EXE_e");
         let child = unsafe {
             Command::new(binary)
@@ -256,13 +293,13 @@ impl TestEditor {
                 .env("PATH", home.path())
                 .env_remove("WAYLAND_DISPLAY")
                 .env_remove("DISPLAY")
-                .stdin(Stdio::from_raw_fd(libc::dup(slave_fd)))
-                .stdout(Stdio::from_raw_fd(libc::dup(slave_fd)))
-                .stderr(Stdio::from_raw_fd(libc::dup(slave_fd)))
+                .stdin(Stdio::from_raw_fd(dup(slave_fd)))
+                .stdout(Stdio::from_raw_fd(dup(slave_fd)))
+                .stderr(Stdio::from_raw_fd(dup(slave_fd)))
                 .pre_exec(move || {
-                    libc::setsid();
-                    libc::ioctl(0, libc::TIOCSCTTY as _, 0);
-                    libc::close(slave_fd);
+                    setsid();
+                    ioctl(0, TIOCSCTTY, 0);
+                    close(slave_fd);
                     Ok(())
                 })
                 .spawn()
@@ -270,7 +307,7 @@ impl TestEditor {
         };
         // Close slave in parent.
         unsafe {
-            libc::close(slave_fd);
+            close(slave_fd);
         }
 
         let master = unsafe { std::fs::File::from_raw_fd(master_fd) };

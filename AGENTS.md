@@ -5,7 +5,7 @@ A performant, minimalist, intuitive terminal text editor in Rust.
 ## 1. Constraints
 
 - Rust 2024 edition
-- 3 dependencies: `termion` (4), `regex-lite` (0.1), `libc` (0.2, signal handling only)
+- 3 runtime dependencies: `termion` (4), `regex-lite` (0.1), `rustix` (1.1.4, `runtime` feature)
 - Single-file editing only — no tabs, no file browser, no split panes
 - macOS and Linux only (no Windows)
 - Binary name: `e`, package version: `0.1.0`
@@ -46,7 +46,8 @@ src/
   file_io.rs         File read/write, CRLF normalization, binary detection, file locking (std::fs),
                      persistent undo (~/.config/e/undo.bin), cursor persistence (~/.config/e/cursor.bin)
   language.rs        Language detection by file extension (~45 languages), comment syntax
-  signal.rs          SIGWINCH handler via libc::sigaction + AtomicBool polling (sole unsafe block)
+  signal.rs          SIGWINCH handler via rustix on Linux and minimal Darwin FFI on macOS,
+                     with AtomicBool polling
   highlight.rs       Syntax highlighting: byte-by-byte highlighter, 16 language rule sets,
                      bracket/quote matching, semver detection, function/constant/macro detection
 ```
@@ -971,7 +972,8 @@ For each entry:
 
 Static `AtomicBool` (`SIGWINCH_RECEIVED`).
 
-- `register_sigwinch()`: installs `sigwinch_handler` via `libc::sigaction` with `SA_RESTART` flag.
+- `register_sigwinch()`: installs `sigwinch_handler` via rustix's `kernel_sigaction` with
+  `SA_RESTART` on Linux; uses a minimal local Darwin `sigaction` ABI declaration on macOS.
 - `sigwinch_handler(_: c_int)`: stores `true` to atomic bool with `Relaxed` ordering.
 - `take_sigwinch() -> bool`: atomically swaps flag to `false`, returns previous value.
 

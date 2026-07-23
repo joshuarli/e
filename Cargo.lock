@@ -204,9 +204,9 @@ name = "e"
 version = "0.1.13"
 dependencies = [
  "criterion",
- "libc",
  "proptest",
  "regex-lite",
+ "rustix",
  "termion",
  "vt100",
 ]
