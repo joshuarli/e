@@ -22,12 +22,9 @@ debug = 0
 strip = "debuginfo"
 
 [profile.release]
-lto = "thin"
-opt-level = 3
-panic = "abort"
-
-[profile.dist]
-inherits = "release"
 lto = "fat"
+opt-level = 3
 codegen-units = 1
+panic = "abort"
 strip = true
+
