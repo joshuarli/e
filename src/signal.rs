@@ -15,10 +15,10 @@ unsafe extern "C" fn sigwinch_handler(_: core::ffi::c_int) {
 pub fn register_sigwinch() {
     #[cfg(target_os = "linux")]
     {
+        use rustix::runtime::Signal;
         use rustix::runtime::{
             KernelSigSet, KernelSigaction, KernelSigactionFlags, kernel_sigaction,
         };
-        use rustix::signal::Signal;
 
         // SAFETY: The handler only writes to an `AtomicBool`, which is async-signal-safe.
         // The action uses an empty signal mask and requests SA_RESTART, matching the previous
