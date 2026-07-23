@@ -49,6 +49,8 @@ ENV PATH="/opt/llvm-musl/bin:/root/.cargo/bin:$PATH" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="rust-lld" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="rust-lld"
 
+RUN llvm-strip --strip-debug /usr/lib/libc.a
+
 RUN rustup toolchain install nightly-2026-04-20 \
     --target x86_64-unknown-linux-musl \
     --target aarch64-unknown-linux-musl \
