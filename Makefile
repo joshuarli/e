@@ -3,6 +3,8 @@ HOST       := $(shell rustc -vV | awk '/^host:/ {print $$2}')
 TARGET     ?= $(subst -unknown-linux-gnu,-unknown-linux-musl,$(HOST))
 MUSL_LOADER := $(if $(findstring x86_64,$(TARGET)),/lib/ld-musl-x86_64.so.1,/lib/ld-musl-aarch64.so.1)
 MUSL_NATIVE_RUSTFLAGS := $(if $(findstring -linux-musl,$(TARGET)),-L native=/usr/lib)
+TARGET_ENV := $(shell echo $(TARGET) | tr '[:lower:]-' '[:upper:]_')
+MUSL_CRT_DIR := /usr/lib/e-crt/$(TARGET)
 LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(TARGET)/bin
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
@@ -28,7 +30,8 @@ release:
 
 release-dynamic:
 	cargo clean -p $(NAME) --release --target $(TARGET)
-	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort -Ctarget-feature=-crt-static -Clink-arg=-dynamic-linker=$(MUSL_LOADER)" \
+	CARGO_TARGET_$(TARGET_ENV)_LINKER=clang \
+	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER)" \
 	cargo build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \

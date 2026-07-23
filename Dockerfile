@@ -30,6 +30,14 @@ RUN case "$TARGETARCH" in \
     && tar xf "$archive" -C /opt/llvm-musl --strip-components=1 \
     && rm /tmp/llvm-x86_64.tar.xz /tmp/llvm-aarch64.tar.xz
 
+RUN for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do \
+        stub_dir="/usr/lib/e-crt/$target"; \
+        mkdir -p "$stub_dir"; \
+        for obj in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o; do \
+            /opt/llvm-musl/bin/clang --target="$target" -x c -c /dev/null -o "$stub_dir/$obj"; \
+        done; \
+    done
+
 ADD https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-musl/rustup-init /rustup-init-x86_64
 ADD https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-musl/rustup-init /rustup-init-aarch64
 RUN case "$TARGETARCH" in \
@@ -50,6 +58,7 @@ ENV PATH="/opt/llvm-musl/bin:/root/.cargo/bin:$PATH" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="rust-lld"
 
 RUN llvm-strip --strip-debug /usr/lib/libc.a
+RUN llvm-strip --strip-debug /usr/lib/crt*.o /usr/lib/[S]*.o 2>/dev/null || true
 
 RUN rustup toolchain install nightly-2026-04-20 \
     --target x86_64-unknown-linux-musl \
