@@ -2,6 +2,7 @@ NAME       := e
 HOST       := $(shell rustc -vV | awk '/^host:/ {print $$2}')
 TARGET     ?= $(subst -unknown-linux-gnu,-unknown-linux-musl,$(HOST))
 MUSL_LOADER := $(if $(findstring x86_64,$(TARGET)),/lib/ld-musl-x86_64.so.1,/lib/ld-musl-aarch64.so.1)
+MUSL_NATIVE_RUSTFLAGS := $(if $(findstring -linux-musl,$(TARGET)),-L native=/usr/lib)
 LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(TARGET)/bin
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
@@ -15,11 +16,11 @@ test:
 	cargo test --quiet
 
 test-ci:
-	cargo test --quiet --release -- --test-threads=1
+	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" cargo test --quiet --release -- --test-threads=1
 
 release:
 	cargo clean -p $(NAME) --release --target $(TARGET)
-	RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
+	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
 	cargo build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \
@@ -27,7 +28,7 @@ release:
 
 release-dynamic:
 	cargo clean -p $(NAME) --release --target $(TARGET)
-	RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort -Ctarget-feature=-crt-static -Clink-arg=-dynamic-linker=$(MUSL_LOADER)" \
+	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort -Ctarget-feature=-crt-static -Clink-arg=-dynamic-linker=$(MUSL_LOADER)" \
 	cargo build --release \
 	  -Z build-std=std \
 	  -Z build-std-features= \

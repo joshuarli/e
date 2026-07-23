@@ -12,6 +12,11 @@ RUN apk add --no-cache \
     git \
     tzdata
 
+# rustix requests libutil for Unix PTY support; musl provides those symbols in
+# libc, so an empty archive satisfies the legacy library name without adding a
+# glibc runtime dependency.
+RUN ar rcs /usr/lib/libutil.a
+
 # Use the same prebuilt LLVM family as the Linux CI image. The archive is
 # musl-linked so clang, lld, and the LLVM tools run inside Alpine.
 ADD https://github.com/laputa-systems/llvm-prebuilt-musl/releases/download/llvm-musl-${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-x86_64-linux-musl.tar.xz /tmp/llvm-x86_64.tar.xz
