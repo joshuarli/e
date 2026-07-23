@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -29,30 +30,67 @@ jobs:
           - runner: macos-26
             target: aarch64-apple-darwin
           - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        if: endsWith(matrix.target, '-linux-musl')
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Linux release image
+        if: endsWith(matrix.target, '-linux-musl')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: e-builder:${{ matrix.target }}
+          cache-from: type=gha,scope=e-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=e-${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
+        if: endsWith(matrix.target, '-apple-darwin')
         with:
           key: ${{ matrix.runner }}-${{ matrix.target }}
 
-      - name: Run tests
+      - name: Run macOS tests
+        if: endsWith(matrix.target, '-apple-darwin')
         run: make test-ci
 
-      - name: Build release
+      - name: Build macOS release
+        if: endsWith(matrix.target, '-apple-darwin')
         # release-pgo disabled for now
-        run: make release
+        run: make release TARGET=${{ matrix.target }}
 
-      - run: cp "target/${{ matrix.target }}/release/e" "e-${{ matrix.target }}"
+      - name: Build and verify Linux releases
+        if: endsWith(matrix.target, '-linux-musl')
+        run: |
+          docker run --rm --init \
+            --volume "$GITHUB_WORKSPACE:/e" \
+            --workdir /e \
+            "e-builder:${{ matrix.target }}" \
+            sh -ec '
+              make test-ci
+              make release TARGET=${{ matrix.target }}
+              make verify-release TARGET=${{ matrix.target }}
+              cp "target/${{ matrix.target }}/release/e" "e-${{ matrix.target }}-static"
+              make release-dynamic TARGET=${{ matrix.target }}
+              make verify-release-dynamic TARGET=${{ matrix.target }}
+              cp "target/${{ matrix.target }}/release/e" "e-${{ matrix.target }}"
+            '
+
+      - name: Save macOS release
+        if: endsWith(matrix.target, '-apple-darwin')
+        run: cp "target/${{ matrix.target }}/release/e" "e-${{ matrix.target }}"
 
       - uses: actions/upload-artifact@v4
         with:
           name: e-${{ matrix.target }}
-          path: e-${{ matrix.target }}
+          path: e-*
 
   release:
     name: Create pre-release

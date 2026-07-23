@@ -4,6 +4,9 @@ ARG TARGETARCH
 ARG LLVM_VERSION=22.1.8
 
 RUN apk add --no-cache \
+    binutils \
+    file \
+    make \
     musl-dev \
     libgcc \
     git \
@@ -53,8 +56,3 @@ RUN host_libdir="$(rustc --print target-libdir)" \
     && ln -sf /usr/lib/libgcc_s.so.1 "$host_libdir/libgcc_s.so" \
     && ln -sf /usr/lib/libgcc_s.so.1 "$host_libdir/libgcc_s.so.1" \
     && ln -sf /usr/lib/libc.so "$host_libdir/libc.so"
-
-WORKDIR /e
-COPY . .
-
-CMD ["cargo", "test", "--lib", "--release"]
