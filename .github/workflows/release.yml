@@ -73,13 +73,13 @@ jobs:
             --workdir /e \
             "e-builder:${{ matrix.target }}" \
             sh -ec '
-              make release TARGET=${{ matrix.target }}
-              make verify-release TARGET=${{ matrix.target }}
-              make test-ci TARGET=${{ matrix.target }}
-              cp "target/${{ matrix.target }}/release/e" "e-${{ matrix.target }}-static"
-              make release-dynamic TARGET=${{ matrix.target }}
+              make release-pgo-linux TARGET=${{ matrix.target }}
               make verify-release-dynamic TARGET=${{ matrix.target }}
+              make test-ci TARGET=${{ matrix.target }}
               cp "target/${{ matrix.target }}/release/e" "e-${{ matrix.target }}"
+              make release-pgo-linux-static TARGET=${{ matrix.target }}
+              make verify-release TARGET=${{ matrix.target }}
+              cp "target/${{ matrix.target }}/release/e" "e-${{ matrix.target }}-static"
             '
 
       - name: Save macOS release
