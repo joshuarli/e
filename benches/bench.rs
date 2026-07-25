@@ -14,9 +14,11 @@ use divan::{AllocProfiler, Bencher, black_box};
 static ALLOC: AllocProfiler = AllocProfiler::system();
 
 use e::buffer::GapBuffer;
+use e::command::CommandRegistry;
+use e::command_buffer::{CommandBuffer, CommandBufferMode, CommandBufferResult};
 use e::document::Document;
 use e::find::FindState;
-use e::highlight::{self, HlState, SyntaxRules};
+use e::highlight::{self, SyntaxRules};
 use e::render::Renderer;
 use e::selection::{Pos, Selection};
 use e::view::View;
@@ -93,17 +95,6 @@ fn make_rust_source(n: usize) -> Vec<u8> {
             _ => buf.extend_from_slice(b"    }\n"),
         }
     }
-    buf
-}
-
-fn make_json(n: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(n * 30);
-    buf.extend_from_slice(b"{\n");
-    for i in 0..n.saturating_sub(2) {
-        let comma = if i + 1 < n.saturating_sub(2) { "," } else { "" };
-        buf.extend_from_slice(format!("  \"key_{}\": \"value_{}\" {}\n", i, i, comma).as_bytes());
-    }
-    buf.extend_from_slice(b"}\n");
     buf
 }
 
@@ -184,54 +175,6 @@ fn file_write_1000_lines(bencher: Bencher) {
     });
 }
 
-fn gap_from_vec(b: Bencher, data: &[u8]) {
-    bench_with_syscall_trace(b, || black_box(GapBuffer::from_vec(data.to_vec())));
-}
-
-#[divan::bench]
-fn gap_from_vec_1000_lines(b: Bencher) {
-    gap_from_vec(b, &make_rust_source(1_000));
-}
-
-#[divan::bench]
-fn gap_from_vec_5000_lines(b: Bencher) {
-    gap_from_vec(b, &make_rust_source(5_000));
-}
-
-macro_rules! highlight_benchmarks {
-    ($json_name:ident, $into_name:ident, $size:literal) => {
-        #[divan::bench]
-        fn $json_name(b: Bencher) {
-            let data = make_json($size);
-            let rules = highlight::rules_for_language("JSON").unwrap();
-            bench_with_syscall_trace(b, || {
-                let mut state = HlState::default();
-                for line in data.split(|&byte| byte == b'\n') {
-                    let (highlighted, next) = highlight::highlight_line(line, state, rules);
-                    state = next;
-                    black_box(&highlighted);
-                }
-            });
-        }
-
-        #[divan::bench]
-        fn $into_name(b: Bencher) {
-            let data = make_rust_source($size);
-            let rules = highlight::rules_for_language("Rust").unwrap();
-            let mut output = Vec::new();
-            bench_with_syscall_trace(b, || {
-                let mut state = HlState::default();
-                for line in data.split(|&byte| byte == b'\n') {
-                    state = highlight::highlight_line_into(line, state, rules, &[], &mut output);
-                    black_box(&output);
-                }
-            });
-        }
-    };
-}
-
-highlight_benchmarks!(highlight_json_1000, highlight_rust_into_1000, 1000);
-
 #[divan::bench]
 fn document_insert_10_seal_undo_all(b: Bencher) {
     let data = make_rust_source(500);
@@ -273,6 +216,26 @@ fn edit_and_render_python_10k(b: Bencher) {
     let mut view = View::new(120, 40);
     let cursor = Pos::new(5_000, 12);
     view.scroll_line = cursor.line;
+    let mut sink = Vec::with_capacity(32 * 1024);
+    render_viewport(&mut renderer, &mut doc.buf, &view, cursor, None, &mut sink);
+
+    bench_with_syscall_trace(b, || {
+        let after = doc.insert(cursor.line, cursor.col, b"x");
+        render_viewport(&mut renderer, &mut doc.buf, &view, after, None, &mut sink);
+        doc.undo();
+        black_box((after, sink.len()));
+    });
+}
+
+#[divan::bench]
+fn edit_and_render_python_short(b: Bencher) {
+    let data = make_python_source(40);
+    let rules = highlight::rules_for_language("Python");
+    let mut doc = Document::new(data, Some("fixture.py".to_string()));
+    let mut renderer = Renderer::new();
+    renderer.set_syntax(rules);
+    let view = View::new(120, 40);
+    let cursor = Pos::new(5, 12);
     let mut sink = Vec::with_capacity(32 * 1024);
     render_viewport(&mut renderer, &mut doc.buf, &view, cursor, None, &mut sink);
 
@@ -387,6 +350,24 @@ fn render_viewport(
     selection: Option<Selection>,
     sink: &mut Vec<u8>,
 ) {
+    render_editor_frame(
+        renderer, buffer, view, cursor, selection, None, None, None, false, sink,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_editor_frame(
+    renderer: &mut Renderer,
+    buffer: &mut GapBuffer,
+    view: &View,
+    cursor: Pos,
+    selection: Option<Selection>,
+    command_line: Option<&str>,
+    find_matches: Option<&[(Pos, Pos)]>,
+    find_current: Option<(Pos, Pos)>,
+    find_active: bool,
+    sink: &mut Vec<u8>,
+) {
     sink.clear();
     renderer
         .render(
@@ -398,18 +379,124 @@ fn render_viewport(
             true,
             " fixture.py",
             " e v0.1.13 ",
-            None,
+            command_line,
             selection,
             &[],
             &[],
-            None,
-            None,
+            find_matches,
+            find_current,
             &[],
-            None,
-            false,
+            command_line.map(|line| line.len()),
+            find_active,
             None,
         )
         .unwrap();
+}
+
+#[divan::bench]
+fn command_palette_trace_python_10k(b: Bencher) {
+    let data = make_python_source(10_000);
+    let mut doc = Document::new(data, Some("fixture.py".to_string()));
+    let mut renderer = Renderer::new();
+    renderer.set_syntax(highlight::rules_for_language("Python"));
+    let view = View::new(120, 40);
+    let cursor = Pos::new(5_000, 12);
+    let mut command = CommandBuffer::new();
+    let registry = CommandRegistry::new();
+    let mut sink = Vec::with_capacity(32 * 1024);
+
+    bench_with_syscall_trace(b, || {
+        command.open(CommandBufferMode::Command, "> ", "");
+        for ch in "goto 5000".chars() {
+            let result = command.handle_key(termion::event::Key::Char(ch));
+            if matches!(result, CommandBufferResult::Changed(_)) {
+                let line = command.display_line();
+                render_editor_frame(
+                    &mut renderer,
+                    &mut doc.buf,
+                    &view,
+                    cursor,
+                    None,
+                    Some(&line),
+                    None,
+                    None,
+                    false,
+                    &mut sink,
+                );
+            }
+        }
+        let result = command.handle_key(termion::event::Key::Char('\n'));
+        if let CommandBufferResult::Submit(input) = result {
+            let action = registry.execute(&input);
+            command.close();
+            render_editor_frame(
+                &mut renderer,
+                &mut doc.buf,
+                &view,
+                cursor,
+                None,
+                None,
+                None,
+                None,
+                false,
+                &mut sink,
+            );
+            black_box(action);
+        }
+        black_box((&command, &sink));
+    });
+}
+
+#[divan::bench]
+fn find_command_trace_python_10k(b: Bencher) {
+    let data = make_python_source(10_000);
+    let mut doc = Document::new(data, Some("fixture.py".to_string()));
+    let mut renderer = Renderer::new();
+    renderer.set_syntax(highlight::rules_for_language("Python"));
+    let view = View::new(120, 40);
+    let cursor = Pos::new(5_000, 12);
+    let mut command = CommandBuffer::new();
+    let mut find = FindState::new();
+    let mut sink = Vec::with_capacity(32 * 1024);
+
+    bench_with_syscall_trace(b, || {
+        command.open(CommandBufferMode::Find, "find: ", "");
+        find.clear();
+        for ch in "benchmark_token_123".chars() {
+            let result = command.handle_key(termion::event::Key::Char(ch));
+            if let CommandBufferResult::Changed(pattern) = result {
+                find.update_highlights_lazy(&pattern, &doc.buf, &view);
+                let line = command.display_line();
+                render_editor_frame(
+                    &mut renderer,
+                    &mut doc.buf,
+                    &view,
+                    cursor,
+                    None,
+                    Some(&line),
+                    Some(&find.matches),
+                    find.current,
+                    false,
+                    &mut sink,
+                );
+            }
+        }
+        find.update_highlights(command.input.as_str(), &doc.buf, &view);
+        command.close();
+        render_editor_frame(
+            &mut renderer,
+            &mut doc.buf,
+            &view,
+            cursor,
+            None,
+            None,
+            Some(&find.matches),
+            find.current,
+            true,
+            &mut sink,
+        );
+        black_box((&find, &sink));
+    });
 }
 
 fn render_frame(

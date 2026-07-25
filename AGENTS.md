@@ -1063,7 +1063,7 @@ Dark grey background (`\x1b[0;100m`). Full width.
 - Coverage: `cargo tarpaulin`.
 - Philosophy: prefer integration-style scenario tests over tiny unit tests.
 - **Property tests** (proptest): `buffer::proptests` (7 properties — GapBuffer invariants), `document::proptests` (2 — edit/undo/redo consistency, full-undo restores original), `view::proptests` (4 — wrapped_rows, ensure_cursor_visible, buffer_to_screen, center_on_line no-panic), `selection::proptests` (4 — word boundary bounds, selection ordering, Pos total order).
-- **Benchmarks** (`benches/bench.rs`): Divan benchmarks with allocation profiling for gap-buffer operations, syntax highlighting, document edits, full/incremental rendering, full-scan search misses, and large cursor jumps. Run `make bench` for the host-keyed baseline and allocation deltas, or `cargo bench` for the raw Divan report.
+- **Benchmarks** (`benches/bench.rs`): Divan benchmarks with allocation profiling for file I/O and open/render, document edits, short and large edit/render traces, command-palette and live-find interaction, full/incremental rendering, full-scan search misses, and large cursor jumps. Run `make bench` for the host-keyed baseline and allocation deltas, or `cargo bench` for the raw Divan report.
 
 ## 22. Configuration Paths Summary
 
