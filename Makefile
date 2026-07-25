@@ -9,7 +9,7 @@ LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(TARGET)/bin
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 
-.PHONY: build release release-dynamic verify-release verify-release-dynamic release-pgo pgo-profile bench-pgo install test test-ci record gifs
+.PHONY: build release release-dynamic verify-release verify-release-dynamic bench release-pgo pgo-profile install test test-ci record gifs
 
 build:
 	cargo build
@@ -18,7 +18,7 @@ test:
 	cargo test --quiet
 
 test-ci:
-	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" cargo test --quiet --release -- --test-threads=1
+	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" cargo test --quiet --release
 
 release:
 	cargo clean -p $(NAME) --release --target $(TARGET)
@@ -65,12 +65,15 @@ lint:
 	cargo fmt --all
 	cargo clippy --fix --allow-dirty --all-targets --all-features -- --deny warnings
 
-# Collect PGO profiles from benchmarks — only re-run when hot paths change.
-# No build-std or -Cpanic=immediate-abort here: the profiler runtime needs unwinding.
+bench:
+	scripts/bench-baseline.py
+
+# Collect PGO profiles from the benchmark workload. No build-std or
+# -Cpanic=immediate-abort here: the profiler runtime needs unwinding.
 pgo-profile:
 	rm -rf $(PGO_DIR) && mkdir -p $(PGO_DIR)
 	RUSTFLAGS="-Cprofile-generate=$(PGO_DIR)" \
-	cargo bench --bench bench -- --profile-time 1 "highlight|search|document|render|viewport"
+	cargo bench --bench bench
 	$(LLVM_BIN)/llvm-profdata merge -o $(PGO_MERGED) $(PGO_DIR)
 
 # PGO-optimized release: uses gathered profiles + all aggressive flags.
@@ -81,13 +84,6 @@ release-pgo: $(PGO_MERGED)
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
-
-# Benchmark regular release vs PGO. Requires: critcmp (cargo install critcmp)
-bench-pgo: $(PGO_MERGED)
-	cargo bench --bench bench -- --save-baseline regular 2>/dev/null
-	RUSTFLAGS="-Cprofile-use=$(PGO_MERGED)" \
-	cargo bench --bench bench -- --save-baseline pgo 2>/dev/null
-	critcmp regular pgo
 
 $(PGO_MERGED):
 	$(MAKE) pgo-profile

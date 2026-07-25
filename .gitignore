@@ -2,3 +2,5 @@
 .roam/
 tests/e2e/recordings
 .DS_Store
+scripts/__pycache__
+benches/*-baseline.txt
