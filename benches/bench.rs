@@ -108,7 +108,7 @@ fn make_json(n: usize) -> Vec<u8> {
 }
 
 #[divan::bench]
-fn file_read_1k(bencher: Bencher) {
+fn file_read_1000_lines(bencher: Bencher) {
     let dir = BenchDir::new("read");
     let path = dir.0.join("fixture.rs");
     let data = make_rust_source(1_000);
@@ -117,7 +117,7 @@ fn file_read_1k(bencher: Bencher) {
 }
 
 #[divan::bench]
-fn file_write_1k(bencher: Bencher) {
+fn file_write_1000_lines(bencher: Bencher) {
     let dir = BenchDir::new("write");
     let path = dir.0.join("fixture.rs");
     let data = make_rust_source(1_000);
@@ -126,109 +126,22 @@ fn file_write_1k(bencher: Bencher) {
     });
 }
 
-macro_rules! gap_benchmarks {
-    ($($name:ident: $operation:expr),+ $(,)?) => {
-        $(
-            #[divan::bench]
-            fn $name(b: Bencher) {
-                let data = make_rust_source($operation.0);
-                $operation.1(b, &data);
-            }
-        )+
-    };
-}
-
 fn gap_from_vec(b: Bencher, data: &[u8]) {
     bench_with_syscall_trace(b, || black_box(GapBuffer::from_vec(data.to_vec())));
 }
 
-fn gap_insert_sequential(b: Bencher, data: &[u8]) {
-    bench_with_syscall_trace(b, || {
-        let mut buf = GapBuffer::from_vec(data.to_vec());
-        let end = buf.len();
-        for i in 0..100 {
-            buf.insert(end + i, b"x");
-        }
-        black_box(&buf);
-    });
+#[divan::bench]
+fn gap_from_vec_1000_lines(b: Bencher) {
+    gap_from_vec(b, &make_rust_source(1_000));
 }
 
-fn gap_pos_to_offset_all_lines(b: Bencher, data: &[u8]) {
-    let buf = GapBuffer::from_vec(data.to_vec());
-    bench_with_syscall_trace(b, || {
-        for line in 0..buf.line_count() {
-            black_box(buf.pos_to_offset(line, 0));
-        }
-    });
+#[divan::bench]
+fn gap_from_vec_5000_lines(b: Bencher) {
+    gap_from_vec(b, &make_rust_source(5_000));
 }
-
-fn gap_offset_to_pos_walk(b: Bencher, data: &[u8]) {
-    let buf = GapBuffer::from_vec(data.to_vec());
-    let len = buf.len();
-    let step = len / 100;
-    bench_with_syscall_trace(b, || {
-        let mut offset = 0;
-        while offset < len {
-            black_box(buf.offset_to_pos(offset));
-            offset += step.max(1);
-        }
-    });
-}
-
-fn gap_line_text_all(b: Bencher, data: &[u8]) {
-    let buf = GapBuffer::from_vec(data.to_vec());
-    bench_with_syscall_trace(b, || {
-        for line in 0..buf.line_count() {
-            black_box(buf.line_text(line));
-        }
-    });
-}
-
-macro_rules! gap_size_set {
-    ($size:literal, $from_vec:ident, $insert:ident, $pos:ident, $offset:ident, $line:ident) => {
-        gap_benchmarks! {
-            $from_vec: ($size, gap_from_vec),
-            $insert: ($size, gap_insert_sequential),
-            $pos: ($size, gap_pos_to_offset_all_lines),
-            $offset: ($size, gap_offset_to_pos_walk),
-            $line: ($size, gap_line_text_all),
-        }
-    };
-}
-
-gap_size_set!(
-    1000,
-    gap_from_vec_1000,
-    gap_insert_sequential_1000,
-    gap_pos_to_offset_all_lines_1000,
-    gap_offset_to_pos_walk_1000,
-    gap_line_text_all_1000
-);
-gap_size_set!(
-    5000,
-    gap_from_vec_5000,
-    gap_insert_sequential_5000,
-    gap_pos_to_offset_all_lines_5000,
-    gap_offset_to_pos_walk_5000,
-    gap_line_text_all_5000
-);
 
 macro_rules! highlight_benchmarks {
-    ($rust_name:ident, $json_name:ident, $into_name:ident, $size:literal) => {
-        #[divan::bench]
-        fn $rust_name(b: Bencher) {
-            let data = make_rust_source($size);
-            let rules = highlight::rules_for_language("Rust").unwrap();
-            bench_with_syscall_trace(b, || {
-                let mut state = HlState::default();
-                for line in data.split(|&byte| byte == b'\n') {
-                    let (highlighted, next) = highlight::highlight_line(line, state, rules);
-                    state = next;
-                    black_box(&highlighted);
-                }
-            });
-        }
-
+    ($json_name:ident, $into_name:ident, $size:literal) => {
         #[divan::bench]
         fn $json_name(b: Bencher) {
             let data = make_json($size);
@@ -260,14 +173,13 @@ macro_rules! highlight_benchmarks {
 }
 
 highlight_benchmarks!(
-    highlight_rust_1000,
     highlight_json_1000,
     highlight_rust_into_1000,
     1000
 );
 
 #[divan::bench]
-fn document_insert_100_seal_undo_all(b: Bencher) {
+fn document_insert_10_seal_undo_all(b: Bencher) {
     let data = make_rust_source(500);
     bench_with_syscall_trace(b, || {
         let mut doc = Document::new(data.clone(), None);
@@ -390,14 +302,14 @@ fn render_frame(
 }
 
 #[divan::bench]
-fn render_frame_120x40_1k_syntax(b: Bencher) {
+fn render_frame_120x40_viewport_syntax(b: Bencher) {
     let data = make_rust_source(1_000);
     let rules = highlight::rules_for_language("Rust");
     render_frame(b, &data, 120, 40, None, rules);
 }
 
 #[divan::bench]
-fn render_frame_120x40_1k_selection(b: Bencher) {
+fn render_frame_120x40_viewport_selection(b: Bencher) {
     let data = make_rust_source(1_000);
     let rules = highlight::rules_for_language("Rust");
     let line = 1_000 / 2;
@@ -409,7 +321,7 @@ fn render_frame_120x40_1k_selection(b: Bencher) {
 }
 
 #[divan::bench]
-fn render_frame_120x40_1k_plain(b: Bencher) {
+fn render_frame_120x40_viewport_plain(b: Bencher) {
     let data = make_rust_source(1_000);
     render_frame(b, &data, 120, 40, None, None);
 }
