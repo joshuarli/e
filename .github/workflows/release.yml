@@ -63,8 +63,7 @@ jobs:
 
       - name: Build macOS release
         if: endsWith(matrix.target, '-apple-darwin')
-        # release-pgo disabled for now
-        run: make release TARGET=${{ matrix.target }}
+        run: make release-pgo TARGET=${{ matrix.target }}
 
       - name: Build and verify Linux releases
         if: endsWith(matrix.target, '-linux-musl')

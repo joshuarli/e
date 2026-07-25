@@ -9,7 +9,7 @@ LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(TARGET)/bin
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 
-.PHONY: build release release-dynamic verify-release verify-release-dynamic bench bench-syscalls release-pgo pgo-profile install test test-ci record gifs
+.PHONY: build release release-dynamic verify-release verify-release-dynamic bench bench-syscalls release-pgo pgo-profile bench-pgo install test test-ci record gifs
 
 build:
 	cargo build
@@ -90,6 +90,15 @@ release-pgo: $(PGO_MERGED)
 
 $(PGO_MERGED):
 	$(MAKE) pgo-profile
+
+# Benchmark regular release vs PGO and compare persisted baselines.
+bench-pgo: $(PGO_MERGED)
+	@BASELINE=$$(scripts/bench-baseline.py --print-path); \
+	PGO_BASELINE=$$(scripts/bench-baseline.py --variant pgo --print-path); \
+	scripts/bench-baseline.py --baseline "$$BASELINE" --quiet; \
+	RUSTFLAGS="-Cprofile-use=$(PGO_MERGED)" \
+	scripts/bench-baseline.py --baseline "$$PGO_BASELINE" --quiet --variant pgo; \
+	scripts/diff-baselines.py "$$BASELINE" "$$PGO_BASELINE"
 
 install: release-pgo
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)
