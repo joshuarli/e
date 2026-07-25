@@ -1310,11 +1310,12 @@ impl Editor {
 
     fn update_find_highlights(&mut self, pattern: &str) {
         self.find
-            .update_highlights(pattern, &self.doc.buf, &self.view);
+            .update_highlights_lazy(pattern, &self.doc.buf, &self.view);
     }
 
     fn find_next_from_submit(&mut self, pattern: &str) {
-        self.update_find_highlights(pattern);
+        self.find
+            .update_highlights(pattern, &self.doc.buf, &self.view);
         if self.find.current.is_none() {
             self.set_status("Find: no matches".to_string());
             return;
@@ -1401,12 +1402,15 @@ impl Editor {
             return;
         }
 
-        let new_text = re.replace_all(&text, replacement);
+        let new_text = re.replace_all(&text, replacement).into_owned();
 
         self.doc.seal_undo();
-        self.doc.delete_range(range_start, range_end);
-        self.doc
-            .insert(range_start.line, range_start.col, new_text.as_bytes());
+        self.doc.replace_range_with_deleted(
+            range_start,
+            range_end,
+            new_text.as_bytes(),
+            text_bytes,
+        );
         self.doc.seal_undo();
 
         self.clear_selection();

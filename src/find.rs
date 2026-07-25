@@ -16,6 +16,7 @@ pub struct FindState {
     pub active: bool,
     /// Total match count across the entire file.
     pub total_count: usize,
+    total_count_known: bool,
     /// Cursor position captured when find mode is opened; search anchors here.
     pub search_start: Pos,
 }
@@ -36,6 +37,7 @@ impl FindState {
             current_index: 0,
             active: false,
             total_count: 0,
+            total_count_known: false,
             search_start: Pos::zero(),
         }
     }
@@ -47,14 +49,33 @@ impl FindState {
         self.current = None;
         self.current_index = 0;
         self.total_count = 0;
+        self.total_count_known = false;
     }
 
     /// Update find highlights for a new pattern. Scans viewport and picks
     /// the first match at or after `self.search_start`.
     pub fn update_highlights(&mut self, pattern: &str, buf: &GapBuffer, view: &View) {
+        self.update_highlights_impl(pattern, buf, view, true);
+    }
+
+    /// Update find highlights without counting every match in the file.
+    /// Used while the find command buffer is changing; the exact count is
+    /// computed when the pattern is submitted for browsing.
+    pub fn update_highlights_lazy(&mut self, pattern: &str, buf: &GapBuffer, view: &View) {
+        self.update_highlights_impl(pattern, buf, view, false);
+    }
+
+    fn update_highlights_impl(
+        &mut self,
+        pattern: &str,
+        buf: &GapBuffer,
+        view: &View,
+        count_total: bool,
+    ) {
         self.matches.clear();
         self.current = None;
         self.total_count = 0;
+        self.total_count_known = false;
         self.pattern = pattern.to_string();
         if pattern.is_empty() {
             self.re = None;
@@ -70,7 +91,10 @@ impl FindState {
         };
         self.re = Some(re);
 
-        self.total_count = Self::count_all_matches(self.re.as_ref().unwrap(), buf);
+        if count_total {
+            self.total_count = Self::count_all_matches(self.re.as_ref().unwrap(), buf);
+            self.total_count_known = true;
+        }
         self.refresh_viewport_matches(buf, view);
 
         // Land on the first match at or after the search-start position.
@@ -78,7 +102,11 @@ impl FindState {
             self.current = Self::search_forward(buf, re, self.search_start);
         }
         if let Some((start, _)) = self.current {
-            self.current_index = Self::match_index(self.re.as_ref().unwrap(), buf, start);
+            if count_total {
+                self.current_index = Self::match_index(self.re.as_ref().unwrap(), buf, start);
+            }
+        } else if !count_total {
+            self.total_count_known = true;
         }
     }
 
@@ -252,11 +280,15 @@ impl FindState {
         self.current = None;
         self.current_index = 0;
         self.total_count = 0;
+        self.total_count_known = false;
         current
     }
 
     /// Format the find status text.
     pub fn status_text(&self) -> String {
+        if !self.total_count_known {
+            return format!("Find: {}", self.pattern);
+        }
         if self.total_count == 0 {
             return format!("Find: {} (no matches)", self.pattern);
         }

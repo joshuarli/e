@@ -324,7 +324,13 @@ impl Renderer {
                     self.hl_dirty_from = 0;
                 }
                 self.hl_cache_version = buf_version;
-                self.update_user_types(buf, line_count);
+                let may_define_type = dirty < line_count && {
+                    buf.line_text_into(dirty, &mut self.line_buf);
+                    self.line_buf.windows(4).any(|word| word == b"type")
+                };
+                if self.hl_cache.is_empty() || !self.user_types.is_empty() || may_define_type {
+                    self.update_user_types(buf, line_count);
+                }
             }
             self.refresh_hl_cache(visible_end, view.scroll_line, line_count, buf, rules);
             self.hl_dirty_from = usize::MAX;

@@ -84,6 +84,46 @@ impl Document {
         start_pos
     }
 
+    /// Replace a range when its deleted bytes have already been extracted.
+    /// This avoids copying the same deleted range a second time for undo.
+    pub fn replace_range_with_deleted(
+        &mut self,
+        start_pos: Pos,
+        end_pos: Pos,
+        replacement: &[u8],
+        deleted: Vec<u8>,
+    ) -> Pos {
+        let start_offset = self.buf.pos_to_offset(start_pos.line, start_pos.col);
+        let end_offset = self.buf.pos_to_offset(end_pos.line, end_pos.col);
+        if start_offset >= end_offset {
+            return start_pos;
+        }
+        debug_assert_eq!(deleted.len(), end_offset - start_offset);
+
+        self.buf.delete(start_offset, end_offset - start_offset);
+        self.undo_stack.record(
+            Operation::Delete {
+                pos: start_offset,
+                data: Arc::from(deleted),
+            },
+            Self::snapshot_for_pos(end_pos),
+            Self::snapshot_for_pos(start_pos),
+        );
+
+        self.buf.insert(start_offset, replacement);
+        let cursor_after = self.buf.offset_to_pos(start_offset + replacement.len());
+        self.undo_stack.record(
+            Operation::Insert {
+                pos: start_offset,
+                data: Arc::from(replacement),
+            },
+            Self::snapshot_for_pos(start_pos),
+            Self::snapshot_for_pos(Pos::new(cursor_after.0, cursor_after.1)),
+        );
+        self.dirty = true;
+        start_pos
+    }
+
     /// Seal the current undo group (force a boundary).
     pub fn seal_undo(&mut self) {
         self.undo_stack.seal();

@@ -107,6 +107,63 @@ fn make_json(n: usize) -> Vec<u8> {
     buf
 }
 
+fn append_python_line(buf: &mut Vec<u8>, index: usize) {
+    match index % 5 {
+        0 => buf.extend_from_slice(
+            format!(
+                "benchmark_token_{index:05}: dict[str, int | bool] = {{\"value\": {index}, \"scaled\": {index} * 3, \"even\": {index} % 2 == 0}}\n"
+            )
+            .as_bytes(),
+        ),
+        1 => buf.extend_from_slice(
+            format!(
+                "benchmark_token_{index:05}_list = [value * 2 for value in range({}) if value >= 0]\n",
+                index % 7
+            )
+            .as_bytes(),
+        ),
+        2 => buf.extend_from_slice(
+            format!(
+                "benchmark_token_{index:05}_name = f\"item-{{{index}:05d}}-{{{}}}\"\n",
+                index % 3
+            )
+            .as_bytes(),
+        ),
+        3 => buf.extend_from_slice(
+            format!(
+                "benchmark_token_{index:05}_result = ({} * 2 if {} % 2 == 0 else {} + 1)\n",
+                index, index, index
+            )
+            .as_bytes(),
+        ),
+        _ => buf.extend_from_slice(
+            format!(
+                "benchmark_token_{index:05}_call = sorted({{value: value * value for value in range({})}}.items(), key=lambda pair: pair[1])\n",
+                index % 5
+            )
+            .as_bytes(),
+        ),
+    }
+}
+
+fn make_python_source(lines: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(lines * 128);
+    for index in 0..lines {
+        append_python_line(&mut buf, index);
+    }
+    buf
+}
+
+fn make_python_source_bytes(target: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(target);
+    let mut index = 0;
+    while buf.len() < target {
+        append_python_line(&mut buf, index);
+        index += 1;
+    }
+    buf
+}
+
 #[divan::bench]
 fn file_read_1000_lines(bencher: Bencher) {
     let dir = BenchDir::new("read");
@@ -122,7 +179,8 @@ fn file_write_1000_lines(bencher: Bencher) {
     let path = dir.0.join("fixture.rs");
     let data = make_rust_source(1_000);
     bench_with_syscall_trace(bencher, || {
-        black_box(e::file_io::write_file(&path, &data).unwrap())
+        e::file_io::write_file(&path, &data).unwrap();
+        black_box(())
     });
 }
 
@@ -172,11 +230,7 @@ macro_rules! highlight_benchmarks {
     };
 }
 
-highlight_benchmarks!(
-    highlight_json_1000,
-    highlight_rust_into_1000,
-    1000
-);
+highlight_benchmarks!(highlight_json_1000, highlight_rust_into_1000, 1000);
 
 #[divan::bench]
 fn document_insert_10_seal_undo_all(b: Bencher) {
@@ -206,6 +260,70 @@ fn document_insert_delete_interleaved(b: Bencher) {
             doc.seal_undo();
         }
         black_box(&doc);
+    });
+}
+
+#[divan::bench]
+fn edit_and_render_python_10k(b: Bencher) {
+    let data = make_python_source(10_000);
+    let rules = highlight::rules_for_language("Python");
+    let mut doc = Document::new(data, Some("fixture.py".to_string()));
+    let mut renderer = Renderer::new();
+    renderer.set_syntax(rules);
+    let mut view = View::new(120, 40);
+    let cursor = Pos::new(5_000, 12);
+    view.scroll_line = cursor.line;
+    let mut sink = Vec::with_capacity(32 * 1024);
+    render_viewport(&mut renderer, &mut doc.buf, &view, cursor, None, &mut sink);
+
+    bench_with_syscall_trace(b, || {
+        let after = doc.insert(cursor.line, cursor.col, b"x");
+        render_viewport(&mut renderer, &mut doc.buf, &view, after, None, &mut sink);
+        doc.undo();
+        black_box((after, sink.len()));
+    });
+}
+
+#[divan::bench]
+fn find_update_python_10k(b: Bencher) {
+    let buf = GapBuffer::from_vec(make_python_source(10_000));
+    let mut view = View::new(120, 40);
+    view.scroll_line = 5_000;
+    let mut find = FindState::new();
+    bench_with_syscall_trace(b, || {
+        find.update_highlights_lazy(r"benchmark_token_\d+", &buf, &view);
+        black_box((find.total_count, find.matches.len()));
+    });
+}
+
+#[divan::bench]
+fn paste_multiline_python_100k_into_10k(b: Bencher) {
+    let mut doc = Document::new(make_python_source(10_000), Some("fixture.py".to_string()));
+    let paste = make_python_source_bytes(100 * 1024);
+    let cursor = Pos::new(5_000, 12);
+    bench_with_syscall_trace(b, || {
+        let after = doc.insert(cursor.line, cursor.col, &paste);
+        doc.undo();
+        black_box(after);
+    });
+}
+
+#[divan::bench]
+fn replace_all_python_10k(b: Bencher) {
+    let data = make_python_source(10_000);
+    let pattern = regex_lite::Regex::new(r"benchmark_token_\d+").unwrap();
+    bench_with_syscall_trace(b, || {
+        let mut doc = Document::new(data.clone(), Some("fixture.py".to_string()));
+        let last_line = doc.buf.line_count().saturating_sub(1);
+        let end = Pos::new(last_line, doc.buf.line_char_len(last_line));
+        let text_bytes = doc.text_in_range(Pos::zero(), end);
+        let text = String::from_utf8_lossy(&text_bytes);
+        let count = pattern.find_iter(&text).count();
+        let replacement = pattern.replace_all(&text, "replacement_token").into_owned();
+        doc.seal_undo();
+        doc.replace_range_with_deleted(Pos::zero(), end, replacement.as_bytes(), text_bytes);
+        doc.seal_undo();
+        black_box((count, doc.buf.len()));
     });
 }
 
@@ -261,6 +379,39 @@ fn render_setup(
     (renderer, buffer, view)
 }
 
+fn render_viewport(
+    renderer: &mut Renderer,
+    buffer: &mut GapBuffer,
+    view: &View,
+    cursor: Pos,
+    selection: Option<Selection>,
+    sink: &mut Vec<u8>,
+) {
+    sink.clear();
+    renderer
+        .render(
+            sink,
+            buffer,
+            view,
+            cursor.line,
+            cursor.col,
+            true,
+            " fixture.py",
+            " e v0.1.13 ",
+            None,
+            selection,
+            &[],
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+}
+
 fn render_frame(
     b: Bencher,
     data: &[u8],
@@ -273,32 +424,48 @@ fn render_frame(
     let cursor_line = view.scroll_line;
     let mut sink = Vec::with_capacity(32 * 1024);
     bench_with_syscall_trace(b, || {
-        sink.clear();
         renderer.needs_full_redraw = true;
-        renderer
-            .render(
-                &mut sink,
-                &mut buffer,
-                &view,
-                cursor_line,
-                0,
-                true,
-                " test.rs",
-                " e v0.1.5 ",
-                None,
-                selection,
-                &[],
-                &[],
-                None,
-                None,
-                &[],
-                None,
-                false,
-                None,
-            )
-            .unwrap();
+        render_viewport(
+            &mut renderer,
+            &mut buffer,
+            &view,
+            Pos::new(cursor_line, 0),
+            selection,
+            &mut sink,
+        );
         black_box(&sink);
     });
+}
+
+fn open_and_render_python(b: Bencher, data: &[u8], label: &str) {
+    let dir = BenchDir::new(label);
+    let path = dir.0.join("fixture.py");
+    fs::write(&path, data).unwrap();
+    let rules = highlight::rules_for_language("Python");
+    bench_with_syscall_trace(b, || {
+        let loaded = e::file_io::read_file(&path).unwrap();
+        let mut buffer = GapBuffer::from_vec(loaded);
+        let mut renderer = Renderer::new();
+        renderer.set_syntax(rules);
+        let mut view = View::new(120, 40);
+        view.scroll_line = buffer.line_count() / 2;
+        let cursor = Pos::new(view.scroll_line, 0);
+        let mut sink = Vec::with_capacity(32 * 1024);
+        render_viewport(&mut renderer, &mut buffer, &view, cursor, None, &mut sink);
+        black_box(sink.len());
+    });
+}
+
+#[divan::bench]
+fn open_and_render_python_1mb(b: Bencher) {
+    let data = make_python_source_bytes(1024 * 1024);
+    open_and_render_python(b, &data, "open-1mb");
+}
+
+#[divan::bench]
+fn open_and_render_python_10mb(b: Bencher) {
+    let data = make_python_source_bytes(10 * 1024 * 1024);
+    open_and_render_python(b, &data, "open-10mb");
 }
 
 #[divan::bench]
