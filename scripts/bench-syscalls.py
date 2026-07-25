@@ -8,7 +8,7 @@ import shlex
 import subprocess
 
 
-IMAGE = "e-bench-syscalls:local"
+IMAGE = "benchmark-syscalls:local"
 WORKDIR = "/workspace"
 SAMPLE_COUNT = 10
 SAMPLE_SIZE = 100
