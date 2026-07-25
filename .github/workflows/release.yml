@@ -57,13 +57,13 @@ jobs:
         with:
           key: ${{ matrix.runner }}-${{ matrix.target }}
 
-      - name: Run macOS tests
-        if: endsWith(matrix.target, '-apple-darwin')
-        run: make test-ci
-
       - name: Build macOS release
         if: endsWith(matrix.target, '-apple-darwin')
         run: make release-pgo TARGET=${{ matrix.target }}
+
+      - name: Run macOS tests
+        if: endsWith(matrix.target, '-apple-darwin')
+        run: make test-ci TARGET=${{ matrix.target }}
 
       - name: Build and verify Linux releases
         if: endsWith(matrix.target, '-linux-musl')
@@ -73,9 +73,9 @@ jobs:
             --workdir /e \
             "e-builder:${{ matrix.target }}" \
             sh -ec '
-              make test-ci
               make release TARGET=${{ matrix.target }}
               make verify-release TARGET=${{ matrix.target }}
+              make test-ci TARGET=${{ matrix.target }}
               cp "target/${{ matrix.target }}/release/e" "e-${{ matrix.target }}-static"
               make release-dynamic TARGET=${{ matrix.target }}
               make verify-release-dynamic TARGET=${{ matrix.target }}

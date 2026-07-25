@@ -280,9 +280,17 @@ impl TestEditor {
         }
 
         // Spawn the editor.
-        let binary = env!("CARGO_BIN_EXE_e");
+        let binary = if let Some(path) = std::env::var_os("E_TEST_BINARY") {
+            PathBuf::from(path)
+        } else {
+            let mut path = std::env::current_exe().expect("test executable path unavailable");
+            path.pop();
+            path.pop();
+            path.push("e");
+            path
+        };
         let child = unsafe {
-            Command::new(binary)
+            Command::new(&binary)
                 .args(args)
                 .env("TERM", "xterm-256color")
                 .env("HOME", home.path())

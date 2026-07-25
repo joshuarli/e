@@ -1,4 +1,6 @@
 NAME       := e
+TEST_BINARY_ENV := E_TEST_BINARY
+TEST_TARGETS := --tests
 HOST       := $(shell rustc -vV | awk '/^host:/ {print $$2}')
 TARGET     ?= $(subst -unknown-linux-gnu,-unknown-linux-musl,$(HOST))
 MUSL_LOADER := $(if $(findstring x86_64,$(TARGET)),/lib/ld-musl-x86_64.so.1,/lib/ld-musl-aarch64.so.1)
@@ -9,7 +11,7 @@ LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(TARGET)/bin
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 
-.PHONY: build release release-dynamic verify-release verify-release-dynamic bench bench-syscalls release-pgo pgo-profile bench-pgo install test test-ci record gifs
+.PHONY: build test test-ci release release-dynamic verify-release verify-release-dynamic bench bench-syscalls release-pgo pgo-profile bench-pgo install record gifs
 
 build:
 	cargo build
@@ -18,7 +20,9 @@ test:
 	cargo test --quiet
 
 test-ci:
-	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" cargo test --quiet --release
+	@test -x "target/$(TARGET)/release/$(NAME)"
+	$(TEST_BINARY_ENV)="$(CURDIR)/target/$(TARGET)/release/$(NAME)" \
+	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" cargo test --quiet --release $(TEST_TARGETS)
 
 release:
 	cargo clean -p $(NAME) --release --target $(TARGET)
@@ -71,13 +75,16 @@ bench:
 bench-syscalls:
 	@scripts/bench-syscalls.py
 
-# Collect PGO profiles from the benchmark workload. No build-std or
-# -Cpanic=immediate-abort here: the profiler runtime needs unwinding.
+# Collect PGO profiles from Divan benchmarks.
+# No build-std or -Cpanic=immediate-abort here: the profiler runtime needs unwinding.
 pgo-profile:
 	rm -rf $(PGO_DIR) && mkdir -p $(PGO_DIR)
 	RUSTFLAGS="-Cprofile-generate=$(PGO_DIR)" \
 	cargo bench --bench bench
 	$(LLVM_BIN)/llvm-profdata merge -o $(PGO_MERGED) $(PGO_DIR)
+
+$(PGO_MERGED):
+	$(MAKE) pgo-profile
 
 # PGO-optimized release: uses gathered profiles + all aggressive flags.
 release-pgo: $(PGO_MERGED)
@@ -87,9 +94,6 @@ release-pgo: $(PGO_MERGED)
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  --target $(TARGET)
-
-$(PGO_MERGED):
-	$(MAKE) pgo-profile
 
 # Benchmark regular release vs PGO and compare persisted baselines.
 bench-pgo: $(PGO_MERGED)
