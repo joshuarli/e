@@ -1063,8 +1063,6 @@ Dark grey background (`\x1b[0;100m`). Full width.
 - Coverage: `cargo tarpaulin`.
 - Philosophy: prefer integration-style scenario tests over tiny unit tests.
 - **Property tests** (proptest): `buffer::proptests` (7 properties — GapBuffer invariants), `document::proptests` (2 — edit/undo/redo consistency, full-undo restores original), `view::proptests` (4 — wrapped_rows, ensure_cursor_visible, buffer_to_screen, center_on_line no-panic), `selection::proptests` (4 — word boundary bounds, selection ordering, Pos total order).
-- **Fuzz targets** (`fuzz/`): cargo-fuzz setup with 7 targets — `fuzz_gap_buffer`, `fuzz_document` (edit + undo/redo sequences), `fuzz_undo_deserialize`, `fuzz_cursor_deserialize`, `fuzz_highlight` (all languages), `fuzz_command` (command dispatch + arg parsing), `fuzz_keybind_parse` (INI config parsing). Run with `cargo +nightly fuzz run <target>`.
-- **Crate structure**: `lib.rs` re-exports all modules publicly so fuzz targets can import them. `main.rs` imports from `e::*`.
 - **Benchmarks** (`benches/bench.rs`): Divan benchmarks with allocation profiling for gap-buffer operations, syntax highlighting, document edits, full/incremental rendering, full-scan search misses, and large cursor jumps. Run `make bench` for the host-keyed baseline and allocation deltas, or `cargo bench` for the raw Divan report.
 
 ## 22. Configuration Paths Summary
