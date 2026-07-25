@@ -1,5 +1,13 @@
 //! Wall-time benchmarks for editor hot paths.
 
+#[cfg(target_os = "linux")]
+use std::ffi::CStr;
+use std::fs;
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use divan::{AllocProfiler, Bencher, black_box};
 
 #[global_allocator]
@@ -12,6 +20,67 @@ use e::highlight::{self, HlState, SyntaxRules};
 use e::render::Renderer;
 use e::selection::{Pos, Selection};
 use e::view::View;
+
+#[cfg(target_os = "linux")]
+const TRACE_BEGIN: &CStr = c"BENCH_BEGIN";
+#[cfg(target_os = "linux")]
+const TRACE_END: &CStr = c"BENCH_END";
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn prctl(option: i32, ...) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+fn syscall_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SYSCALL_TRACE").is_some())
+}
+
+#[cfg(target_os = "linux")]
+fn trace_marker(marker: &CStr) {
+    if syscall_trace_enabled() {
+        unsafe {
+            let _ = prctl(15, marker.as_ptr(), 0, 0, 0);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bench_with_syscall_trace<O>(bencher: Bencher, mut operation: impl FnMut() -> O) {
+    bencher.bench_local(|| {
+        trace_marker(TRACE_BEGIN);
+        let result = operation();
+        trace_marker(TRACE_END);
+        black_box(result);
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bench_with_syscall_trace<O>(bencher: Bencher, operation: impl FnMut() -> O) {
+    bencher.bench_local(operation);
+}
+
+struct BenchDir(PathBuf);
+
+impl BenchDir {
+    fn new(label: &str) -> Self {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("e-bench-{label}-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for BenchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 fn make_rust_source(n: usize) -> Vec<u8> {
     let mut buf = Vec::with_capacity(n * 40);
@@ -38,6 +107,25 @@ fn make_json(n: usize) -> Vec<u8> {
     buf
 }
 
+#[divan::bench]
+fn file_read_1k(bencher: Bencher) {
+    let dir = BenchDir::new("read");
+    let path = dir.0.join("fixture.rs");
+    let data = make_rust_source(1_000);
+    fs::write(&path, &data).unwrap();
+    bench_with_syscall_trace(bencher, || black_box(e::file_io::read_file(&path).unwrap()));
+}
+
+#[divan::bench]
+fn file_write_1k(bencher: Bencher) {
+    let dir = BenchDir::new("write");
+    let path = dir.0.join("fixture.rs");
+    let data = make_rust_source(1_000);
+    bench_with_syscall_trace(bencher, || {
+        black_box(e::file_io::write_file(&path, &data).unwrap())
+    });
+}
+
 macro_rules! gap_benchmarks {
     ($($name:ident: $operation:expr),+ $(,)?) => {
         $(
@@ -51,11 +139,11 @@ macro_rules! gap_benchmarks {
 }
 
 fn gap_from_vec(b: Bencher, data: &[u8]) {
-    b.bench_local(|| black_box(GapBuffer::from_vec(data.to_vec())));
+    bench_with_syscall_trace(b, || black_box(GapBuffer::from_vec(data.to_vec())));
 }
 
 fn gap_insert_sequential(b: Bencher, data: &[u8]) {
-    b.bench_local(|| {
+    bench_with_syscall_trace(b, || {
         let mut buf = GapBuffer::from_vec(data.to_vec());
         let end = buf.len();
         for i in 0..100 {
@@ -67,7 +155,7 @@ fn gap_insert_sequential(b: Bencher, data: &[u8]) {
 
 fn gap_pos_to_offset_all_lines(b: Bencher, data: &[u8]) {
     let buf = GapBuffer::from_vec(data.to_vec());
-    b.bench_local(|| {
+    bench_with_syscall_trace(b, || {
         for line in 0..buf.line_count() {
             black_box(buf.pos_to_offset(line, 0));
         }
@@ -78,7 +166,7 @@ fn gap_offset_to_pos_walk(b: Bencher, data: &[u8]) {
     let buf = GapBuffer::from_vec(data.to_vec());
     let len = buf.len();
     let step = len / 100;
-    b.bench_local(|| {
+    bench_with_syscall_trace(b, || {
         let mut offset = 0;
         while offset < len {
             black_box(buf.offset_to_pos(offset));
@@ -89,7 +177,7 @@ fn gap_offset_to_pos_walk(b: Bencher, data: &[u8]) {
 
 fn gap_line_text_all(b: Bencher, data: &[u8]) {
     let buf = GapBuffer::from_vec(data.to_vec());
-    b.bench_local(|| {
+    bench_with_syscall_trace(b, || {
         for line in 0..buf.line_count() {
             black_box(buf.line_text(line));
         }
@@ -131,7 +219,7 @@ macro_rules! highlight_benchmarks {
         fn $rust_name(b: Bencher) {
             let data = make_rust_source($size);
             let rules = highlight::rules_for_language("Rust").unwrap();
-            b.bench_local(|| {
+            bench_with_syscall_trace(b, || {
                 let mut state = HlState::default();
                 for line in data.split(|&byte| byte == b'\n') {
                     let (highlighted, next) = highlight::highlight_line(line, state, rules);
@@ -145,7 +233,7 @@ macro_rules! highlight_benchmarks {
         fn $json_name(b: Bencher) {
             let data = make_json($size);
             let rules = highlight::rules_for_language("JSON").unwrap();
-            b.bench_local(|| {
+            bench_with_syscall_trace(b, || {
                 let mut state = HlState::default();
                 for line in data.split(|&byte| byte == b'\n') {
                     let (highlighted, next) = highlight::highlight_line(line, state, rules);
@@ -160,7 +248,7 @@ macro_rules! highlight_benchmarks {
             let data = make_rust_source($size);
             let rules = highlight::rules_for_language("Rust").unwrap();
             let mut output = Vec::new();
-            b.bench_local(|| {
+            bench_with_syscall_trace(b, || {
                 let mut state = HlState::default();
                 for line in data.split(|&byte| byte == b'\n') {
                     state = highlight::highlight_line_into(line, state, rules, &[], &mut output);
@@ -181,7 +269,7 @@ highlight_benchmarks!(
 #[divan::bench]
 fn document_insert_100_seal_undo_all(b: Bencher) {
     let data = make_rust_source(500);
-    b.bench_local(|| {
+    bench_with_syscall_trace(b, || {
         let mut doc = Document::new(data.clone(), None);
         for i in 0..10 {
             let line = i % doc.buf.line_count();
@@ -196,7 +284,7 @@ fn document_insert_100_seal_undo_all(b: Bencher) {
 #[divan::bench]
 fn document_insert_delete_interleaved(b: Bencher) {
     let data = make_rust_source(500);
-    b.bench_local(|| {
+    bench_with_syscall_trace(b, || {
         let mut doc = Document::new(data.clone(), None);
         for _ in 0..5 {
             let line = doc.buf.line_count() / 2;
@@ -216,7 +304,9 @@ macro_rules! search_benchmarks {
             let data = make_rust_source($size);
             let buf = GapBuffer::from_vec(data.clone());
             let re = regex_lite::Regex::new("ZZNOTFOUND").unwrap();
-            b.bench_local(|| black_box(FindState::search_forward(&buf, &re, Pos::zero())));
+            bench_with_syscall_trace(b, || {
+                black_box(FindState::search_forward(&buf, &re, Pos::zero()))
+            });
         }
 
         #[divan::bench]
@@ -225,7 +315,7 @@ macro_rules! search_benchmarks {
             let buf = GapBuffer::from_vec(data.clone());
             let re = regex_lite::Regex::new("ZZNOTFOUND").unwrap();
             let last = Pos::new(buf.line_count().saturating_sub(1), 0);
-            b.bench_local(|| black_box(FindState::search_backward(&buf, &re, last)));
+            bench_with_syscall_trace(b, || black_box(FindState::search_backward(&buf, &re, last)));
         }
     };
 }
@@ -235,7 +325,7 @@ search_benchmarks!(search_forward_miss_1000, search_backward_miss_1000, 1000);
 #[divan::bench]
 fn viewport_ensure_cursor_visible_jump(b: Bencher) {
     let buf = GapBuffer::from_vec(make_rust_source(1_000));
-    b.bench_local(|| {
+    bench_with_syscall_trace(b, || {
         let mut view = View::new(120, 40);
         let mut widths = |line: usize| buf.display_col_at(line, usize::MAX);
         for line in (0..buf.line_count()).step_by(10) {
@@ -270,7 +360,7 @@ fn render_frame(
     let (mut renderer, mut buffer, view) = render_setup(data, width, height, syntax);
     let cursor_line = view.scroll_line;
     let mut sink = Vec::with_capacity(32 * 1024);
-    b.bench_local(|| {
+    bench_with_syscall_trace(b, || {
         sink.clear();
         renderer.needs_full_redraw = true;
         renderer
@@ -356,7 +446,9 @@ fn render_incremental(
             None,
         )
         .unwrap();
-    b.bench_local(|| movement(&mut renderer, &mut buffer, &mut sink, &view, cursor_line));
+    bench_with_syscall_trace(b, || {
+        movement(&mut renderer, &mut buffer, &mut sink, &view, cursor_line)
+    });
 }
 
 #[divan::bench]

@@ -9,7 +9,7 @@ LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(TARGET)/bin
 PGO_DIR    := $(CURDIR)/target/pgo-profiles
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 
-.PHONY: build release release-dynamic verify-release verify-release-dynamic bench release-pgo pgo-profile install test test-ci record gifs
+.PHONY: build release release-dynamic verify-release verify-release-dynamic bench bench-syscalls release-pgo pgo-profile install test test-ci record gifs
 
 build:
 	cargo build
@@ -66,7 +66,10 @@ lint:
 	cargo clippy --fix --allow-dirty --all-targets --all-features -- --deny warnings
 
 bench:
-	scripts/bench-baseline.py
+	@scripts/bench-baseline.py
+
+bench-syscalls:
+	@scripts/bench-syscalls.py
 
 # Collect PGO profiles from the benchmark workload. No build-std or
 # -Cpanic=immediate-abort here: the profiler runtime needs unwinding.
