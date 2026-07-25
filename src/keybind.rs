@@ -7,10 +7,10 @@
 ///   ctrl+q = quit
 ///   ctrl+f = find
 ///   ...
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+use fxhash::FxHashMap;
 use termion::event::Key;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -37,7 +37,7 @@ pub enum EditorAction {
 }
 
 pub struct KeybindingTable {
-    bindings: HashMap<KeyCombo, EditorAction>,
+    bindings: FxHashMap<KeyCombo, EditorAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -47,7 +47,7 @@ struct KeyCombo {
 
 impl KeybindingTable {
     pub fn with_defaults() -> Self {
-        let mut bindings = HashMap::new();
+        let mut bindings = FxHashMap::default();
         bindings.insert(kc(Key::Ctrl('s')), EditorAction::Save);
         bindings.insert(kc(Key::Ctrl('q')), EditorAction::Quit);
         bindings.insert(kc(Key::Ctrl('z')), EditorAction::Undo);

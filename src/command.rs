@@ -1,5 +1,5 @@
 /// Command registry: maps command names to functions.
-use std::collections::HashMap;
+use fxhash::FxHashMap;
 
 /// Parse a command argument string into tokens, respecting single and double quotes.
 /// Unquoted tokens are split on whitespace. Quoted tokens preserve interior whitespace
@@ -72,7 +72,7 @@ pub enum CommandAction {
 }
 
 pub struct CommandRegistry {
-    commands: HashMap<String, CommandFn>,
+    commands: FxHashMap<String, CommandFn>,
 }
 
 impl Default for CommandRegistry {
@@ -83,7 +83,7 @@ impl Default for CommandRegistry {
 
 impl CommandRegistry {
     pub fn new() -> Self {
-        let mut commands: HashMap<String, CommandFn> = HashMap::new();
+        let mut commands: FxHashMap<String, CommandFn> = FxHashMap::default();
 
         commands.insert("save".to_string(), cmd_save);
         commands.insert("quit".to_string(), cmd_quit);

@@ -2315,7 +2315,7 @@ fn line_continues(line: &[u8], len: usize) -> bool {
 #[cfg(test)]
 pub fn collect_user_types(buf: &buffer::GapBuffer) -> Vec<Vec<u8>> {
     let mut all = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = fxhash::FxHashSet::default();
     let mut line_buf = Vec::new();
     let mut in_continuation = false;
     for line_idx in 0..buf.line_count() {

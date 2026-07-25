@@ -4,6 +4,7 @@ version = "0.1.13"
 edition = "2024"
 
 [dependencies]
+fxhash = "0.2"
 termion = "4"
 regex-lite = "0.1"
 rustix = { version = "1.1.4", features = ["runtime"] }
