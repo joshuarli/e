@@ -82,8 +82,8 @@ impl CommandBuffer {
         }
     }
 
-    pub fn handle_key(&mut self, key: termion::event::Key) -> CommandBufferResult {
-        use termion::event::Key;
+    pub fn handle_key(&mut self, key: crate::input::Key) -> CommandBufferResult {
+        use crate::input::Key;
         match key {
             Key::Char('\n') => {
                 let val = self.input.clone();
@@ -175,7 +175,7 @@ impl CommandBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use termion::event::Key;
+    use crate::input::Key;
 
     #[test]
     fn test_new_is_inactive() {

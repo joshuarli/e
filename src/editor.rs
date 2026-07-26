@@ -1,33 +1,8 @@
 use std::fs::File;
-use std::io::{self, Read, Write, stdout};
+use std::io::{self, Read, Write};
 use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-
-use termion::event::{Event, Key, MouseButton, MouseEvent};
-use termion::input::TermReadEventsAndRaw;
-use termion::raw::IntoRawMode;
-use termion::screen::IntoAlternateScreen;
-
-/// Wraps a reader to distinguish Ctrl+J (0x0A) from Enter (0x0D).
-///
-/// Termion normalises both bytes to `Key::Char('\n')`, making them
-/// indistinguishable.  By replacing 0x0A with 0x00 *before* termion
-/// parses the stream, the editor receives `Event::Unsupported([0])`
-/// for Ctrl+J while Enter still works normally.
-struct CtrlJReader<R>(R);
-
-impl<R: Read> Read for CtrlJReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.0.read(buf)?;
-        for b in &mut buf[..n] {
-            if *b == 0x0A {
-                *b = 0x00;
-            }
-        }
-        Ok(n)
-    }
-}
 
 use crate::clipboard::Clipboard;
 use crate::command::{CommandAction, CommandRegistry};
@@ -35,6 +10,7 @@ use crate::command_buffer::{CommandBuffer, CommandBufferMode, CommandBufferResul
 use crate::document::{Document, RawEdit};
 use crate::find::FindState;
 use crate::highlight;
+use crate::input::{self, EditorEvent, InputParser, Key, MouseButton, MouseEvent, MouseMods};
 use crate::keybind::{EditorAction, KeybindingTable};
 use crate::mouse::MouseState;
 use crate::render::{Renderer, gutter_width};
@@ -44,24 +20,6 @@ use crate::selection::{
 use crate::view::View;
 
 const SCROLL_LINES: usize = 3;
-
-const PASTE_START: &[u8] = &[0x1b, b'[', b'2', b'0', b'0', b'~'];
-const PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
-const CTRL_SHIFT_UP: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'A'];
-const CTRL_SHIFT_DOWN: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'B'];
-const CTRL_LEFT: &[u8] = &[0x1b, b'[', b'1', b';', b'5', b'D'];
-const CTRL_RIGHT: &[u8] = &[0x1b, b'[', b'1', b';', b'5', b'C'];
-// rxvt-style (sent by tmux, some terminals)
-const CTRL_LEFT_RXVT: &[u8] = &[0x1b, b'O', b'd'];
-const CTRL_RIGHT_RXVT: &[u8] = &[0x1b, b'O', b'c'];
-const CTRL_SHIFT_LEFT: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'D'];
-const CTRL_SHIFT_RIGHT: &[u8] = &[0x1b, b'[', b'1', b';', b'6', b'C'];
-// CSI u encoding for Ctrl+Backspace (kitty, ghostty, etc.)
-const CTRL_BACKSPACE_CSI_U: &[u8] = &[0x1b, b'[', b'1', b'2', b'7', b';', b'5', b'u'];
-// Xterm-style Ctrl+Delete. In terminals where the Mac Delete key is remapped
-// to forward delete, this is the practical Ctrl+Backspace equivalent.
-const CTRL_DELETE_XTERM: &[u8] = &[0x1b, b'[', b'3', b';', b'5', b'~'];
-const FOCUS_IN: &[u8] = &[0x1b, b'[', b'I'];
 
 fn auto_close_char(c: char, lang_name: Option<&str>) -> Option<char> {
     match c {
@@ -79,138 +37,6 @@ fn auto_close_char(c: char, lang_name: Option<&str>) -> Option<char> {
 
 fn is_close_char(c: char) -> bool {
     matches!(c, ')' | ']' | '}' | '"' | '\'' | '`')
-}
-
-fn is_paste_start(ev: &Event) -> bool {
-    matches!(ev, Event::Unsupported(bytes) if bytes == PASTE_START)
-}
-
-fn is_paste_end(ev: &Event) -> bool {
-    matches!(ev, Event::Unsupported(bytes) if bytes == PASTE_END)
-}
-
-fn parse_sgr_mouse(raw: &[u8]) -> Option<(MouseEvent, MouseMods)> {
-    if !raw.starts_with(b"\x1b[<") {
-        return None;
-    }
-    let final_byte = *raw.last()?;
-    if final_byte != b'M' && final_byte != b'm' {
-        return None;
-    }
-    let body = std::str::from_utf8(&raw[3..raw.len() - 1]).ok()?;
-    let mut parts = body.split(';');
-    let cb = parts.next()?.parse::<u16>().ok()?;
-    let cx = parts.next()?.parse::<u16>().ok()?;
-    let cy = parts.next()?.parse::<u16>().ok()?;
-    let mods = MouseMods {
-        ctrl: cb & 0x10 != 0,
-    };
-    let base = cb & 0b11;
-    let wheel = cb & 0x40 != 0;
-    let hold = cb & 0x20 != 0 && !wheel;
-    let event = if hold {
-        MouseEvent::Hold(cx, cy)
-    } else if final_byte == b'm' || (base == 3 && !wheel) {
-        MouseEvent::Release(cx, cy)
-    } else {
-        let button = if wheel {
-            match base {
-                0 => MouseButton::WheelUp,
-                1 => MouseButton::WheelDown,
-                2 => MouseButton::WheelLeft,
-                3 => MouseButton::WheelRight,
-                _ => return None,
-            }
-        } else {
-            match base {
-                0 => MouseButton::Left,
-                1 => MouseButton::Middle,
-                2 => MouseButton::Right,
-                _ => return None,
-            }
-        };
-        MouseEvent::Press(button, cx, cy)
-    };
-    Some((event, mods))
-}
-
-fn decode_mouse_cb(
-    cb: u16,
-    cx: u16,
-    cy: u16,
-    sgr_release: Option<bool>,
-) -> Option<(MouseEvent, MouseMods)> {
-    let mods = MouseMods {
-        ctrl: cb & 0x10 != 0,
-    };
-    let base = cb & 0b11;
-    let wheel = cb & 0x40 != 0;
-    let hold = cb & 0x20 != 0 && !wheel;
-    let event = if hold {
-        MouseEvent::Hold(cx, cy)
-    } else if sgr_release == Some(true) || (base == 3 && !wheel) {
-        MouseEvent::Release(cx, cy)
-    } else {
-        let button = if wheel {
-            match base {
-                0 => MouseButton::WheelUp,
-                1 => MouseButton::WheelDown,
-                2 => MouseButton::WheelLeft,
-                3 => MouseButton::WheelRight,
-                _ => return None,
-            }
-        } else {
-            match base {
-                0 => MouseButton::Left,
-                1 => MouseButton::Middle,
-                2 => MouseButton::Right,
-                _ => return None,
-            }
-        };
-        MouseEvent::Press(button, cx, cy)
-    };
-    Some((event, mods))
-}
-
-fn parse_x10_mouse(raw: &[u8]) -> Option<(MouseEvent, MouseMods)> {
-    if raw.len() != 6 || &raw[..3] != b"\x1b[M" {
-        return None;
-    }
-    let cb = raw[3].checked_sub(32)? as u16;
-    let cx = raw[4].checked_sub(32)? as u16;
-    let cy = raw[5].checked_sub(32)? as u16;
-    decode_mouse_cb(cb, cx, cy, None)
-}
-
-fn parse_rxvt_mouse(raw: &[u8]) -> Option<(MouseEvent, MouseMods)> {
-    if !raw.starts_with(b"\x1b[") || raw.starts_with(b"\x1b[<") || *raw.last()? != b'M' {
-        return None;
-    }
-    let body = std::str::from_utf8(&raw[2..raw.len() - 1]).ok()?;
-    let mut parts = body.split(';');
-    let cb = parts.next()?.parse::<u16>().ok()?;
-    let cx = parts.next()?.parse::<u16>().ok()?;
-    let cy = parts.next()?.parse::<u16>().ok()?;
-    if parts.next().is_some() || cb < 32 {
-        return None;
-    }
-    decode_mouse_cb(cb - 32, cx, cy, None)
-}
-
-fn decode_mouse_event(ev: &Event, raw: &[u8]) -> Option<(MouseEvent, MouseMods)> {
-    if let Some(parsed) = parse_sgr_mouse(raw) {
-        return Some(parsed);
-    }
-    if let Some(parsed) = parse_x10_mouse(raw) {
-        return Some(parsed);
-    }
-    if let Some(parsed) = parse_rxvt_mouse(raw) {
-        return Some(parsed);
-    }
-    match ev {
-        Event::Mouse(mouse) => Some((*mouse, MouseMods::default())),
-        _ => None,
-    }
 }
 
 fn common_prefix(strings: &[&str]) -> String {
@@ -262,17 +88,6 @@ pub struct Editor {
     line_scratch: Vec<u8>,
 }
 
-enum EditorEvent {
-    Term(Event),
-    Mouse(MouseEvent, MouseMods),
-    Paste(String),
-}
-
-#[derive(Clone, Copy, Default)]
-struct MouseMods {
-    ctrl: bool,
-}
-
 struct PlannedCaretEdit {
     start: usize,
     end: usize,
@@ -284,7 +99,7 @@ struct PlannedCaretEdit {
 
 impl Editor {
     pub fn new(text: Vec<u8>, filename: Option<String>, piped_stdin: bool) -> Self {
-        let (w, h) = termion::terminal_size().unwrap_or((80, 24));
+        let (w, h) = input::terminal_size().unwrap_or((80, 24));
         let mut keybindings = KeybindingTable::with_defaults();
         keybindings.load_config();
         let mut doc = Document::new(text, filename);
@@ -340,8 +155,10 @@ impl Editor {
             self.center_view_on_line(self.cursor().line);
         }
 
-        let mut stdout = stdout().into_raw_mode()?.into_alternate_screen()?;
+        let old_termios = input::enable_raw_mode()?;
+        let mut stdout = io::stdout();
 
+        write!(stdout, "\x1b[?1049h")?;
         write!(
             stdout,
             "\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1004h\x1b[?25l"
@@ -349,80 +166,38 @@ impl Editor {
         stdout.flush()?;
 
         let (tx, rx) = mpsc::channel::<EditorEvent>();
-
         let tx_input = tx.clone();
         let use_tty = self.piped_stdin;
         std::thread::spawn(move || {
-            let tty_file: Option<File> = if use_tty {
-                File::open("/dev/tty").ok()
+            let mut reader: Box<dyn Read> = if use_tty {
+                match File::open("/dev/tty") {
+                    Ok(f) => Box::new(f),
+                    Err(_) => return,
+                }
             } else {
-                None
+                Box::new(io::stdin())
             };
-            let stdin_handle;
-            let events: Box<dyn Iterator<Item = Result<(Event, Vec<u8>), io::Error>>> =
-                if let Some(f) = tty_file {
-                    Box::new(CtrlJReader(io::BufReader::new(f)).events_and_raw())
-                } else {
-                    stdin_handle = io::stdin();
-                    Box::new(CtrlJReader(stdin_handle.lock()).events_and_raw())
-                };
-            let mut in_paste = false;
-            let mut paste_buf = String::new();
-            let mut saw_cr = false;
-            for (ev, raw) in events.flatten() {
-                if is_paste_start(&ev) {
-                    in_paste = true;
-                    paste_buf.clear();
-                    saw_cr = false;
-                    continue;
-                }
-                if is_paste_end(&ev) {
-                    in_paste = false;
-                    if tx_input
-                        .send(EditorEvent::Paste(std::mem::take(&mut paste_buf)))
-                        .is_err()
-                    {
-                        break;
-                    }
-                    continue;
-                }
-                if in_paste {
-                    match &ev {
-                        // \r (0x0D) → termion Key::Char('\n'); treat as newline.
-                        Event::Key(Key::Char('\n')) => {
-                            paste_buf.push('\n');
-                            saw_cr = true;
+            let mut parser = InputParser::new();
+            let mut buf = [0u8; 256];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        for &b in &buf[..n] {
+                            if let Some(ev) = parser.advance(b)
+                                && tx_input.send(ev).is_err() {
+                                    return;
+                                }
                         }
-                        Event::Key(Key::Char(c)) => {
-                            saw_cr = false;
-                            paste_buf.push(*c);
-                        }
-                        // \n (0x0A) → CtrlJReader remaps to 0x00 → Key::Null.
-                        // Skip if preceded by \r (CRLF) to avoid double newlines.
-                        Event::Key(Key::Null) => {
-                            if !saw_cr {
-                                paste_buf.push('\n');
+                        // After each read burst, flush pending bare ESC.
+                        // Terminal emulators send escape sequences atomically,
+                        // so a pending ESC means the user pressed Escape alone.
+                        if let Some(ev) = parser.flush()
+                            && tx_input.send(ev).is_err() {
+                                return;
                             }
-                            saw_cr = false;
-                        }
-                        Event::Key(Key::Backspace) => {
-                            saw_cr = false;
-                            paste_buf.push('\x7f');
-                        }
-                        _ => {
-                            saw_cr = false;
-                        }
                     }
-                    continue;
-                }
-                if let Some((mouse, mods)) = decode_mouse_event(&ev, &raw) {
-                    if tx_input.send(EditorEvent::Mouse(mouse, mods)).is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                if tx_input.send(EditorEvent::Term(ev)).is_err() {
-                    break;
+                    Err(_) => break,
                 }
             }
         });
@@ -454,7 +229,7 @@ impl Editor {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if crate::signal::take_sigwinch()
-                        && let Ok((w, h)) = termion::terminal_size()
+                        && let Ok((w, h)) = input::terminal_size()
                     {
                         self.view.width = w;
                         self.view.height = h;
@@ -469,13 +244,21 @@ impl Editor {
             stdout,
             "\x1b[?1004l\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h"
         )?;
+        write!(stdout, "\x1b[?1049l")?;
         stdout.flush()?;
+        input::disable_raw_mode(&old_termios)?;
         Ok(())
     }
 
     fn dispatch_event(&mut self, ev: EditorEvent) {
         match ev {
-            EditorEvent::Term(ev) => self.handle_event(ev),
+            EditorEvent::Key(key) => {
+                if self.cmd_buf.active {
+                    self.handle_cmd_key(key);
+                } else {
+                    self.handle_key(key);
+                }
+            }
             EditorEvent::Mouse(mouse, mods) => {
                 if !self.cmd_buf.active {
                     if self.find.active {
@@ -492,6 +275,9 @@ impl Editor {
                 } else {
                     self.paste_text(&text);
                 }
+            }
+            EditorEvent::FocusIn => {
+                self.check_external_modification();
             }
         }
     }
@@ -896,47 +682,6 @@ impl Editor {
         match_pos.map(|p| (cursor, p))
     }
 
-    fn handle_event(&mut self, ev: Event) {
-        match ev {
-            Event::Key(key) => {
-                if self.cmd_buf.active {
-                    self.handle_cmd_key(key);
-                } else {
-                    self.handle_key(key);
-                }
-            }
-            Event::Mouse(mouse) => {
-                if !self.cmd_buf.active {
-                    if self.find.active {
-                        self.exit_find_mode();
-                    }
-                    self.handle_mouse(mouse, MouseMods::default());
-                }
-            }
-            Event::Unsupported(bytes) => {
-                if bytes == FOCUS_IN {
-                    self.check_external_modification();
-                } else if !self.cmd_buf.active {
-                    if bytes == CTRL_SHIFT_UP {
-                        self.select_above();
-                    } else if bytes == CTRL_SHIFT_DOWN {
-                        self.select_below();
-                    } else if bytes == CTRL_LEFT || bytes == CTRL_LEFT_RXVT {
-                        self.word_left();
-                    } else if bytes == CTRL_RIGHT || bytes == CTRL_RIGHT_RXVT {
-                        self.word_right();
-                    } else if bytes == CTRL_SHIFT_LEFT {
-                        self.word_left_extend();
-                    } else if bytes == CTRL_SHIFT_RIGHT {
-                        self.word_right_extend();
-                    } else if bytes == CTRL_BACKSPACE_CSI_U || bytes == CTRL_DELETE_XTERM {
-                        self.ctrl_backspace();
-                    }
-                }
-            }
-        }
-    }
-
     fn handle_key(&mut self, key: Key) {
         // Handle quit confirmation
         if self.quit_pending {
@@ -1064,6 +809,12 @@ impl Editor {
             Key::End => self.move_end(),
             Key::CtrlLeft => self.word_left(),
             Key::CtrlRight => self.word_right(),
+            Key::CtrlUp => self.move_up(),
+            Key::CtrlDown => self.move_down(),
+            Key::CtrlShiftUp => self.select_above(),
+            Key::CtrlShiftDown => self.select_below(),
+            Key::CtrlShiftLeft => self.word_left_extend(),
+            Key::CtrlShiftRight => self.word_right_extend(),
             Key::PageUp => self.page_up(),
             Key::PageDown => self.page_down(),
 
@@ -3748,8 +3499,8 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::{Key, MouseButton, MouseEvent};
     use crate::selection::Caret;
-    use termion::event::{Event, Key, MouseButton, MouseEvent};
 
     fn ed(text: &str) -> Editor {
         ed_impl(text, None)
@@ -4681,7 +4432,7 @@ mod tests {
     #[test]
     fn test_handle_event_dispatches_key() {
         let mut e = ed("hello");
-        e.handle_event(Event::Key(Key::Char('x')));
+        e.dispatch_event(EditorEvent::Key(Key::Char('x')));
         assert_eq!(e.test_text(), "xhello");
     }
 
@@ -4689,7 +4440,10 @@ mod tests {
     fn test_handle_event_mouse_ignored_when_cmd_active() {
         let mut e = ed("hello");
         e.cmd_buf.open(CommandBufferMode::Command, "> ", "");
-        e.handle_event(Event::Mouse(MouseEvent::Press(MouseButton::Left, 1, 1)));
+        e.dispatch_event(EditorEvent::Mouse(
+            MouseEvent::Press(MouseButton::Left, 1, 1),
+            MouseMods::default(),
+        ));
         // Mouse should be ignored when cmd_buf is active
         assert!(e.cmd_buf.active);
     }
@@ -4698,7 +4452,7 @@ mod tests {
     fn test_handle_event_unsupported_ctrl_shift_up() {
         let mut e = ed("hello\nworld");
         e.set_cursor(Pos::new(1, 3));
-        e.handle_event(Event::Unsupported(CTRL_SHIFT_UP.to_vec()));
+        e.dispatch_event(EditorEvent::Key(Key::CtrlShiftUp));
         assert_eq!(sel(&e).cursor, Pos::new(0, 0));
     }
 
@@ -4706,7 +4460,7 @@ mod tests {
     fn test_handle_event_unsupported_ctrl_shift_down() {
         let mut e = ed("hello\nworld");
         e.set_cursor(Pos::new(0, 2));
-        e.handle_event(Event::Unsupported(CTRL_SHIFT_DOWN.to_vec()));
+        e.dispatch_event(EditorEvent::Key(Key::CtrlShiftDown));
         assert_eq!(sel(&e).cursor, Pos::new(1, 5));
     }
 
@@ -4886,30 +4640,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_mouse_event_sgr_ctrl_click() {
-        let raw = b"\x1b[<16;2;4;M";
-        let (mouse, mods) = decode_mouse_event(&Event::Unsupported(raw.to_vec()), raw).unwrap();
-        assert_eq!(mouse, MouseEvent::Press(MouseButton::Left, 2, 4));
-        assert!(mods.ctrl);
-    }
-
-    #[test]
-    fn test_decode_mouse_event_x10_ctrl_click() {
-        let raw = [0x1b, b'[', b'M', 32 + 16, 32 + 2, 32 + 4];
-        let (mouse, mods) = decode_mouse_event(&Event::Unsupported(raw.to_vec()), &raw).unwrap();
-        assert_eq!(mouse, MouseEvent::Press(MouseButton::Left, 2, 4));
-        assert!(mods.ctrl);
-    }
-
-    #[test]
-    fn test_decode_mouse_event_rxvt_ctrl_click() {
-        let raw = b"\x1b[48;2;4M";
-        let (mouse, mods) = decode_mouse_event(&Event::Unsupported(raw.to_vec()), raw).unwrap();
-        assert_eq!(mouse, MouseEvent::Press(MouseButton::Left, 2, 4));
-        assert!(mods.ctrl);
-    }
-
-    #[test]
     fn test_ctrl_click_adds_caret_and_inserts_at_all_carets() {
         let mut e = ed("abc\ndef");
         e.ruler_on = false;
@@ -5040,7 +4770,10 @@ mod tests {
         let mut e = ed("hello world");
         e.find.active = true;
         e.find.matches = vec![(Pos::new(0, 0), Pos::new(0, 5))];
-        e.handle_event(Event::Mouse(MouseEvent::Press(MouseButton::Left, 1, 1)));
+        e.dispatch_event(EditorEvent::Mouse(
+            MouseEvent::Press(MouseButton::Left, 1, 1),
+            MouseMods::default(),
+        ));
         assert!(!e.find.active);
     }
 
@@ -5490,14 +5223,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_paste_start_end() {
-        assert!(is_paste_start(&Event::Unsupported(PASTE_START.to_vec())));
-        assert!(is_paste_end(&Event::Unsupported(PASTE_END.to_vec())));
-        assert!(!is_paste_start(&Event::Key(Key::Char('a'))));
-        assert!(!is_paste_end(&Event::Key(Key::Char('a'))));
-    }
-
-    #[test]
     fn test_cursor_display_col_with_tabs() {
         let mut e = ed("\thello");
         e.set_cursor(Pos::new(0, 1));
@@ -5509,17 +5234,6 @@ mod tests {
         let mut e = ed("hello");
         e.set_cursor(Pos::new(0, 3));
         assert_eq!(e.cursor_display_col(), 3);
-    }
-
-    #[test]
-    fn test_find_matching_bracket() {
-        let mut e = ed("(hello)");
-        e.set_cursor(Pos::new(0, 0));
-        let result = e.find_matching_bracket();
-        assert!(result.is_some());
-        let (cursor, match_pos) = result.unwrap();
-        assert_eq!(cursor, Pos::new(0, 0));
-        assert_eq!(match_pos, Pos::new(0, 6));
     }
 
     #[test]
@@ -5883,7 +5597,7 @@ mod tests {
     fn test_handle_event_dispatches_cmd_key() {
         let mut e = ed("hello");
         e.cmd_buf.open(CommandBufferMode::Command, "> ", "");
-        e.handle_event(Event::Key(Key::Char('x')));
+        e.dispatch_event(EditorEvent::Key(Key::Char('x')));
         assert_eq!(e.cmd_buf.input, "x");
     }
 
@@ -5891,7 +5605,7 @@ mod tests {
     fn test_unsupported_ignored_when_cmd_active() {
         let mut e = ed("hello\nworld");
         e.cmd_buf.open(CommandBufferMode::Command, "> ", "");
-        e.handle_event(Event::Unsupported(CTRL_SHIFT_UP.to_vec()));
+        e.dispatch_event(EditorEvent::Key(Key::CtrlShiftUp));
         // Should be ignored, cursor unchanged
         assert_eq!(e.cursor(), Pos::new(0, 0));
     }
@@ -6718,8 +6432,8 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test.txt");
         std::fs::write(&path, b"original").unwrap();
-
         let mut e = ed_named("original", path.to_str().unwrap());
+
         e.file_mtime = crate::file_io::file_mtime(&path);
 
         // Modify file externally
@@ -6784,7 +6498,7 @@ mod tests {
         std::fs::write(&path, b"changed").unwrap();
 
         // Send focus-in event
-        e.handle_event(Event::Unsupported(FOCUS_IN.to_vec()));
+        e.dispatch_event(EditorEvent::FocusIn);
         assert!(e.reload_pending);
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -10,8 +10,8 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crate::input::Key;
 use fxhash::FxHashMap;
-use termion::event::Key;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EditorAction {
@@ -149,7 +149,7 @@ pub fn parse_action(s: &str) -> Option<EditorAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use termion::event::Key;
+    use crate::input::Key;
 
     // -- default bindings -----------------------------------------------------
 

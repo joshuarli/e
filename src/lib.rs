@@ -7,6 +7,7 @@ pub mod editor;
 pub mod file_io;
 pub mod find;
 pub mod highlight;
+pub mod input;
 pub mod keybind;
 pub mod language;
 pub mod mouse;

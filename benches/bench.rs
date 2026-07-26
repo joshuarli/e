@@ -408,7 +408,7 @@ fn command_palette_trace_python_10k(b: Bencher) {
     bench_with_syscall_trace(b, || {
         command.open(CommandBufferMode::Command, "> ", "");
         for ch in "goto 5000".chars() {
-            let result = command.handle_key(termion::event::Key::Char(ch));
+            let result = command.handle_key(e::input::Key::Char(ch));
             if matches!(result, CommandBufferResult::Changed(_)) {
                 let line = command.display_line();
                 render_editor_frame(
@@ -425,7 +425,7 @@ fn command_palette_trace_python_10k(b: Bencher) {
                 );
             }
         }
-        let result = command.handle_key(termion::event::Key::Char('\n'));
+        let result = command.handle_key(e::input::Key::Char('\n'));
         if let CommandBufferResult::Submit(input) = result {
             let action = registry.execute(&input);
             command.close();
@@ -463,7 +463,7 @@ fn find_command_trace_python_10k(b: Bencher) {
         command.open(CommandBufferMode::Find, "find: ", "");
         find.clear();
         for ch in "benchmark_token_123".chars() {
-            let result = command.handle_key(termion::event::Key::Char(ch));
+            let result = command.handle_key(e::input::Key::Char(ch));
             if let CommandBufferResult::Changed(pattern) = result {
                 find.update_highlights_lazy(&pattern, &doc.buf, &view);
                 let line = command.display_line();
