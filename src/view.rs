@@ -11,6 +11,13 @@ pub struct View {
     pub height: u16,
 }
 
+/// Logical content position kept at the center of the viewport during layout changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewportAnchor {
+    pub line: usize,
+    pub display_col: usize,
+}
+
 /// How many screen rows a line of given display width occupies (minimum 1).
 pub fn wrapped_rows(display_width: usize, text_cols: usize) -> usize {
     if text_cols == 0 || display_width == 0 {
@@ -37,6 +44,77 @@ impl View {
     /// Width available for text after the gutter.
     pub fn text_cols(&self, gutter_width: usize) -> usize {
         (self.width as usize).saturating_sub(gutter_width)
+    }
+
+    /// Return the logical content position currently shown at the viewport center.
+    pub fn center_anchor(
+        &self,
+        line_count: usize,
+        gutter_width: usize,
+        line_display_width: &mut dyn FnMut(usize) -> usize,
+    ) -> Option<ViewportAnchor> {
+        let rows = self.text_rows();
+        let text_cols = self.text_cols(gutter_width);
+        if rows == 0 || text_cols == 0 || line_count == 0 {
+            return None;
+        }
+
+        let mut line = self.scroll_line.min(line_count - 1);
+        let mut wrap = self.scroll_wrap;
+        let mut display_col = wrap.saturating_mul(text_cols);
+        let target_row = rows / 2;
+
+        for _ in 0..target_row {
+            let wraps = wrapped_rows(line_display_width(line), text_cols);
+            if wrap + 1 < wraps {
+                wrap += 1;
+                display_col = display_col.saturating_add(text_cols);
+            } else if line + 1 < line_count {
+                line += 1;
+                wrap = 0;
+                display_col = 0;
+            } else {
+                break;
+            }
+        }
+
+        Some(ViewportAnchor { line, display_col })
+    }
+
+    /// Recenter the viewport on a logical content position after a layout change.
+    pub fn center_on_anchor(
+        &mut self,
+        anchor: ViewportAnchor,
+        line_count: usize,
+        gutter_width: usize,
+        line_display_width: &mut dyn FnMut(usize) -> usize,
+    ) {
+        let rows = self.text_rows();
+        let text_cols = self.text_cols(gutter_width);
+        if rows == 0 || text_cols == 0 || line_count == 0 {
+            return;
+        }
+
+        let line = anchor.line.min(line_count - 1);
+        let wraps = wrapped_rows(line_display_width(line), text_cols);
+        let mut start_line = line;
+        let mut start_wrap = (anchor.display_col / text_cols).min(wraps - 1);
+        let mut rows_to_walk = rows / 2;
+
+        while rows_to_walk > 0 {
+            if start_wrap > 0 {
+                start_wrap -= 1;
+            } else if start_line > 0 {
+                start_line -= 1;
+                start_wrap = wrapped_rows(line_display_width(start_line), text_cols) - 1;
+            } else {
+                break;
+            }
+            rows_to_walk -= 1;
+        }
+
+        self.scroll_line = start_line;
+        self.scroll_wrap = start_wrap;
     }
 
     /// Adjust scroll so that the cursor line/col is visible, with soft-wrap.
@@ -300,6 +378,35 @@ mod tests {
     fn test_text_cols_large_gutter() {
         let v = View::new(10, 24);
         assert_eq!(v.text_cols(15), 0); // saturating_sub
+    }
+
+    #[test]
+    fn test_center_anchor_preserves_logical_display_position() {
+        let mut v = View::new(14, 7); // text_cols=10, text_rows=5
+        v.scroll_line = 3;
+        let mut widths = |_line: usize| 25;
+        let anchor = v.center_anchor(20, 4, &mut widths).unwrap();
+        assert_eq!(
+            anchor,
+            ViewportAnchor {
+                line: 3,
+                display_col: 20
+            }
+        );
+
+        v.width = 24; // text_cols=20
+        v.height = 9; // text_rows=7
+        v.center_on_anchor(anchor, 20, 4, &mut widths);
+
+        let mut resized_widths = |_line: usize| 25;
+        assert_eq!(v.center_anchor(20, 4, &mut resized_widths), Some(anchor));
+    }
+
+    #[test]
+    fn test_center_anchor_handles_empty_layout() {
+        let v = View::new(80, 2);
+        let mut widths = |_line: usize| 10;
+        assert_eq!(v.center_anchor(1, 4, &mut widths), None);
     }
 
     // -- wrapped_rows ---------------------------------------------------------

@@ -2,9 +2,18 @@ use crate::buffer::{self, GapBuffer};
 use crate::selection::Pos;
 use crate::view::View;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ViewportMatchCache {
+    buffer_version: u64,
+    scroll_line: usize,
+    scroll_wrap: usize,
+    width: u16,
+    height: u16,
+}
+
 pub struct FindState {
     pub pattern: String,
-    /// Viewport-only matches, repopulated each draw() call.
+    /// Viewport-only matches, reused until the buffer or viewport changes.
     pub matches: Vec<(Pos, Pos)>,
     /// Compiled regex cached across keystrokes.
     pub re: Option<regex_lite::Regex>,
@@ -19,6 +28,7 @@ pub struct FindState {
     total_count_known: bool,
     /// Cursor position captured when find mode is opened; search anchors here.
     pub search_start: Pos,
+    viewport_cache: Option<ViewportMatchCache>,
 }
 
 impl Default for FindState {
@@ -39,6 +49,7 @@ impl FindState {
             total_count: 0,
             total_count_known: false,
             search_start: Pos::zero(),
+            viewport_cache: None,
         }
     }
 
@@ -50,6 +61,7 @@ impl FindState {
         self.current_index = 0;
         self.total_count = 0;
         self.total_count_known = false;
+        self.viewport_cache = None;
     }
 
     /// Update find highlights for a new pattern. Scans viewport and picks
@@ -76,6 +88,7 @@ impl FindState {
         self.current = None;
         self.total_count = 0;
         self.total_count_known = false;
+        self.viewport_cache = None;
         self.pattern = pattern.to_string();
         if pattern.is_empty() {
             self.re = None;
@@ -110,10 +123,23 @@ impl FindState {
         }
     }
 
-    /// Scan only the current viewport lines and populate `matches`.
+    /// Scan visible lines only when the buffer version or viewport geometry changed.
     pub fn refresh_viewport_matches(&mut self, buf: &GapBuffer, view: &View) {
+        let cache = ViewportMatchCache {
+            buffer_version: buf.version(),
+            scroll_line: view.scroll_line,
+            scroll_wrap: view.scroll_wrap,
+            width: view.width,
+            height: view.height,
+        };
+        if self.viewport_cache == Some(cache) {
+            return;
+        }
         self.matches.clear();
-        let Some(re) = self.re.as_ref() else { return };
+        let Some(re) = self.re.as_ref() else {
+            self.viewport_cache = Some(cache);
+            return;
+        };
         let line_count = buf.line_count();
         let viewport_end = (view.scroll_line + view.text_rows() + 4).min(line_count);
         let mut line_buf = Vec::new();
@@ -129,6 +155,7 @@ impl FindState {
                     .push((Pos::new(line_idx, start_col), Pos::new(line_idx, end_col)));
             }
         }
+        self.viewport_cache = Some(cache);
     }
 
     /// Return the 1-based index of the match starting at `pos` in the file.
@@ -281,6 +308,7 @@ impl FindState {
         self.current_index = 0;
         self.total_count = 0;
         self.total_count_known = false;
+        self.viewport_cache = None;
         current
     }
 
@@ -318,5 +346,25 @@ impl FindState {
             regex_lite::Regex::new(pattern)
         };
         result.ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_matches_refresh_after_buffer_version_changes() {
+        let mut buf = GapBuffer::from_vec(b"alpha\nbeta".to_vec());
+        let view = View::new(80, 24);
+        let mut find = FindState::new();
+        find.update_highlights_lazy("alpha", &buf, &view);
+        assert_eq!(find.matches.len(), 1);
+
+        find.refresh_viewport_matches(&buf, &view);
+        buf.insert(5, b" alpha");
+        find.refresh_viewport_matches(&buf, &view);
+
+        assert_eq!(find.matches.len(), 2);
     }
 }

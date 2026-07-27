@@ -260,6 +260,31 @@ fn find_update_python_10k(b: Bencher) {
 }
 
 #[divan::bench]
+fn find_refresh_viewport_cached_python_10k(b: Bencher) {
+    let buf = GapBuffer::from_vec(make_python_source(10_000));
+    let view = View::new(120, 40);
+    let mut find = FindState::new();
+    find.update_highlights_lazy(r"benchmark_token_\d+", &buf, &view);
+    bench_with_syscall_trace(b, || {
+        find.refresh_viewport_matches(&buf, &view);
+        black_box(find.matches.len());
+    });
+}
+
+#[divan::bench]
+fn find_refresh_viewport_invalidated_python_10k(b: Bencher) {
+    let buf = GapBuffer::from_vec(make_python_source(10_000));
+    let mut view = View::new(120, 40);
+    let mut find = FindState::new();
+    find.update_highlights_lazy(r"benchmark_token_\d+", &buf, &view);
+    bench_with_syscall_trace(b, || {
+        view.scroll_line = if view.scroll_line == 0 { 1 } else { 0 };
+        find.refresh_viewport_matches(&buf, &view);
+        black_box(find.matches.len());
+    });
+}
+
+#[divan::bench]
 fn paste_multiline_python_100k_into_10k(b: Bencher) {
     let mut doc = Document::new(make_python_source(10_000), Some("fixture.py".to_string()));
     let paste = make_python_source_bytes(100 * 1024);
@@ -325,6 +350,35 @@ fn viewport_ensure_cursor_visible_jump(b: Bencher) {
             view.ensure_cursor_visible(line, 0, 5, &mut widths);
         }
         black_box(&view);
+    });
+}
+
+#[divan::bench]
+fn viewport_resize_unanchored_100k(b: Bencher) {
+    let mut view = View::new(120, 40);
+    view.scroll_line = 50_000;
+    bench_with_syscall_trace(b, || {
+        view.width = if view.width == 120 { 80 } else { 120 };
+        view.height = if view.height == 40 { 30 } else { 40 };
+        black_box((view.scroll_line, view.scroll_wrap));
+    });
+}
+
+#[divan::bench]
+fn viewport_resize_anchored_100k(b: Bencher) {
+    let mut view = View::new(120, 40);
+    view.scroll_line = 50_000;
+    let line_count = 100_000;
+    let gutter = 6;
+    let mut widths = |_line: usize| 240;
+    bench_with_syscall_trace(b, || {
+        let anchor = view.center_anchor(line_count, gutter, &mut widths);
+        view.width = if view.width == 120 { 80 } else { 120 };
+        view.height = if view.height == 40 { 30 } else { 40 };
+        if let Some(anchor) = anchor {
+            view.center_on_anchor(anchor, line_count, gutter, &mut widths);
+        }
+        black_box((view.scroll_line, view.scroll_wrap));
     });
 }
 

@@ -185,17 +185,19 @@ impl Editor {
                     Ok(n) => {
                         for &b in &buf[..n] {
                             if let Some(ev) = parser.advance(b)
-                                && tx_input.send(ev).is_err() {
-                                    return;
-                                }
+                                && tx_input.send(ev).is_err()
+                            {
+                                return;
+                            }
                         }
                         // After each read burst, flush pending bare ESC.
                         // Terminal emulators send escape sequences atomically,
                         // so a pending ESC means the user pressed Escape alone.
                         if let Some(ev) = parser.flush()
-                            && tx_input.send(ev).is_err() {
-                                return;
-                            }
+                            && tx_input.send(ev).is_err()
+                        {
+                            return;
+                        }
                     }
                     Err(_) => break,
                 }
@@ -231,9 +233,7 @@ impl Editor {
                     if crate::signal::take_sigwinch()
                         && let Ok((w, h)) = input::terminal_size()
                     {
-                        self.view.width = w;
-                        self.view.height = h;
-                        self.renderer.force_full_redraw();
+                        self.resize_view(w, h);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -248,6 +248,32 @@ impl Editor {
         stdout.flush()?;
         input::disable_raw_mode(&old_termios)?;
         Ok(())
+    }
+
+    /// Resize the terminal while keeping the logical center near the same content.
+    fn resize_view(&mut self, width: u16, height: u16) {
+        let line_count = self.doc.buf.line_count();
+        let gutter = if self.ruler_on {
+            gutter_width(line_count)
+        } else {
+            0
+        };
+        let anchor = {
+            let buf = &self.doc.buf;
+            let mut widths = |line: usize| buf.display_col_at(line, usize::MAX);
+            self.view.center_anchor(line_count, gutter, &mut widths)
+        };
+
+        self.view.width = width;
+        self.view.height = height;
+
+        if let Some(anchor) = anchor {
+            let buf = &self.doc.buf;
+            let mut widths = |line: usize| buf.display_col_at(line, usize::MAX);
+            self.view
+                .center_on_anchor(anchor, line_count, gutter, &mut widths);
+        }
+        self.renderer.force_full_redraw();
     }
 
     fn dispatch_event(&mut self, ev: EditorEvent) {

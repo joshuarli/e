@@ -1079,3 +1079,49 @@ Dark grey background (`\x1b[0;100m`). Full width.
 - 2 spaces for all files except `.c`, `.h`, `.go`, `Makefile` which use tabs.
 - Determined by checking `doc.filename` for these extensions/names.
 - Same logic used for both Tab key insertion and indent selection.
+
+## 24. Agent Navigation Map
+
+Use these distinctive paths and symbols as the first search targets for behavior changes:
+
+- `src/main.rs` — CLI arguments, file safety checks, file locks, and editor startup.
+- `src/editor.rs` — event loop, key dispatch, editing commands, cursor state, and `Editor::resize_view()`.
+- `src/document.rs` — mutations, `RawEdit`, undo/redo, dirty state, and filenames.
+- `src/buffer.rs` — `GapBuffer`, incremental line starts, UTF-8 positions, ASCII fast paths, and `GapBuffer::version()`.
+- `src/view.rs` — `View`, soft-wrap scrolling, cursor mapping, `ViewportAnchor`, `View::center_anchor()`, and `View::center_on_anchor()`.
+- `src/render.rs` — ANSI output, cached syntax state, dirty rows, and reusable render scratch buffers.
+- `src/find.rs` — `FindState`, regex compilation, viewport match caching, navigation, and match counts.
+- `src/highlight.rs` — syntax rules, incremental line-state highlighting, and bracket matching.
+- `src/operation.rs` — undo grouping and callback-based undo/redo replay.
+
+Terminology is intentional: `Pos` is a character position, a `GapBuffer` byte offset is an internal storage coordinate, a `RawEdit` is a planned document mutation, and a `ViewportAnchor` is a display-coordinate position used across terminal layout changes.
+
+## 25. Mutation and Invalidation Contracts
+
+`GapBuffer::insert()` and `GapBuffer::delete()` update the line-start index, per-line ASCII flags, `min_dirty_line`, and the monotonic `GapBuffer::version()`. `GapBuffer::take_dirty_line()` is the renderer invalidation boundary.
+
+`Document::insert()`, `Document::delete_range()`, `Document::insert_at_byte_with_carets()`, and `Document::delete_at_byte_with_carets()` are the single-operation recording paths. `Document::apply_batch()` consumes sorted `RawEdit` values for multi-caret or line-wise edits and records one undo group.
+
+Consumers should use these existing edit effects rather than creating a second change model:
+
+- `Renderer::render()` compares `GapBuffer::version()` and consumes `GapBuffer::take_dirty_line()` before recomputing cached syntax state.
+- `FindState::refresh_viewport_matches()` caches matches by buffer version and viewport geometry, so repeated draws do not rescan unchanged visible lines.
+- `Editor::resize_view()` captures a `ViewportAnchor` before changing terminal dimensions and restores that logical display position afterward.
+
+## 26. Agent-Facing Benchmark Contract
+
+`benches/bench.rs` is the executable benchmark contract. Name benchmarks after the source behavior they cover so `rg` finds both implementation and measurement:
+
+- `viewport_resize_unanchored_100k` and `viewport_resize_anchored_100k` compare raw terminal dimension changes with logical-center preservation through `View::center_anchor()` and `View::center_on_anchor()`.
+- `find_refresh_viewport_cached_python_10k` measures a repeated refresh with unchanged `GapBuffer::version()` and viewport geometry.
+- `find_refresh_viewport_invalidated_python_10k` measures the required scan path after viewport geometry changes.
+- `render_incr_noop_120x40`, `render_incr_cursor_move_120x40`, and `render_incr_scroll_120x40` cover reusable renderer buffers and dirty-row comparison.
+
+Run `cargo bench --bench bench` for raw Divan output or `make bench` for host-keyed timing, allocation, and syscall baselines. For behavior-preserving optimizations, compare median time, allocation count, allocation bytes, and the correctness tests for the affected cache or viewport state. A faster benchmark that skips required invalidation is not a valid improvement.
+
+## 27. Agent Documentation Rules
+
+- Put explanations above the definition they describe, especially for invariants, platform workarounds, ownership boundaries, and intentional absences.
+- Pick one spelling per concept: use `Pos` for character positions, byte offset for storage coordinates, `RawEdit` for planned document mutations, and `ViewportAnchor` for display-coordinate resize preservation.
+- Name tests after the source or behavior they cover: `src/view.rs` covers `View`, `src/find.rs` covers `FindState`, and benchmark names identify the measured behavior.
+- Keep legacy paths clearly marked and do not introduce new references to them.
