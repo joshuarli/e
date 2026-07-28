@@ -1,6 +1,6 @@
 /// Viewport: tracks scroll offsets and maps cursor position to screen coordinates.
 #[derive(Clone)]
-pub struct View {
+pub struct Viewport {
     /// First visible line (0-indexed logical line).
     pub scroll_line: usize,
     /// Which wrapped sub-row of `scroll_line` is at top of screen (0 = first row).
@@ -26,7 +26,7 @@ pub fn wrapped_rows(display_width: usize, text_cols: usize) -> usize {
     display_width.div_ceil(text_cols)
 }
 
-impl View {
+impl Viewport {
     pub fn new(width: u16, height: u16) -> Self {
         Self {
             scroll_line: 0,
@@ -117,7 +117,7 @@ impl View {
         self.scroll_wrap = start_wrap;
     }
 
-    /// Adjust scroll so that the cursor line/col is visible, with soft-wrap.
+    /// Adjust scroll so that the cursor line/column is visible, with soft-wrap.
     ///
     /// `line_display_width` returns the total display width for a given line index.
     pub fn ensure_cursor_visible(
@@ -265,12 +265,12 @@ impl View {
         self.scroll_wrap = start_wrap;
     }
 
-    /// Convert a buffer (line, col) to screen (row, col). Returns None if off-screen.
+    /// Convert a buffer (line, column) to screen (row, column). Returns None if off-screen.
     #[allow(dead_code)]
     pub fn buffer_to_screen(
         &self,
         line: usize,
-        col: usize,
+        column: usize,
         gutter_width: usize,
         line_display_width: &mut dyn FnMut(usize) -> usize,
     ) -> Option<(u16, u16)> {
@@ -288,7 +288,7 @@ impl View {
         }
 
         if line == self.scroll_line {
-            let wrap = col / text_cols;
+            let wrap = column / text_cols;
             if wrap < self.scroll_wrap {
                 return None;
             }
@@ -302,7 +302,7 @@ impl View {
                 screen_row += wrapped_rows(line_display_width(l), text_cols);
             }
 
-            let wrap = col / text_cols;
+            let wrap = column / text_cols;
             screen_row += wrap;
         }
 
@@ -310,7 +310,7 @@ impl View {
             return None;
         }
 
-        let screen_col = (col % text_cols) + gutter_width;
+        let screen_col = (column % text_cols) + gutter_width;
         if screen_col >= self.width as usize {
             return None;
         }
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let v = View::new(80, 24);
+        let v = Viewport::new(80, 24);
         assert_eq!(v.scroll_line, 0);
         assert_eq!(v.scroll_wrap, 0);
         assert_eq!(v.width, 80);
@@ -340,49 +340,49 @@ mod tests {
 
     #[test]
     fn test_text_rows() {
-        let v = View::new(80, 24);
+        let v = Viewport::new(80, 24);
         assert_eq!(v.text_rows(), 22); // 24 - 2 (status bar + command line)
     }
 
     #[test]
     fn test_text_rows_small_terminal() {
-        let v = View::new(80, 3);
+        let v = Viewport::new(80, 3);
         assert_eq!(v.text_rows(), 1);
     }
 
     #[test]
     fn test_text_rows_minimum() {
-        let v = View::new(80, 2);
+        let v = Viewport::new(80, 2);
         assert_eq!(v.text_rows(), 0);
     }
 
     #[test]
     fn test_text_rows_very_small() {
-        let v = View::new(80, 1);
+        let v = Viewport::new(80, 1);
         assert_eq!(v.text_rows(), 0); // saturating_sub
     }
 
     #[test]
     fn test_text_cols() {
-        let v = View::new(80, 24);
+        let v = Viewport::new(80, 24);
         assert_eq!(v.text_cols(5), 75); // 80 - 5 gutter
     }
 
     #[test]
     fn test_text_cols_no_gutter() {
-        let v = View::new(80, 24);
+        let v = Viewport::new(80, 24);
         assert_eq!(v.text_cols(0), 80);
     }
 
     #[test]
     fn test_text_cols_large_gutter() {
-        let v = View::new(10, 24);
+        let v = Viewport::new(10, 24);
         assert_eq!(v.text_cols(15), 0); // saturating_sub
     }
 
     #[test]
     fn test_center_anchor_preserves_logical_display_position() {
-        let mut v = View::new(14, 7); // text_cols=10, text_rows=5
+        let mut v = Viewport::new(14, 7); // text_cols=10, text_rows=5
         v.scroll_line = 3;
         let mut widths = |_line: usize| 25;
         let anchor = v.center_anchor(20, 4, &mut widths).unwrap();
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_center_anchor_handles_empty_layout() {
-        let v = View::new(80, 2);
+        let v = Viewport::new(80, 2);
         let mut widths = |_line: usize| 10;
         assert_eq!(v.center_anchor(1, 4, &mut widths), None);
     }
@@ -445,14 +445,14 @@ mod tests {
 
     #[test]
     fn test_ensure_visible_cursor_already_visible() {
-        let mut v = View::new(80, 24);
+        let mut v = Viewport::new(80, 24);
         v.ensure_cursor_visible(10, 5, 4, &mut trivial_width);
         assert_eq!(v.scroll_line, 0); // no scroll needed, line 10 is within 0..22
     }
 
     #[test]
     fn test_ensure_visible_scrolls_down() {
-        let mut v = View::new(80, 24);
+        let mut v = Viewport::new(80, 24);
         v.ensure_cursor_visible(30, 0, 4, &mut trivial_width);
         // Cursor at line 30, text_rows=22, scroll_line should be 9
         assert_eq!(v.scroll_line, 9);
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_ensure_visible_scrolls_up() {
-        let mut v = View::new(80, 24);
+        let mut v = Viewport::new(80, 24);
         v.scroll_line = 50;
         v.ensure_cursor_visible(10, 0, 4, &mut trivial_width);
         assert_eq!(v.scroll_line, 10);
@@ -468,14 +468,14 @@ mod tests {
 
     #[test]
     fn test_ensure_visible_zero_rows() {
-        let mut v = View::new(80, 2); // text_rows = 0
+        let mut v = Viewport::new(80, 2); // text_rows = 0
         v.ensure_cursor_visible(10, 0, 4, &mut trivial_width);
         assert_eq!(v.scroll_line, 0);
     }
 
     #[test]
     fn test_ensure_visible_zero_text_cols() {
-        let mut v = View::new(5, 24);
+        let mut v = Viewport::new(5, 24);
         v.ensure_cursor_visible(0, 100, 10, &mut trivial_width);
         // text_cols = 0, early return
         assert_eq!(v.scroll_line, 0);
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_ensure_visible_cursor_at_last_row() {
-        let mut v = View::new(80, 24);
+        let mut v = Viewport::new(80, 24);
         // text_rows=22, cursor at line 21 should not scroll
         v.ensure_cursor_visible(21, 0, 4, &mut trivial_width);
         assert_eq!(v.scroll_line, 0);
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_ensure_visible_at_line_zero() {
-        let mut v = View::new(80, 24);
+        let mut v = Viewport::new(80, 24);
         v.scroll_line = 10;
         v.ensure_cursor_visible(0, 0, 4, &mut trivial_width);
         assert_eq!(v.scroll_line, 0);
@@ -504,9 +504,9 @@ mod tests {
     #[test]
     fn test_ensure_visible_wrapped_line() {
         // 10 cols text area, line 0 is 25 chars wide → 3 wrapped rows
-        let mut v = View::new(14, 7); // text_rows=5, text_cols=10 (14-4 gutter)
+        let mut v = Viewport::new(14, 7); // text_rows=5, text_cols=10 (14-4 gutter)
         let mut widths = |_line: usize| -> usize { 25 };
-        // cursor at col 22 → wrap row 2 (0-indexed)
+        // cursor at column 22 → wrap row 2 (0-indexed)
         v.ensure_cursor_visible(0, 22, 4, &mut widths);
         assert_eq!(v.scroll_line, 0);
         // cursor wrap=2, scroll_wrap=0, screen_rows=3 ≤ 5, no scroll needed
@@ -516,8 +516,8 @@ mod tests {
     #[test]
     fn test_ensure_visible_wrapped_scrolls_down() {
         // 10 cols text area, terminal 5 text rows
-        let mut v = View::new(14, 7); // text_rows=5, text_cols=10
-        // Line 0 is 60 chars → 6 wrapped rows. Cursor at col 55 → wrap 5
+        let mut v = Viewport::new(14, 7); // text_rows=5, text_cols=10
+        // Line 0 is 60 chars → 6 wrapped rows. Cursor at column 55 → wrap 5
         let mut widths = |_line: usize| -> usize { 60 };
         v.ensure_cursor_visible(0, 55, 4, &mut widths);
         // Need wrap 5 visible, 5 rows available → scroll_wrap should be 1
@@ -529,35 +529,35 @@ mod tests {
 
     #[test]
     fn test_buffer_to_screen_basic() {
-        let v = View::new(80, 24);
+        let v = Viewport::new(80, 24);
         let result = v.buffer_to_screen(0, 0, 4, &mut trivial_width);
-        assert_eq!(result, Some((0, 4))); // row 0, col 0 + gutter
+        assert_eq!(result, Some((0, 4))); // row 0, column 0 + gutter
     }
 
     #[test]
     fn test_buffer_to_screen_line_above_viewport() {
-        let mut v = View::new(80, 24);
+        let mut v = Viewport::new(80, 24);
         v.scroll_line = 10;
         assert_eq!(v.buffer_to_screen(5, 0, 4, &mut trivial_width), None);
     }
 
     #[test]
     fn test_buffer_to_screen_line_below_viewport() {
-        let v = View::new(80, 24);
+        let v = Viewport::new(80, 24);
         // text_rows = 22, so lines 0..22 are visible
         assert_eq!(v.buffer_to_screen(22, 0, 4, &mut trivial_width), None);
     }
 
     #[test]
     fn test_buffer_to_screen_no_gutter() {
-        let v = View::new(80, 24);
+        let v = Viewport::new(80, 24);
         let result = v.buffer_to_screen(5, 10, 0, &mut trivial_width);
         assert_eq!(result, Some((5, 10)));
     }
 
     #[test]
     fn test_buffer_to_screen_last_visible_line() {
-        let v = View::new(80, 24);
+        let v = Viewport::new(80, 24);
         // text_rows = 22, last visible line is 21
         let result = v.buffer_to_screen(21, 0, 4, &mut trivial_width);
         assert_eq!(result, Some((21, 4)));
@@ -567,7 +567,7 @@ mod tests {
 
     #[test]
     fn test_center_on_line_middle() {
-        let mut v = View::new(80, 24);
+        let mut v = Viewport::new(80, 24);
         let mut widths = |_: usize| -> usize { 10 }; // short lines
         v.center_on_line(50, &mut widths, 4);
         // scroll_line should be roughly 50 - 11 = 39
@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_center_on_line_near_start() {
-        let mut v = View::new(80, 24);
+        let mut v = Viewport::new(80, 24);
         let mut widths = |_: usize| -> usize { 10 };
         v.center_on_line(3, &mut widths, 4);
         assert_eq!(v.scroll_line, 0);
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_center_on_line_zero_rows() {
-        let mut v = View::new(80, 2); // text_rows = 0
+        let mut v = Viewport::new(80, 2); // text_rows = 0
         let mut widths = |_: usize| -> usize { 10 };
         v.center_on_line(10, &mut widths, 4);
         assert_eq!(v.scroll_line, 0);
@@ -593,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_center_on_line_zero_text_cols() {
-        let mut v = View::new(4, 24); // text_cols = 0 with gutter 4
+        let mut v = Viewport::new(4, 24); // text_cols = 0 with gutter 4
         let mut widths = |_: usize| -> usize { 10 };
         v.center_on_line(10, &mut widths, 4);
         assert_eq!(v.scroll_line, 0);
@@ -602,7 +602,7 @@ mod tests {
     #[test]
     fn test_center_on_line_wrapped_target() {
         // Target line is very wide → wraps, center_on_line should still work
-        let mut v = View::new(14, 7); // text_rows=5, text_cols=10
+        let mut v = Viewport::new(14, 7); // text_rows=5, text_cols=10
         let mut widths = |line: usize| -> usize { if line == 50 { 100 } else { 10 } };
         v.center_on_line(50, &mut widths, 4);
         assert!(v.scroll_line <= 50);
@@ -612,7 +612,7 @@ mod tests {
 
     #[test]
     fn test_scroll_forward_multi_line() {
-        let mut v = View::new(80, 24);
+        let mut v = Viewport::new(80, 24);
         let mut widths = |_: usize| -> usize { 10 };
         v.scroll_forward(3, 76, &mut widths);
         assert_eq!(v.scroll_line, 3);
@@ -621,7 +621,7 @@ mod tests {
 
     #[test]
     fn test_scroll_forward_wrapping() {
-        let mut v = View::new(14, 24); // text_cols = 10
+        let mut v = Viewport::new(14, 24); // text_cols = 10
         // Line 0 has 25 display cols → 3 wraps
         let mut widths = |_: usize| -> usize { 25 };
         v.scroll_forward(2, 10, &mut widths);
@@ -633,13 +633,13 @@ mod tests {
 
     #[test]
     fn test_buffer_to_screen_zero_text_cols() {
-        let v = View::new(4, 24); // text_cols = 0 with gutter 4
+        let v = Viewport::new(4, 24); // text_cols = 0 with gutter 4
         assert_eq!(v.buffer_to_screen(0, 0, 4, &mut trivial_width), None);
     }
 
     #[test]
     fn test_buffer_to_screen_scroll_wrap_above() {
-        let mut v = View::new(14, 24); // text_cols=10
+        let mut v = Viewport::new(14, 24); // text_cols=10
         v.scroll_line = 0;
         v.scroll_wrap = 2; // scrolled past first 2 wrap rows
         // Col 5 is on wrap 0, which is before scroll_wrap → should return None
@@ -648,14 +648,14 @@ mod tests {
 
     #[test]
     fn test_buffer_to_screen_col_beyond_width() {
-        let v = View::new(10, 24); // width = 10, text_cols = 6 with gutter 4
-        // col 8 → wrap 1, screen_col = 8%6 + 4 = 6, within width 10
+        let v = Viewport::new(10, 24); // width = 10, text_cols = 6 with gutter 4
+        // column 8 → wrap 1, screen_col = 8%6 + 4 = 6, within width 10
         let result = v.buffer_to_screen(0, 8, 4, &mut trivial_width);
         assert_eq!(result, Some((1, 6)));
-        // screen_col = col % text_cols + gutter_width. If that >= width, returns None
+        // screen_col = column % text_cols + gutter_width. If that >= width, returns None
         // With text_cols=6, the max screen_col is 4+5=9 < 10, so it never exceeds.
-        // Test a case where col would land out of viewport rows instead
-        let v_small = View::new(10, 4); // text_rows = 2
+        // Test a case where column would land out of viewport rows instead
+        let v_small = Viewport::new(10, 4); // text_rows = 2
         let result = v_small.buffer_to_screen(0, 20, 4, &mut trivial_width);
         // wrap 20/6 = 3, screen_row = 3 >= text_rows(2) → None
         assert_eq!(result, None);
@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn test_center_on_line_partial_wrap() {
         // Triggers the partial wrap branch (lines 158-161) in center_on_line
-        let mut v = View::new(14, 14); // text_rows=12, text_cols=10 (with gutter 4)
+        let mut v = Viewport::new(14, 14); // text_rows=12, text_cols=10 (with gutter 4)
         // half = 6, target = 5 with width 10 → 1 wrap → remaining = 5
         // Lines 4..1 each have 1 wrap → remaining = 1
         // Line 0 has 100 display cols → 10 wraps. w=10 > remaining=1 → partial
@@ -678,11 +678,11 @@ mod tests {
     #[test]
     fn test_buffer_to_screen_wrapped() {
         // Line 0 is 20 chars wide, text_cols=10 → 2 wrapped rows
-        let v = View::new(14, 24); // text_cols=10 with gutter 4
+        let v = Viewport::new(14, 24); // text_cols=10 with gutter 4
         let mut widths = |_line: usize| -> usize { 20 };
-        // col 5 → wrap 0, screen col = 5 + 4 = 9
+        // column 5 → wrap 0, screen column = 5 + 4 = 9
         assert_eq!(v.buffer_to_screen(0, 5, 4, &mut widths), Some((0, 9)));
-        // col 12 → wrap 1, screen row 1, screen col = 2 + 4 = 6
+        // column 12 → wrap 1, screen row 1, screen column = 2 + 4 = 6
         assert_eq!(v.buffer_to_screen(0, 12, 4, &mut widths), Some((1, 6)));
     }
 }
@@ -714,7 +714,7 @@ mod proptests {
             scroll_line in 0usize..5000,
             scroll_wrap in 0usize..50,
         ) {
-            let mut v = View::new(width, height);
+            let mut v = Viewport::new(width, height);
             v.scroll_line = scroll_line;
             v.scroll_wrap = scroll_wrap;
 
@@ -733,17 +733,17 @@ mod proptests {
             width in 1u16..500,
             height in 1u16..200,
             line in 0usize..5000,
-            col in 0usize..5000,
+            column in 0usize..5000,
             gutter in 0usize..20,
             scroll_line in 0usize..5000,
             scroll_wrap in 0usize..50,
         ) {
-            let mut v = View::new(width, height);
+            let mut v = Viewport::new(width, height);
             v.scroll_line = scroll_line;
             v.scroll_wrap = scroll_wrap;
 
             let mut widths = |_line: usize| -> usize { 40 };
-            let _ = v.buffer_to_screen(line, col, gutter, &mut widths);
+            let _ = v.buffer_to_screen(line, column, gutter, &mut widths);
         }
 
         /// center_on_line never panics on arbitrary inputs.
@@ -754,7 +754,7 @@ mod proptests {
             line in 0usize..5000,
             gutter in 0usize..20,
         ) {
-            let mut v = View::new(width, height);
+            let mut v = Viewport::new(width, height);
             let mut widths = |_line: usize| -> usize { 40 };
             v.center_on_line(line, &mut widths, gutter);
         }

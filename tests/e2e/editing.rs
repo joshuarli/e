@@ -75,16 +75,16 @@ fn backspace_smart_dedent() {
     e.type_text("    x");
     // Move cursor to after the 4 spaces, before 'x'
     e.key(Key::Home);
-    e.key(Key::Right); // col 2
-    e.key(Key::Right); // col 4 (indent stop snapping: should be at col 4)
+    e.key(Key::Right); // column 2
+    e.key(Key::Right); // column 4 (indent stop snapping: should be at column 4)
     // Actually, let's be simpler: delete from end of spaces
     // Start fresh
     drop(e);
 
     let mut e = TestEditor::new(&[]);
     e.type_text("    "); // 4 spaces
-    // Cursor is at col 4 in leading whitespace
-    // Backspace should remove 2 spaces (smart dedent to col 2)
+    // Cursor is at column 4 in leading whitespace
+    // Backspace should remove 2 spaces (smart dedent to column 2)
     e.backspace();
     let r = e.row(0);
     // Should have 2 spaces left

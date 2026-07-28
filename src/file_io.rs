@@ -3,8 +3,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::operation::{Operation, OperationGroup, UndoStack};
-use crate::selection::{CaretSnapshot, Pos, Selection};
+use crate::operation::{UndoGroup, UndoOperation, UndoStack};
+use crate::selection::{CaretSnapshot, Selection, TextPosition};
 
 /// Read a file. Returns the raw bytes as-is.
 pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
@@ -119,7 +119,7 @@ pub fn file_size(path: &Path) -> io::Result<u64> {
 }
 
 /// File modification time, or None if unavailable.
-pub fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+pub fn file_modification_time(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
 
@@ -209,11 +209,11 @@ fn read_i64(data: &[u8], pos: &mut usize) -> Option<i64> {
     Some(v)
 }
 
-fn serialize_selection(buf: &mut Vec<u8>, sel: Selection) {
-    write_u32(buf, sel.anchor.line as u32);
-    write_u32(buf, sel.anchor.col as u32);
-    write_u32(buf, sel.cursor.line as u32);
-    write_u32(buf, sel.cursor.col as u32);
+fn serialize_selection(buf: &mut Vec<u8>, selection: Selection) {
+    write_u32(buf, selection.anchor.line as u32);
+    write_u32(buf, selection.anchor.column as u32);
+    write_u32(buf, selection.cursor.line as u32);
+    write_u32(buf, selection.cursor.column as u32);
 }
 
 fn deserialize_selection(data: &[u8], pos: &mut usize) -> Option<Selection> {
@@ -222,16 +222,16 @@ fn deserialize_selection(data: &[u8], pos: &mut usize) -> Option<Selection> {
     let cursor_line = read_u32(data, pos)? as usize;
     let cursor_col = read_u32(data, pos)? as usize;
     Some(Selection {
-        anchor: Pos::new(anchor_line, anchor_col),
-        cursor: Pos::new(cursor_line, cursor_col),
+        anchor: TextPosition::new(anchor_line, anchor_col),
+        cursor: TextPosition::new(cursor_line, cursor_col),
     })
 }
 
 fn serialize_snapshot(buf: &mut Vec<u8>, snapshot: &CaretSnapshot) {
     write_u32(buf, snapshot.selections.len() as u32);
     write_u32(buf, snapshot.primary as u32);
-    for sel in &snapshot.selections {
-        serialize_selection(buf, *sel);
+    for selection in &snapshot.selections {
+        serialize_selection(buf, *selection);
     }
 }
 
@@ -251,36 +251,36 @@ fn deserialize_snapshot(data: &[u8], pos: &mut usize) -> Option<CaretSnapshot> {
     })
 }
 
-fn serialize_group(buf: &mut Vec<u8>, group: &OperationGroup) {
+fn serialize_group(buf: &mut Vec<u8>, group: &UndoGroup) {
     serialize_snapshot(buf, &group.carets_before);
     serialize_snapshot(buf, &group.carets_after);
-    write_u32(buf, group.ops.len() as u32);
-    for op in &group.ops {
+    write_u32(buf, group.operations.len() as u32);
+    for op in &group.operations {
         match op {
-            Operation::Insert { pos, data } => {
+            UndoOperation::Insert { byte_offset, bytes } => {
                 write_u8(buf, 0);
-                write_u64(buf, *pos as u64);
-                write_u32(buf, data.len() as u32);
-                buf.extend_from_slice(data.as_ref());
+                write_u64(buf, *byte_offset as u64);
+                write_u32(buf, bytes.len() as u32);
+                buf.extend_from_slice(bytes.as_ref());
             }
-            Operation::Delete { pos, data } => {
+            UndoOperation::Delete { byte_offset, bytes } => {
                 write_u8(buf, 1);
-                write_u64(buf, *pos as u64);
-                write_u32(buf, data.len() as u32);
-                buf.extend_from_slice(data.as_ref());
+                write_u64(buf, *byte_offset as u64);
+                write_u32(buf, bytes.len() as u32);
+                buf.extend_from_slice(bytes.as_ref());
             }
         }
     }
 }
 
-fn deserialize_group(data: &[u8], pos: &mut usize) -> Option<OperationGroup> {
+fn deserialize_group(data: &[u8], pos: &mut usize) -> Option<UndoGroup> {
     let carets_before = deserialize_snapshot(data, pos)?;
     let carets_after = deserialize_snapshot(data, pos)?;
     let op_count = read_u32(data, pos)?;
     if op_count > MAX_GROUPS {
         return None;
     }
-    let mut ops = Vec::with_capacity(op_count as usize);
+    let mut operations = Vec::with_capacity(op_count as usize);
     for _ in 0..op_count {
         let kind = read_u8(data, pos)?;
         let op_pos = read_u64(data, pos)? as usize;
@@ -291,26 +291,26 @@ fn deserialize_group(data: &[u8], pos: &mut usize) -> Option<OperationGroup> {
         let op_data: Arc<[u8]> = Arc::from(&data[*pos..*pos + data_len]);
         *pos += data_len;
         let op = match kind {
-            0 => Operation::Insert {
-                pos: op_pos,
-                data: op_data,
+            0 => UndoOperation::Insert {
+                byte_offset: op_pos,
+                bytes: op_data,
             },
-            1 => Operation::Delete {
-                pos: op_pos,
-                data: op_data,
+            1 => UndoOperation::Delete {
+                byte_offset: op_pos,
+                bytes: op_data,
             },
             _ => return None,
         };
-        ops.push(op);
+        operations.push(op);
     }
-    Some(OperationGroup {
-        ops,
+    Some(UndoGroup {
+        operations,
         carets_before,
         carets_after,
     })
 }
 
-fn deserialize_groups(data: &[u8], pos: &mut usize) -> Option<Vec<OperationGroup>> {
+fn deserialize_groups(data: &[u8], pos: &mut usize) -> Option<Vec<UndoGroup>> {
     let count = read_u32(data, pos)?;
     if count > MAX_GROUPS {
         return None;
@@ -530,7 +530,7 @@ fn load_undo_history_from(
 //
 // Stores last cursor position per file in: ~/.config/e/cursor.bin
 // Format: [magic:4 "eCUR"][version:1][entry_count:4] then entries:
-//   [path_len:4][path_bytes][line:4][col:4]
+//   [path_len:4][path_bytes][line:4][column:4]
 // No mtime validation — cursor position is clamped to buffer bounds on load.
 // Stale entries for deleted files are pruned on write.
 
@@ -544,11 +544,11 @@ fn cursor_db_path() -> PathBuf {
 }
 
 /// Save cursor position for a file. Errors silently ignored.
-pub fn save_cursor_position(file_path: &Path, cursor: Pos) {
+pub fn save_cursor_position(file_path: &Path, cursor: TextPosition) {
     let _ = save_cursor_position_to(&cursor_db_path(), file_path, cursor);
 }
 
-fn save_cursor_position_to(db_path: &Path, file_path: &Path, cursor: Pos) -> Option<()> {
+fn save_cursor_position_to(db_path: &Path, file_path: &Path, cursor: TextPosition) -> Option<()> {
     let abs_path = resolve_absolute(file_path);
     let abs_str = abs_path.to_string_lossy();
     let path_bytes = abs_str.as_bytes();
@@ -558,7 +558,7 @@ fn save_cursor_position_to(db_path: &Path, file_path: &Path, cursor: Pos) -> Opt
     write_u32(&mut entry, path_bytes.len() as u32);
     entry.extend_from_slice(path_bytes);
     write_u32(&mut entry, cursor.line as u32);
-    write_u32(&mut entry, cursor.col as u32);
+    write_u32(&mut entry, cursor.column as u32);
 
     // Ensure parent dir, open db, lock
     if let Some(parent) = db_path.parent() {
@@ -597,11 +597,11 @@ fn save_cursor_position_to(db_path: &Path, file_path: &Path, cursor: Pos) -> Opt
 }
 
 /// Load cursor position for a file. Returns None if not found.
-pub fn load_cursor_position(file_path: &Path) -> Option<Pos> {
+pub fn load_cursor_position(file_path: &Path) -> Option<TextPosition> {
     load_cursor_position_from(&cursor_db_path(), file_path)
 }
 
-fn load_cursor_position_from(db_path: &Path, file_path: &Path) -> Option<Pos> {
+fn load_cursor_position_from(db_path: &Path, file_path: &Path) -> Option<TextPosition> {
     let abs_path = resolve_absolute(file_path);
     let abs_str = abs_path.to_string_lossy();
     let target_path = abs_str.as_bytes();
@@ -633,8 +633,8 @@ fn load_cursor_position_from(db_path: &Path, file_path: &Path) -> Option<Pos> {
 
         if entry_path == target_path {
             let line = read_u32(&data, &mut pos)? as usize;
-            let col = read_u32(&data, &mut pos)? as usize;
-            return Some(Pos::new(line, col));
+            let column = read_u32(&data, &mut pos)? as usize;
+            return Some(TextPosition::new(line, column));
         }
         pos = entry_start + entry_len;
     }
@@ -820,7 +820,7 @@ mod tests {
 
     // -- undo history persistence -------------------------------------------
 
-    fn snap(pos: Pos) -> CaretSnapshot {
+    fn snap(pos: TextPosition) -> CaretSnapshot {
         CaretSnapshot {
             selections: vec![Selection::caret(pos)],
             primary: 0,
@@ -830,21 +830,21 @@ mod tests {
     fn make_test_stack() -> UndoStack {
         let mut stack = UndoStack::new();
         stack.record(
-            Operation::Insert {
-                pos: 0,
-                data: Arc::from(b"hello".as_ref()),
+            UndoOperation::Insert {
+                byte_offset: 0,
+                bytes: Arc::from(b"hello".as_ref()),
             },
-            snap(Pos::new(0, 0)),
-            snap(Pos::new(0, 5)),
+            snap(TextPosition::new(0, 0)),
+            snap(TextPosition::new(0, 5)),
         );
         stack.seal();
         stack.record(
-            Operation::Delete {
-                pos: 3,
-                data: Arc::from(b"lo".as_ref()),
+            UndoOperation::Delete {
+                byte_offset: 3,
+                bytes: Arc::from(b"lo".as_ref()),
             },
-            snap(Pos::new(0, 5)),
-            snap(Pos::new(0, 3)),
+            snap(TextPosition::new(0, 5)),
+            snap(TextPosition::new(0, 3)),
         );
         stack.seal();
         stack
@@ -867,11 +867,11 @@ mod tests {
         assert_eq!(undo.len(), 2);
         assert!(redo.is_empty());
 
-        assert_eq!(undo[0].carets_before, snap(Pos::new(0, 0)));
-        assert_eq!(undo[0].carets_after, snap(Pos::new(0, 5)));
-        assert_eq!(undo[0].ops.len(), 1);
-        assert_eq!(undo[1].carets_before, snap(Pos::new(0, 5)));
-        assert_eq!(undo[1].carets_after, snap(Pos::new(0, 3)));
+        assert_eq!(undo[0].carets_before, snap(TextPosition::new(0, 0)));
+        assert_eq!(undo[0].carets_after, snap(TextPosition::new(0, 5)));
+        assert_eq!(undo[0].operations.len(), 1);
+        assert_eq!(undo[1].carets_before, snap(TextPosition::new(0, 5)));
+        assert_eq!(undo[1].carets_after, snap(TextPosition::new(0, 3)));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1013,12 +1013,12 @@ mod tests {
 
         let mut stack_b = UndoStack::new();
         stack_b.record(
-            Operation::Insert {
-                pos: 0,
-                data: Arc::from(b"x".as_ref()),
+            UndoOperation::Insert {
+                byte_offset: 0,
+                bytes: Arc::from(b"x".as_ref()),
             },
-            snap(Pos::new(0, 0)),
-            snap(Pos::new(0, 1)),
+            snap(TextPosition::new(0, 0)),
+            snap(TextPosition::new(0, 1)),
         );
         stack_b.seal();
         save_undo_history_to(&db, &path_b, &stack_b);
@@ -1049,12 +1049,12 @@ mod tests {
         // Save again with different stack — should replace, not duplicate
         let mut stack2 = UndoStack::new();
         stack2.record(
-            Operation::Insert {
-                pos: 0,
-                data: Arc::from(b"x".as_ref()),
+            UndoOperation::Insert {
+                byte_offset: 0,
+                bytes: Arc::from(b"x".as_ref()),
             },
-            snap(Pos::new(0, 0)),
-            snap(Pos::new(0, 1)),
+            snap(TextPosition::new(0, 0)),
+            snap(TextPosition::new(0, 1)),
         );
         stack2.seal();
         save_undo_history_to(&db, &path, &stack2);
@@ -1190,14 +1190,14 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("test.txt");
         fs::write(&path, b"hello").unwrap();
-        assert!(file_mtime(&path).is_some());
+        assert!(file_modification_time(&path).is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_file_mtime_nonexistent() {
         let path = std::path::Path::new("/tmp/e_nonexistent_file_mtime_test.txt");
-        assert!(file_mtime(path).is_none());
+        assert!(file_modification_time(path).is_none());
     }
 
     #[test]
@@ -1286,9 +1286,9 @@ mod tests {
         let db = dir.join("cursor.bin");
         fs::write(&path, b"hello\nworld\n").unwrap();
 
-        save_cursor_position_to(&db, &path, Pos::new(1, 3));
+        save_cursor_position_to(&db, &path, TextPosition::new(1, 3));
         let loaded = load_cursor_position_from(&db, &path);
-        assert_eq!(loaded, Some(Pos::new(1, 3)));
+        assert_eq!(loaded, Some(TextPosition::new(1, 3)));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1301,10 +1301,10 @@ mod tests {
         let db = dir.join("cursor.bin");
         fs::write(&path, b"hello").unwrap();
 
-        save_cursor_position_to(&db, &path, Pos::new(0, 2));
-        save_cursor_position_to(&db, &path, Pos::new(5, 10));
+        save_cursor_position_to(&db, &path, TextPosition::new(0, 2));
+        save_cursor_position_to(&db, &path, TextPosition::new(5, 10));
         let loaded = load_cursor_position_from(&db, &path);
-        assert_eq!(loaded, Some(Pos::new(5, 10)));
+        assert_eq!(loaded, Some(TextPosition::new(5, 10)));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1319,16 +1319,16 @@ mod tests {
         fs::write(&path_a, b"aaa").unwrap();
         fs::write(&path_b, b"bbb").unwrap();
 
-        save_cursor_position_to(&db, &path_a, Pos::new(0, 1));
-        save_cursor_position_to(&db, &path_b, Pos::new(3, 7));
+        save_cursor_position_to(&db, &path_a, TextPosition::new(0, 1));
+        save_cursor_position_to(&db, &path_b, TextPosition::new(3, 7));
 
         assert_eq!(
             load_cursor_position_from(&db, &path_a),
-            Some(Pos::new(0, 1))
+            Some(TextPosition::new(0, 1))
         );
         assert_eq!(
             load_cursor_position_from(&db, &path_b),
-            Some(Pos::new(3, 7))
+            Some(TextPosition::new(3, 7))
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -1357,21 +1357,21 @@ mod tests {
         fs::write(&path_a, b"aaa").unwrap();
         fs::write(&path_b, b"bbb").unwrap();
 
-        save_cursor_position_to(&db, &path_a, Pos::new(0, 1));
-        save_cursor_position_to(&db, &path_b, Pos::new(3, 7));
+        save_cursor_position_to(&db, &path_a, TextPosition::new(0, 1));
+        save_cursor_position_to(&db, &path_b, TextPosition::new(3, 7));
 
         // Delete file_a
         fs::remove_file(&path_a).unwrap();
 
         // Saving file_b should prune file_a's entry
-        save_cursor_position_to(&db, &path_b, Pos::new(4, 0));
+        save_cursor_position_to(&db, &path_b, TextPosition::new(4, 0));
 
         // Re-create file_a — old cursor entry should be gone
         fs::write(&path_a, b"aaa").unwrap();
         assert_eq!(load_cursor_position_from(&db, &path_a), None);
         assert_eq!(
             load_cursor_position_from(&db, &path_b),
-            Some(Pos::new(4, 0))
+            Some(TextPosition::new(4, 0))
         );
 
         let _ = fs::remove_dir_all(&dir);

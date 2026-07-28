@@ -451,22 +451,22 @@ impl TestEditor {
 
     // --- mouse events (SGR mode, 1-indexed) ---------------------------------
 
-    pub fn click(&mut self, row: u16, col: u16) {
-        let (r, c) = (row + 1, col + 1);
+    pub fn click(&mut self, row: u16, column: u16) {
+        let (r, c) = (row + 1, column + 1);
         self.send_raw(format!("\x1b[<0;{c};{r}M").as_bytes());
         self.send_raw(format!("\x1b[<0;{c};{r}m").as_bytes());
         self.wait();
     }
 
-    pub fn double_click(&mut self, row: u16, col: u16) {
-        self.click(row, col);
-        self.click(row, col);
+    pub fn double_click(&mut self, row: u16, column: u16) {
+        self.click(row, column);
+        self.click(row, column);
     }
 
-    pub fn triple_click(&mut self, row: u16, col: u16) {
-        self.click(row, col);
-        self.click(row, col);
-        self.click(row, col);
+    pub fn triple_click(&mut self, row: u16, column: u16) {
+        self.click(row, column);
+        self.click(row, column);
+        self.click(row, column);
     }
 
     pub fn drag(&mut self, from: (u16, u16), to: (u16, u16)) {
@@ -502,8 +502,8 @@ impl TestEditor {
         let screen = self.parser.screen();
         let cols = screen.size().1;
         (0..cols)
-            .map(|col| {
-                let cell = screen.cell(row, col);
+            .map(|column| {
+                let cell = screen.cell(row, column);
                 match cell {
                     Some(c) => {
                         let s = c.contents();
@@ -529,7 +529,7 @@ impl TestEditor {
             .join("\n")
     }
 
-    /// Get cursor position as (row, col), 0-indexed.
+    /// Get cursor position as (row, column), 0-indexed.
     pub fn cursor(&mut self) -> (u16, u16) {
         self.drain_available();
         self.parser.screen().cursor_position()
@@ -538,8 +538,8 @@ impl TestEditor {
     /// Whether the software cursor is visible (drawn as bold+reverse at cursor pos).
     pub fn cursor_visible(&mut self) -> bool {
         self.drain_available();
-        let (row, col) = self.parser.screen().cursor_position();
-        let cell = self.parser.screen().cell(row, col);
+        let (row, column) = self.parser.screen().cursor_position();
+        let cell = self.parser.screen().cell(row, column);
         cell.is_some_and(|c| c.bold() && c.inverse())
     }
 
@@ -554,29 +554,29 @@ impl TestEditor {
     }
 
     /// Foreground color of a specific cell.
-    pub fn cell_fg(&mut self, row: u16, col: u16) -> vt100::Color {
+    pub fn cell_fg(&mut self, row: u16, column: u16) -> vt100::Color {
         self.drain_available();
         self.parser
             .screen()
-            .cell(row, col)
+            .cell(row, column)
             .map_or(vt100::Color::Default, |c| c.fgcolor())
     }
 
     /// Background color of a specific cell.
-    pub fn cell_bg(&mut self, row: u16, col: u16) -> vt100::Color {
+    pub fn cell_bg(&mut self, row: u16, column: u16) -> vt100::Color {
         self.drain_available();
         self.parser
             .screen()
-            .cell(row, col)
+            .cell(row, column)
             .map_or(vt100::Color::Default, |c| c.bgcolor())
     }
 
     /// Whether a cell is rendered in reverse video.
-    pub fn cell_inverse(&mut self, row: u16, col: u16) -> bool {
+    pub fn cell_inverse(&mut self, row: u16, column: u16) -> bool {
         self.drain_available();
         self.parser
             .screen()
-            .cell(row, col)
+            .cell(row, column)
             .is_some_and(|c| c.inverse())
     }
 

@@ -1,9 +1,9 @@
 use std::io::{self, Write};
 
 use crate::buffer::{self, GapBuffer};
-use crate::highlight::{self, HlState, HlType, SyntaxRules};
-use crate::selection::{Pos, Selection};
-use crate::view::View;
+use crate::highlight::{self, HighlightKind, HighlightState, SyntaxRules};
+use crate::selection::{Selection, TextPosition};
+use crate::viewport::Viewport;
 
 // -- ANSI styling sequences -------------------------------------------------
 
@@ -57,21 +57,21 @@ pub fn gutter_width(line_count: usize) -> usize {
 }
 
 /// Format a `usize` into a stack-allocated byte buffer, returning a `&str` slice.
-/// `buf` must be at least 20 bytes (enough for any 64-bit decimal).
-fn write_line_num(mut n: usize, buf: &mut [u8; 20]) -> &str {
+/// `buffer` must be at least 20 bytes (enough for any 64-bit decimal).
+fn write_line_num(mut n: usize, buffer: &mut [u8; 20]) -> &str {
     if n == 0 {
-        buf[19] = b'0';
-        // SAFETY: buf contains only ASCII digits — always valid UTF-8.
-        return unsafe { std::str::from_utf8_unchecked(&buf[19..]) };
+        buffer[19] = b'0';
+        // SAFETY: buffer contains only ASCII digits — always valid UTF-8.
+        return unsafe { std::str::from_utf8_unchecked(&buffer[19..]) };
     }
     let mut pos = 20usize;
     while n > 0 {
         pos -= 1;
-        buf[pos] = b'0' + (n % 10) as u8;
+        buffer[pos] = b'0' + (n % 10) as u8;
         n /= 10;
     }
-    // SAFETY: buf contains only ASCII digits — always valid UTF-8.
-    unsafe { std::str::from_utf8_unchecked(&buf[pos..]) }
+    // SAFETY: buffer contains only ASCII digits — always valid UTF-8.
+    unsafe { std::str::from_utf8_unchecked(&buffer[pos..]) }
 }
 
 /// Expand tabs in `text`, writing expanded bytes into `out` and per-column
@@ -108,7 +108,7 @@ pub struct Renderer {
     pub needs_full_redraw: bool,
     syntax: Option<&'static SyntaxRules>,
     /// Cached highlight state at the start of each line.
-    hl_cache: Vec<HlState>,
+    hl_cache: Vec<HighlightState>,
     /// Buffer version the cache was computed for.
     hl_cache_version: u64,
     /// First line whose cached state may be stale (set by caller via dirty tracking).
@@ -120,9 +120,9 @@ pub struct Renderer {
     /// Scratch buffer reused each line for tab-pipe column markers.
     tab_pipes_scratch: Vec<bool>,
     /// Scratch buffer reused each line for byte-indexed highlight output.
-    hl_scratch: Vec<HlType>,
+    hl_scratch: Vec<HighlightKind>,
     /// Scratch buffer reused each line for char-indexed highlight output.
-    char_hl_scratch: Vec<HlType>,
+    char_hl_scratch: Vec<HighlightKind>,
     /// Scratch buffer reused each line for find-range display columns.
     find_scratch: Vec<(usize, usize, bool)>,
     /// Frame buffer reused each draw to avoid per-frame allocation.
@@ -143,7 +143,7 @@ pub struct Renderer {
     prev_cursor_col: usize,
     prev_draw_cursor: bool,
     prev_sel: Option<Selection>,
-    prev_bracket_pair: Option<(Pos, Pos)>,
+    prev_bracket_pair: Option<(TextPosition, TextPosition)>,
     prev_has_find: bool,
     /// User-defined type names from `type` declarations (flat, deduplicated).
     user_types: Vec<Vec<u8>>,
@@ -206,12 +206,12 @@ impl Renderer {
 
     /// Rescan all lines for `type` declarations.  The scan is gated by the
     /// buffer-version check in `render()`, so it only runs after edits.
-    fn update_user_types(&mut self, buf: &mut crate::buffer::GapBuffer, line_count: usize) {
+    fn update_user_types(&mut self, buffer: &mut crate::buffer::GapBuffer, line_count: usize) {
         let mut seen = fxhash::FxHashSet::default();
         self.user_types.clear();
         let mut in_continuation = false;
         for line_idx in 0..line_count {
-            buf.line_text_into(line_idx, &mut self.line_buf);
+            buffer.line_text_into(line_idx, &mut self.line_buf);
             let (names, continues) = highlight::scan_type_line(&self.line_buf, in_continuation);
             for name in names {
                 if seen.insert(name.clone()) {
@@ -226,39 +226,41 @@ impl Renderer {
     pub fn render(
         &mut self,
         out: &mut impl Write,
-        buf: &mut GapBuffer,
-        view: &View,
+        buffer: &mut GapBuffer,
+        viewport: &Viewport,
         cursor_line: usize,
         cursor_col: usize,
-        ruler_on: bool,
+        line_numbers_visible: bool,
         status_left: &str,
         status_right: &str,
         command_line: Option<&str>,
         selection: Option<Selection>,
         secondary_selections: &[Selection],
-        secondary_cursors: &[Pos],
-        find_matches: Option<&[(Pos, Pos)]>,
-        find_current: Option<(Pos, Pos)>,
+        secondary_cursors: &[TextPosition],
+        find_matches: Option<&[(TextPosition, TextPosition)]>,
+        find_current: Option<(TextPosition, TextPosition)>,
         completions: &[String],
         cmd_cursor: Option<usize>,
         find_active: bool,
-        bracket_pair: Option<(Pos, Pos)>,
+        bracket_pair: Option<(TextPosition, TextPosition)>,
     ) -> io::Result<()> {
-        let line_count = buf.line_count();
-        let gw = if ruler_on {
+        let line_count = buffer.line_count();
+        let gw = if line_numbers_visible {
             gutter_width(line_count)
         } else {
             0
         };
         let completion_rows = completions.len();
-        let text_rows = view.text_rows().saturating_sub(completion_rows);
-        let text_cols = view.text_cols(gw);
+        let text_rows = viewport.text_rows().saturating_sub(completion_rows);
+        let text_cols = viewport.text_cols(gw);
 
         let (sel_start, sel_end) = selection
             .map(|s| s.ordered())
-            .unwrap_or((Pos::zero(), Pos::zero()));
+            .unwrap_or((TextPosition::zero(), TextPosition::zero()));
         let has_sel = selection.is_some_and(|s| !s.is_empty())
-            || secondary_selections.iter().any(|sel| !sel.is_empty());
+            || secondary_selections
+                .iter()
+                .any(|selection| !selection.is_empty());
         // Software cursor: draw reverse-video block when no selection/find/command cursor
         let draw_cursor = !find_active && !has_sel && cmd_cursor.is_none();
 
@@ -285,7 +287,7 @@ impl Renderer {
         // Detect scroll delta and use scroll regions to shift existing content.
         let mut used_scroll_region = false;
         if !self.needs_full_redraw && self.prev_scroll_line != usize::MAX && text_rows > 1 {
-            let delta = self.compute_scroll_delta(view, buf, text_cols, text_rows);
+            let delta = self.compute_scroll_delta(viewport, buffer, text_cols, text_rows);
             if delta != 0 && (delta.unsigned_abs()) < text_rows {
                 let n = delta.unsigned_abs();
                 // Set scroll region to text area only
@@ -313,26 +315,26 @@ impl Renderer {
         }
 
         // Compute per-line highlight states (lazy: only as far as the viewport needs)
-        let buf_version = buf.version();
+        let buf_version = buffer.version();
         // One line past the last visible line — that's all we need to cover.
-        let visible_end = (view.scroll_line + text_rows + 1).min(line_count);
+        let visible_end = (viewport.scroll_line + text_rows + 1).min(line_count);
         if let Some(rules) = self.syntax {
             if buf_version != self.hl_cache_version {
-                let dirty = buf.take_dirty_line();
+                let dirty = buffer.take_dirty_line();
                 self.hl_dirty_from = self.hl_dirty_from.min(dirty);
                 if self.hl_cache.is_empty() {
                     self.hl_dirty_from = 0;
                 }
                 self.hl_cache_version = buf_version;
                 let may_define_type = dirty < line_count && {
-                    buf.line_text_into(dirty, &mut self.line_buf);
+                    buffer.line_text_into(dirty, &mut self.line_buf);
                     self.line_buf.windows(4).any(|word| word == b"type")
                 };
                 if self.hl_cache.is_empty() || !self.user_types.is_empty() || may_define_type {
-                    self.update_user_types(buf, line_count);
+                    self.update_user_types(buffer, line_count);
                 }
             }
-            self.refresh_hl_cache(visible_end, view.scroll_line, line_count, buf, rules);
+            self.refresh_hl_cache(visible_end, viewport.scroll_line, line_count, buffer, rules);
             self.hl_dirty_from = usize::MAX;
         } else {
             self.hl_cache.clear();
@@ -341,8 +343,8 @@ impl Renderer {
 
         // Wrap-aware render loop
         let mut screen_row: usize = 0;
-        let mut line_idx = view.scroll_line;
-        let first_wrap = view.scroll_wrap;
+        let mut line_idx = viewport.scroll_line;
+        let first_wrap = viewport.scroll_wrap;
         let full = self.needs_full_redraw;
         let has_find = find_matches.is_some_and(|m| !m.is_empty());
 
@@ -361,7 +363,7 @@ impl Renderer {
 
         while screen_row < text_rows && line_idx < line_count {
             // Fast skip: if this line can't have changed, advance screen_row
-            // using the gap buffer's display_col_at (no allocation, no copying).
+            // using the gap buffer's display_column_at (no allocation, no copying).
             if can_skip
                 && !self.line_needs_render(
                     line_idx,
@@ -374,9 +376,9 @@ impl Renderer {
                     bracket_pair,
                 )
             {
-                let dw = buf.display_col_at(line_idx, usize::MAX);
-                let total_wraps = crate::view::wrapped_rows(dw, text_cols);
-                let start_wrap = if line_idx == view.scroll_line {
+                let dw = buffer.display_column_at(line_idx, usize::MAX);
+                let total_wraps = crate::viewport::wrapped_rows(dw, text_cols);
+                let start_wrap = if line_idx == viewport.scroll_line {
                     first_wrap
                 } else {
                     0
@@ -386,7 +388,7 @@ impl Renderer {
                 continue;
             }
 
-            buf.line_text_into(line_idx, &mut self.line_buf);
+            buffer.line_text_into(line_idx, &mut self.line_buf);
             let raw_text: &[u8] = &self.line_buf;
             let has_tabs = expand_tabs_into(
                 raw_text,
@@ -397,9 +399,9 @@ impl Renderer {
 
             // One-pass scan: count chars.
             // Replaces the former `chars: Vec<char>` allocation.
-            let char_count = line_str.chars().count();
-            let total_wraps = crate::view::wrapped_rows(char_count, text_cols);
-            let start_wrap = if line_idx == view.scroll_line {
+            let character_count = line_str.chars().count();
+            let total_wraps = crate::viewport::wrapped_rows(character_count, text_cols);
+            let start_wrap = if line_idx == viewport.scroll_line {
                 first_wrap
             } else {
                 0
@@ -430,7 +432,7 @@ impl Renderer {
             // character (the terminal cursor already shows where the cursor is).
             let bracket_match_col = bracket_pair.and_then(|(_, close)| {
                 if close.line == line_idx {
-                    Some(display_col_for_char_col(raw_text, close.col))
+                    Some(display_col_for_character_column(raw_text, close.column))
                 } else {
                     None
                 }
@@ -439,10 +441,10 @@ impl Renderer {
 
             // Per-character highlight info
             let need_per_char = has_sel && line_idx >= sel_start.line && line_idx <= sel_end.line;
-            let line_has_secondary_sel = secondary_selections.iter().any(|sel| {
-                !sel.is_empty()
-                    && line_idx >= sel.ordered().0.line
-                    && line_idx <= sel.ordered().1.line
+            let line_has_secondary_sel = secondary_selections.iter().any(|selection| {
+                !selection.is_empty()
+                    && line_idx >= selection.ordered().0.line
+                    && line_idx <= selection.ordered().1.line
             });
             let line_has_find = find_matches.is_some_and(|m| {
                 m.iter()
@@ -452,7 +454,7 @@ impl Renderer {
                 .iter()
                 .filter_map(|pos| {
                     if pos.line == line_idx {
-                        Some(display_col_for_char_col(raw_text, pos.col))
+                        Some(display_col_for_character_column(raw_text, pos.column))
                     } else {
                         None
                     }
@@ -460,23 +462,23 @@ impl Renderer {
                 .collect();
             let line_secondary_sel_ranges: Vec<(usize, usize)> = secondary_selections
                 .iter()
-                .filter_map(|sel| {
-                    if sel.is_empty() {
+                .filter_map(|selection| {
+                    if selection.is_empty() {
                         return None;
                     }
-                    let (start, end) = sel.ordered();
+                    let (start, end) = selection.ordered();
                     if line_idx < start.line || line_idx > end.line {
                         return None;
                     }
                     let range_start = if line_idx == start.line {
-                        display_col_for_char_col(raw_text, start.col)
+                        display_col_for_character_column(raw_text, start.column)
                     } else {
                         0
                     };
                     let range_end = if line_idx == end.line {
-                        display_col_for_char_col(raw_text, end.col)
+                        display_col_for_character_column(raw_text, end.column)
                     } else {
-                        char_count
+                        character_count
                     };
                     Some((range_start, range_end))
                 })
@@ -485,14 +487,14 @@ impl Renderer {
             // Pre-compute selection and find ranges once per logical line
             let (line_sel_start, line_sel_end) = if need_per_char {
                 let s = if line_idx == sel_start.line {
-                    display_col_for_char_col(raw_text, sel_start.col)
+                    display_col_for_character_column(raw_text, sel_start.column)
                 } else {
                     0
                 };
                 let e = if line_idx == sel_end.line {
-                    display_col_for_char_col(raw_text, sel_end.col)
+                    display_col_for_character_column(raw_text, sel_end.column)
                 } else {
-                    char_count
+                    character_count
                 };
                 (s, e)
             } else {
@@ -507,14 +509,14 @@ impl Renderer {
                     .filter(|(s, e)| line_idx >= s.line && line_idx <= e.line)
                 {
                     let fs = if line_idx == s.line {
-                        display_col_for_char_col(raw_text, s.col)
+                        display_col_for_character_column(raw_text, s.column)
                     } else {
                         0
                     };
                     let fe = if line_idx == e.line {
-                        display_col_for_char_col(raw_text, e.col)
+                        display_col_for_character_column(raw_text, e.column)
                     } else {
-                        char_count
+                        character_count
                     };
                     let is_current = find_current.is_some_and(|(cs, ce)| cs == *s && ce == *e);
                     self.find_scratch.push((fs, fe, is_current));
@@ -531,7 +533,7 @@ impl Renderer {
                 let rb = &mut self.row_buf;
 
                 // Gutter: line number on first wrap row, blank on continuations
-                if ruler_on {
+                if line_numbers_visible {
                     let is_cursor_line = line_idx == cursor_line;
                     if wrap == 0 {
                         let mut num_buf = [0u8; 20];
@@ -555,7 +557,7 @@ impl Renderer {
                 }
 
                 let chunk_start = wrap * text_cols;
-                let chunk_end = ((wrap + 1) * text_cols).min(char_count);
+                let chunk_end = ((wrap + 1) * text_cols).min(character_count);
 
                 // Is the software cursor on this line?
                 let cursor_on_line = draw_cursor && line_idx == cursor_line;
@@ -592,9 +594,9 @@ impl Renderer {
                                 self.char_hl_scratch
                                     .get(i)
                                     .copied()
-                                    .unwrap_or(HlType::Normal)
+                                    .unwrap_or(HighlightKind::Normal)
                             } else {
-                                HlType::Normal
+                                HighlightKind::Normal
                             };
                             let code = ht.ansi_code();
                             write!(rb, "{}{CURSOR_STYLE}{}{RESET}", code, CtrlSafe(ch))?;
@@ -619,9 +621,9 @@ impl Renderer {
                                 self.char_hl_scratch
                                     .get(i)
                                     .copied()
-                                    .unwrap_or(HlType::Normal)
+                                    .unwrap_or(HighlightKind::Normal)
                             } else {
-                                HlType::Normal
+                                HighlightKind::Normal
                             };
                             let code = ht.ansi_code();
                             if code.is_empty() {
@@ -633,7 +635,7 @@ impl Renderer {
                     }
                 } else {
                     // Fast path: syntax highlighting only (no cursor on this line)
-                    let mut current_hl = HlType::Normal;
+                    let mut current_hl = HighlightKind::Normal;
                     for (i, ch) in line_str
                         .chars()
                         .enumerate()
@@ -644,9 +646,9 @@ impl Renderer {
                             && i < self.tab_pipes_scratch.len()
                             && self.tab_pipes_scratch[i];
                         if is_tab_pipe {
-                            if current_hl != HlType::Normal {
+                            if current_hl != HighlightKind::Normal {
                                 write!(rb, "{RESET}")?;
-                                current_hl = HlType::Normal;
+                                current_hl = HighlightKind::Normal;
                             }
                             write!(rb, "{DIM}{}{RESET}", ch)?;
                         } else {
@@ -654,12 +656,12 @@ impl Renderer {
                                 self.char_hl_scratch
                                     .get(i)
                                     .copied()
-                                    .unwrap_or(HlType::Normal)
+                                    .unwrap_or(HighlightKind::Normal)
                             } else {
-                                HlType::Normal
+                                HighlightKind::Normal
                             };
                             if ht != current_hl {
-                                if ht == HlType::Normal {
+                                if ht == HighlightKind::Normal {
                                     write!(rb, "{RESET}")?;
                                 } else {
                                     write!(rb, "{}", ht.ansi_code())?;
@@ -669,7 +671,7 @@ impl Renderer {
                             write!(rb, "{}", CtrlSafe(ch))?;
                         }
                     }
-                    if current_hl != HlType::Normal {
+                    if current_hl != HighlightKind::Normal {
                         write!(rb, "{RESET}")?;
                     }
                 }
@@ -678,8 +680,8 @@ impl Renderer {
                 let cursor_at_eol = (cursor_on_line && cursor_col == chunk_end)
                     || line_secondary_cursors
                         .iter()
-                        .any(|col| *col == chunk_end && chunk_end == char_count);
-                if cursor_at_eol && chunk_end == char_count {
+                        .any(|column| *column == chunk_end && chunk_end == character_count);
+                if cursor_at_eol && chunk_end == character_count {
                     write!(rb, "{CURSOR_STYLE} {RESET}")?;
                 }
 
@@ -701,7 +703,7 @@ impl Renderer {
         while screen_row < text_rows {
             self.row_buf.clear();
             let rb = &mut self.row_buf;
-            if ruler_on {
+            if line_numbers_visible {
                 let pad = gw - 1;
                 write!(
                     rb,
@@ -738,7 +740,7 @@ impl Renderer {
         {
             let rb = &mut self.row_buf;
             write!(rb, "{STATUS_BG}")?;
-            let width = view.width as usize;
+            let width = viewport.width as usize;
             let right_len = status_right.len(); // always ASCII
             // Use character count for display width (correct for multi-byte filenames).
             let left_chars = status_left.chars().count().min(width);
@@ -778,12 +780,14 @@ impl Renderer {
 
         // Position the virtual cursor for the vt parser (the real terminal cursor
         // is permanently hidden; the software cursor is drawn inline above).
-        if let Some(col) = cmd_cursor
+        if let Some(column) = cmd_cursor
             && !(find_active || has_sel)
         {
             // Software cursor in command line
-            write!(w, "\x1b[{};{}H", cmd_idx + 1, col + 1)?;
-            let ch = command_line.and_then(|s| s.chars().nth(col)).unwrap_or(' ');
+            write!(w, "\x1b[{};{}H", cmd_idx + 1, column + 1)?;
+            let ch = command_line
+                .and_then(|s| s.chars().nth(column))
+                .unwrap_or(' ');
             write!(w, "{CURSOR_STYLE}{}{RESET}", ch)?;
         }
         // Always emit cursor position so the vt parser tracks it
@@ -792,19 +796,19 @@ impl Renderer {
             let cursor_wrap = cursor_col / text_cols.max(1);
             let screen_row = {
                 let mut sr = 0usize;
-                if cursor_line == view.scroll_line {
-                    sr = cursor_wrap.saturating_sub(view.scroll_wrap);
+                if cursor_line == viewport.scroll_line {
+                    sr = cursor_wrap.saturating_sub(viewport.scroll_wrap);
                 } else {
-                    buf.line_text_into(view.scroll_line, &mut self.line_buf);
-                    let first_wraps = crate::view::wrapped_rows(
-                        display_col_for_char_col(&self.line_buf, usize::MAX),
+                    buffer.line_text_into(viewport.scroll_line, &mut self.line_buf);
+                    let first_wraps = crate::viewport::wrapped_rows(
+                        display_col_for_character_column(&self.line_buf, usize::MAX),
                         text_cols,
                     );
-                    sr += first_wraps.saturating_sub(view.scroll_wrap);
-                    for l in (view.scroll_line + 1)..cursor_line {
-                        buf.line_text_into(l, &mut self.line_buf);
-                        sr += crate::view::wrapped_rows(
-                            display_col_for_char_col(&self.line_buf, usize::MAX),
+                    sr += first_wraps.saturating_sub(viewport.scroll_wrap);
+                    for l in (viewport.scroll_line + 1)..cursor_line {
+                        buffer.line_text_into(l, &mut self.line_buf);
+                        sr += crate::viewport::wrapped_rows(
+                            display_col_for_character_column(&self.line_buf, usize::MAX),
                             text_cols,
                         );
                     }
@@ -821,8 +825,8 @@ impl Renderer {
         out.write_all(&frame)?;
         out.flush()?;
         self.needs_full_redraw = false;
-        self.prev_scroll_line = view.scroll_line;
-        self.prev_scroll_wrap = view.scroll_wrap;
+        self.prev_scroll_line = viewport.scroll_line;
+        self.prev_scroll_wrap = viewport.scroll_wrap;
         self.prev_text_rows = text_rows;
         self.prev_buf_version = buf_version;
         self.prev_cursor_line = cursor_line;
@@ -839,13 +843,13 @@ impl Renderer {
     /// Positive = scrolled down, negative = scrolled up. Returns 0 if unknown.
     fn compute_scroll_delta(
         &mut self,
-        view: &View,
-        buf: &mut GapBuffer,
+        viewport: &Viewport,
+        buffer: &mut GapBuffer,
         text_cols: usize,
         text_rows: usize,
     ) -> isize {
         let (old_line, old_wrap) = (self.prev_scroll_line, self.prev_scroll_wrap);
-        let (new_line, new_wrap) = (view.scroll_line, view.scroll_wrap);
+        let (new_line, new_wrap) = (viewport.scroll_line, viewport.scroll_wrap);
         if old_line == new_line && old_wrap == new_wrap {
             return 0;
         }
@@ -858,16 +862,16 @@ impl Renderer {
                 (new_line, new_wrap, old_line, old_wrap, -1isize)
             };
 
-        let line_count = buf.line_count();
+        let line_count = buffer.line_count();
         let mut rows = 0isize;
         let mut line = from_line;
         let mut wrap = from_wrap;
         let limit = text_rows as isize;
 
         while (line, wrap) < (to_line, to_wrap) && line < line_count {
-            buf.line_text_into(line, &mut self.line_buf);
-            let dw = display_col_for_char_col(&self.line_buf, usize::MAX);
-            let total_wraps = crate::view::wrapped_rows(dw, text_cols);
+            buffer.line_text_into(line, &mut self.line_buf);
+            let dw = display_col_for_character_column(&self.line_buf, usize::MAX);
+            let total_wraps = crate::viewport::wrapped_rows(dw, text_cols);
             let remaining_in_line = total_wraps.saturating_sub(wrap);
 
             if line == to_line {
@@ -895,9 +899,9 @@ impl Renderer {
         cursor_col: usize,
         draw_cursor: bool,
         has_sel: bool,
-        sel_start: Pos,
-        sel_end: Pos,
-        bracket_pair: Option<(Pos, Pos)>,
+        sel_start: TextPosition,
+        sel_end: TextPosition,
+        bracket_pair: Option<(TextPosition, TextPosition)>,
     ) -> bool {
         // Cursor line changed (either old or new position)
         if (line == cursor_line || line == self.prev_cursor_line)
@@ -946,7 +950,7 @@ impl Renderer {
     ///   that line, stopping early once the cached output state matches.
     /// - **Large-jump fast path**: when the viewport jumped far past the computed
     ///   range (e.g. select-all on a 1M-line file), the intermediate entries are
-    ///   filled with `HlState::Normal` and only the `scroll_line-200..end` range
+    ///   filled with `HighlightState::Normal` and only the `scroll_line-200..end` range
     ///   is actually computed.  Multi-line constructs starting in the skipped gap
     ///   will be cosmetically wrong until the user scrolls back through them.
     fn refresh_hl_cache(
@@ -954,7 +958,7 @@ impl Renderer {
         end: usize,
         scroll_line: usize,
         line_count: usize,
-        buf: &mut GapBuffer,
+        buffer: &mut GapBuffer,
         rules: &'static SyntaxRules,
     ) {
         let end = end.min(line_count);
@@ -970,7 +974,7 @@ impl Renderer {
         // Grow to cover the viewport.  Entries beyond the old `computed` point
         // are initialised to Normal (fast memset).
         if computed < end {
-            self.hl_cache.resize(end, HlState::Normal);
+            self.hl_cache.resize(end, HighlightState::Normal);
         }
 
         // Where to start recomputing:
@@ -1002,14 +1006,14 @@ impl Renderer {
         }
 
         let mut state = if start == 0 {
-            HlState::Normal
+            HighlightState::Normal
         } else {
             self.hl_cache[start]
         };
 
         let mut line = start;
         while line < end {
-            buf.line_text_into(line, &mut self.line_buf);
+            buffer.line_text_into(line, &mut self.line_buf);
             let next_state = highlight::highlight_line_into(
                 &self.line_buf,
                 state,
@@ -1032,17 +1036,17 @@ impl Renderer {
     }
 }
 
-pub(crate) fn display_col_for_char_col(raw_text: &[u8], char_col: usize) -> usize {
+pub(crate) fn display_col_for_character_column(raw_text: &[u8], character_column: usize) -> usize {
     let mut display = 0;
     if raw_text.is_ascii() {
-        let end = char_col.min(raw_text.len());
+        let end = character_column.min(raw_text.len());
         for &b in &raw_text[..end] {
             display += if b == b'\t' { 2 } else { 1 };
         }
     } else {
         let mut ci = 0;
         let mut bi = 0;
-        while ci < char_col && bi < raw_text.len() {
+        while ci < character_column && bi < raw_text.len() {
             if raw_text[bi] == b'\t' {
                 display += 2;
             } else {
@@ -1062,29 +1066,29 @@ mod tests {
     fn render_test(
         r: &mut Renderer,
         output: &mut Vec<u8>,
-        buf: &mut GapBuffer,
-        view: &View,
+        buffer: &mut GapBuffer,
+        viewport: &Viewport,
         cursor_line: usize,
         cursor_col: usize,
-        ruler_on: bool,
+        line_numbers_visible: bool,
         status_left: &str,
         status_right: &str,
         command_line: Option<&str>,
         selection: Option<Selection>,
-        find_matches: Option<&[(Pos, Pos)]>,
-        find_current: Option<(Pos, Pos)>,
+        find_matches: Option<&[(TextPosition, TextPosition)]>,
+        find_current: Option<(TextPosition, TextPosition)>,
         completions: &[String],
         cmd_cursor: Option<usize>,
         find_active: bool,
-        bracket_pair: Option<(Pos, Pos)>,
+        bracket_pair: Option<(TextPosition, TextPosition)>,
     ) -> io::Result<()> {
         r.render(
             output,
-            buf,
-            view,
+            buffer,
+            viewport,
             cursor_line,
             cursor_col,
-            ruler_on,
+            line_numbers_visible,
             status_left,
             status_right,
             command_line,
@@ -1185,49 +1189,49 @@ mod tests {
         assert!(pipes.is_empty());
     }
 
-    // -- display_col_for_char_col ---------------------------------------------
+    // -- display_col_for_character_column ---------------------------------------------
 
     #[test]
     fn test_display_col_plain_ascii() {
-        // No tabs, ASCII text: display col == char col
-        assert_eq!(display_col_for_char_col(b"hello", 0), 0);
-        assert_eq!(display_col_for_char_col(b"hello", 3), 3);
-        assert_eq!(display_col_for_char_col(b"hello", 5), 5);
+        // No tabs, ASCII text: display column == char column
+        assert_eq!(display_col_for_character_column(b"hello", 0), 0);
+        assert_eq!(display_col_for_character_column(b"hello", 3), 3);
+        assert_eq!(display_col_for_character_column(b"hello", 5), 5);
     }
 
     #[test]
     fn test_display_col_with_tab() {
         // Tab expands to 2 display cols
-        assert_eq!(display_col_for_char_col(b"\thello", 0), 0);
-        assert_eq!(display_col_for_char_col(b"\thello", 1), 2); // past the tab
-        assert_eq!(display_col_for_char_col(b"\thello", 2), 3); // past tab + 'h'
+        assert_eq!(display_col_for_character_column(b"\thello", 0), 0);
+        assert_eq!(display_col_for_character_column(b"\thello", 1), 2); // past the tab
+        assert_eq!(display_col_for_character_column(b"\thello", 2), 3); // past tab + 'h'
     }
 
     #[test]
     fn test_display_col_multiple_tabs() {
-        assert_eq!(display_col_for_char_col(b"\t\thello", 2), 4); // 2 tabs = 4 display cols
+        assert_eq!(display_col_for_character_column(b"\t\thello", 2), 4); // 2 tabs = 4 display cols
     }
 
     #[test]
     fn test_display_col_utf8() {
         // "é" is 2 bytes but 1 char
         let text = "héllo".as_bytes();
-        assert_eq!(display_col_for_char_col(text, 0), 0);
-        assert_eq!(display_col_for_char_col(text, 1), 1); // 'h'
-        assert_eq!(display_col_for_char_col(text, 2), 2); // 'é'
-        assert_eq!(display_col_for_char_col(text, 5), 5); // full string
+        assert_eq!(display_col_for_character_column(text, 0), 0);
+        assert_eq!(display_col_for_character_column(text, 1), 1); // 'h'
+        assert_eq!(display_col_for_character_column(text, 2), 2); // 'é'
+        assert_eq!(display_col_for_character_column(text, 5), 5); // full string
     }
 
     #[test]
     fn test_display_col_past_end() {
-        // char_col beyond text length: stops at end
-        assert_eq!(display_col_for_char_col(b"ab", 10), 2);
+        // character_column beyond text length: stops at end
+        assert_eq!(display_col_for_character_column(b"ab", 10), 2);
     }
 
     #[test]
     fn test_display_col_empty() {
-        assert_eq!(display_col_for_char_col(b"", 0), 0);
-        assert_eq!(display_col_for_char_col(b"", 5), 0);
+        assert_eq!(display_col_for_character_column(b"", 0), 0);
+        assert_eq!(display_col_for_character_column(b"", 5), 0);
     }
 
     // -- Renderer basic -------------------------------------------------------
@@ -1250,15 +1254,15 @@ mod tests {
     fn test_render_basic_output() {
         // Verify render produces output without panicking
         let mut r = Renderer::new();
-        let mut buf = GapBuffer::from_text(b"hello\nworld");
-        let view = View::new(80, 24);
+        let mut buffer = GapBuffer::from_text(b"hello\nworld");
+        let viewport = Viewport::new(80, 24);
         let mut output = Vec::new();
 
         render_test(
             &mut r,
             &mut output,
-            &mut buf,
-            &view,
+            &mut buffer,
+            &viewport,
             0,
             0,
             true,
@@ -1286,15 +1290,15 @@ mod tests {
     #[test]
     fn test_render_no_ruler() {
         let mut r = Renderer::new();
-        let mut buf = GapBuffer::from_text(b"hello");
-        let view = View::new(80, 24);
+        let mut buffer = GapBuffer::from_text(b"hello");
+        let viewport = Viewport::new(80, 24);
         let mut output = Vec::new();
 
         render_test(
             &mut r,
             &mut output,
-            &mut buf,
-            &view,
+            &mut buffer,
+            &viewport,
             0,
             0,
             false, // ruler off
@@ -1321,15 +1325,15 @@ mod tests {
     #[test]
     fn test_render_with_command_line() {
         let mut r = Renderer::new();
-        let mut buf = GapBuffer::from_text(b"hello");
-        let view = View::new(80, 24);
+        let mut buffer = GapBuffer::from_text(b"hello");
+        let viewport = Viewport::new(80, 24);
         let mut output = Vec::new();
 
         render_test(
             &mut r,
             &mut output,
-            &mut buf,
-            &view,
+            &mut buffer,
+            &viewport,
             0,
             0,
             true,
@@ -1355,15 +1359,15 @@ mod tests {
         let mut r = Renderer::new();
         assert!(r.needs_full_redraw);
 
-        let mut buf = GapBuffer::from_text(b"hello");
-        let view = View::new(80, 24);
+        let mut buffer = GapBuffer::from_text(b"hello");
+        let viewport = Viewport::new(80, 24);
         let mut output = Vec::new();
 
         render_test(
             &mut r,
             &mut output,
-            &mut buf,
-            &view,
+            &mut buffer,
+            &viewport,
             0,
             0,
             true,
@@ -1386,27 +1390,27 @@ mod tests {
     #[test]
     fn test_render_with_selection() {
         let mut r = Renderer::new();
-        let mut buf = GapBuffer::from_text(b"hello world");
-        let view = View::new(80, 24);
+        let mut buffer = GapBuffer::from_text(b"hello world");
+        let viewport = Viewport::new(80, 24);
         let mut output = Vec::new();
 
-        let sel = Selection {
-            anchor: Pos::new(0, 2),
-            cursor: Pos::new(0, 7),
+        let selection = Selection {
+            anchor: TextPosition::new(0, 2),
+            cursor: TextPosition::new(0, 7),
         };
 
         render_test(
             &mut r,
             &mut output,
-            &mut buf,
-            &view,
+            &mut buffer,
+            &viewport,
             0,
             0,
             true,
             "",
             "",
             None,
-            Some(sel),
+            Some(selection),
             None,
             None,
             &[],
@@ -1424,19 +1428,19 @@ mod tests {
     #[test]
     fn test_render_with_find_matches() {
         let mut r = Renderer::new();
-        let mut buf = GapBuffer::from_text(b"hello world hello");
-        let view = View::new(80, 24);
+        let mut buffer = GapBuffer::from_text(b"hello world hello");
+        let viewport = Viewport::new(80, 24);
         let mut output = Vec::new();
         let matches = [
-            (Pos::new(0, 0), Pos::new(0, 5)),
-            (Pos::new(0, 12), Pos::new(0, 17)),
+            (TextPosition::new(0, 0), TextPosition::new(0, 5)),
+            (TextPosition::new(0, 12), TextPosition::new(0, 17)),
         ];
 
         render_test(
             &mut r,
             &mut output,
-            &mut buf,
-            &view,
+            &mut buffer,
+            &viewport,
             0,
             0,
             true,
@@ -1445,7 +1449,7 @@ mod tests {
             None,
             None,
             Some(&matches),
-            Some((Pos::new(0, 0), Pos::new(0, 5))), // current = first match
+            Some((TextPosition::new(0, 0), TextPosition::new(0, 5))), // current = first match
             &[],
             None,
             false,
@@ -1462,15 +1466,15 @@ mod tests {
     #[test]
     fn test_render_with_bracket_pair() {
         let mut r = Renderer::new();
-        let mut buf = GapBuffer::from_text(b"(hello)");
-        let view = View::new(80, 24);
+        let mut buffer = GapBuffer::from_text(b"(hello)");
+        let viewport = Viewport::new(80, 24);
         let mut output = Vec::new();
 
         render_test(
             &mut r,
             &mut output,
-            &mut buf,
-            &view,
+            &mut buffer,
+            &viewport,
             0,
             0,
             true,
@@ -1483,7 +1487,7 @@ mod tests {
             &[],
             None,
             false,
-            Some((Pos::new(0, 0), Pos::new(0, 6))),
+            Some((TextPosition::new(0, 0), TextPosition::new(0, 6))),
         )
         .unwrap();
 
@@ -1495,16 +1499,16 @@ mod tests {
     #[test]
     fn test_render_with_completions() {
         let mut r = Renderer::new();
-        let mut buf = GapBuffer::from_text(b"hello");
-        let view = View::new(80, 24);
+        let mut buffer = GapBuffer::from_text(b"hello");
+        let viewport = Viewport::new(80, 24);
         let mut output = Vec::new();
         let comps = vec!["save".to_string(), "quit".to_string()];
 
         render_test(
             &mut r,
             &mut output,
-            &mut buf,
-            &view,
+            &mut buffer,
+            &viewport,
             0,
             0,
             true,
@@ -1529,15 +1533,15 @@ mod tests {
     #[test]
     fn test_render_with_cmd_cursor() {
         let mut r = Renderer::new();
-        let mut buf = GapBuffer::from_text(b"hello");
-        let view = View::new(80, 24);
+        let mut buffer = GapBuffer::from_text(b"hello");
+        let viewport = Viewport::new(80, 24);
         let mut output = Vec::new();
 
         render_test(
             &mut r,
             &mut output,
-            &mut buf,
-            &view,
+            &mut buffer,
+            &viewport,
             0,
             0,
             true,
@@ -1562,15 +1566,15 @@ mod tests {
     #[test]
     fn test_render_find_active_hides_cursor() {
         let mut r = Renderer::new();
-        let mut buf = GapBuffer::from_text(b"hello");
-        let view = View::new(80, 24);
+        let mut buffer = GapBuffer::from_text(b"hello");
+        let viewport = Viewport::new(80, 24);
         let mut output = Vec::new();
 
         render_test(
             &mut r,
             &mut output,
-            &mut buf,
-            &view,
+            &mut buffer,
+            &viewport,
             0,
             0,
             true,
@@ -1598,15 +1602,15 @@ mod tests {
         let rules = crate::highlight::rules_for_language("Rust");
         r.set_syntax(rules);
 
-        let mut buf = GapBuffer::from_text(b"fn main() {}");
-        let view = View::new(80, 24);
+        let mut buffer = GapBuffer::from_text(b"fn main() {}");
+        let viewport = Viewport::new(80, 24);
         let mut output = Vec::new();
 
         render_test(
             &mut r,
             &mut output,
-            &mut buf,
-            &view,
+            &mut buffer,
+            &viewport,
             0,
             0,
             true,
@@ -1624,13 +1628,13 @@ mod tests {
         .unwrap();
 
         // Modify buffer (version changes) and render again
-        buf.insert(0, b"// ");
+        buffer.insert(0, b"// ");
         output.clear();
         render_test(
             &mut r,
             &mut output,
-            &mut buf,
-            &view,
+            &mut buffer,
+            &viewport,
             0,
             0,
             true,
@@ -1666,15 +1670,15 @@ mod tests {
     #[test]
     fn test_render_empty_buffer() {
         let mut r = Renderer::new();
-        let mut buf = GapBuffer::new();
-        let view = View::new(80, 24);
+        let mut buffer = GapBuffer::new();
+        let viewport = Viewport::new(80, 24);
         let mut output = Vec::new();
 
         render_test(
             &mut r,
             &mut output,
-            &mut buf,
-            &view,
+            &mut buffer,
+            &viewport,
             0,
             0,
             true,

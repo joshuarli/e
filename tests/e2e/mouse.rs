@@ -11,7 +11,7 @@ fn click_places_cursor() {
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
     let (r0, c0) = e.cursor();
     // Click at a different position (row 0, further right)
-    // Gutter is 2 chars, so clicking at screen col 7 = buffer col 5
+    // Gutter is 2 chars, so clicking at screen column 7 = buffer column 5
     e.click(0, 7);
     let (r1, c1) = e.cursor();
     assert_eq!(r1, 0, "click should stay on row 0");
@@ -26,7 +26,7 @@ fn double_click_selects_word() {
     let dir = TempDir::new();
     let path = create_file(dir.path(), "test.txt", "hello world\n");
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
-    // Double-click on "hello" (gutter=2, so col 2-6 is "hello")
+    // Double-click on "hello" (gutter=2, so column 2-6 is "hello")
     e.double_click(0, 3);
     // Should have a selection (cursor hidden)
     assert!(
@@ -73,7 +73,7 @@ fn drag_creates_selection() {
     let dir = TempDir::new();
     let path = create_file(dir.path(), "test.txt", "hello world\n");
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
-    // Drag from col 2 to col 7 (selecting "hello")
+    // Drag from column 2 to column 7 (selecting "hello")
     e.drag((0, 2), (0, 7));
     assert!(
         !e.cursor_visible(),

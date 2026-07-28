@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::clipboard::Clipboard;
 use crate::command::{CommandAction, CommandRegistry};
 use crate::command_buffer::{CommandBuffer, CommandBufferMode, CommandBufferResult};
-use crate::document::{Document, RawEdit};
+use crate::document::{Document, TextEdit};
 use crate::find::FindState;
 use crate::highlight;
 use crate::input::{self, EditorEvent, InputParser, Key, MouseButton, MouseEvent, MouseMods};
@@ -15,9 +15,10 @@ use crate::keybind::{EditorAction, KeybindingTable};
 use crate::mouse::MouseState;
 use crate::render::{Renderer, gutter_width};
 use crate::selection::{
-    CaretSet, CaretSnapshot, Pos, Selection, is_word_char, next_word_boundary, prev_word_boundary,
+    CaretSet, CaretSnapshot, Selection, TextPosition, is_word_char, next_word_boundary,
+    prev_word_boundary,
 };
-use crate::view::View;
+use crate::viewport::Viewport;
 
 const SCROLL_LINES: usize = 3;
 
@@ -58,16 +59,16 @@ fn common_prefix(strings: &[&str]) -> String {
 }
 
 pub struct Editor {
-    doc: Document,
+    document: Document,
     carets: CaretSet,
-    view: View,
+    viewport: Viewport,
     renderer: Renderer,
     clipboard: Clipboard,
     commands: CommandRegistry,
     keybindings: KeybindingTable,
-    cmd_buf: CommandBuffer,
-    ruler_on: bool,
-    status_msg: String,
+    command_buffer: CommandBuffer,
+    line_numbers_visible: bool,
+    status_message: String,
     status_time: Option<Instant>,
     running: bool,
     /// Pending quit confirmation (dirty buffer).
@@ -79,62 +80,62 @@ pub struct Editor {
     /// True when stdin was a pipe (e.g. `git show | e`).
     piped_stdin: bool,
     /// Cached file mtime for external modification detection.
-    file_mtime: Option<std::time::SystemTime>,
+    file_modification_time: Option<std::time::SystemTime>,
     /// Waiting for y/n response to reload prompt.
     reload_pending: bool,
     /// Cached status-left string; reused each frame to avoid per-draw allocation.
-    status_left_cache: String,
+    status_left_text_cache: String,
     /// Scratch buffer for line_text_into; avoids per-call allocation.
-    line_scratch: Vec<u8>,
+    line_text_scratch: Vec<u8>,
 }
 
 struct PlannedCaretEdit {
-    start: usize,
-    end: usize,
-    insert: Vec<u8>,
-    deleted: Vec<u8>,
-    anchor_after: usize,
-    cursor_after: usize,
+    start_byte: usize,
+    end_byte: usize,
+    inserted_bytes: Vec<u8>,
+    deleted_bytes: Vec<u8>,
+    anchor_after_byte: usize,
+    cursor_after_byte: usize,
 }
 
 impl Editor {
-    pub fn new(text: Vec<u8>, filename: Option<String>, piped_stdin: bool) -> Self {
+    pub fn new(text: Vec<u8>, file_path: Option<String>, piped_stdin: bool) -> Self {
         let (w, h) = input::terminal_size().unwrap_or((80, 24));
         let mut keybindings = KeybindingTable::with_defaults();
         keybindings.load_config();
-        let mut doc = Document::new(text, filename);
-        let file_mtime = doc
-            .filename
+        let mut document = Document::new(text, file_path);
+        let file_modification_time = document
+            .file_path
             .as_ref()
-            .and_then(|name| crate::file_io::file_mtime(std::path::Path::new(name)));
+            .and_then(|name| crate::file_io::file_modification_time(std::path::Path::new(name)));
         let mut restored_cursor = None;
-        if let Some(ref name) = doc.filename {
+        if let Some(ref name) = document.file_path {
             let path = std::path::Path::new(name);
             if path.exists() {
-                crate::file_io::load_undo_history(path, &mut doc.undo_stack);
+                crate::file_io::load_undo_history(path, &mut document.undo_stack);
             }
             restored_cursor = crate::file_io::load_cursor_position(path);
         }
         // Clamp restored cursor to buffer bounds
         let initial_cursor = if let Some(pos) = restored_cursor {
-            let line_count = doc.buf.line_count();
+            let line_count = document.buffer.line_count();
             let line = pos.line.min(line_count.saturating_sub(1));
-            let col = pos.col.min(doc.buf.line_char_len(line));
-            Pos::new(line, col)
+            let column = pos.column.min(document.buffer.line_character_count(line));
+            TextPosition::new(line, column)
         } else {
-            Pos::zero()
+            TextPosition::zero()
         };
         Self {
-            doc,
+            document,
             carets: CaretSet::new(initial_cursor),
-            view: View::new(w, h),
+            viewport: Viewport::new(w, h),
             renderer: Renderer::new(),
             clipboard: Clipboard::detect(),
             commands: CommandRegistry::new(),
             keybindings,
-            cmd_buf: CommandBuffer::new(),
-            ruler_on: true,
-            status_msg: String::new(),
+            command_buffer: CommandBuffer::new(),
+            line_numbers_visible: true,
+            status_message: String::new(),
             status_time: None,
             running: true,
             quit_pending: false,
@@ -142,16 +143,16 @@ impl Editor {
             find: FindState::new(),
             sudo_save_tmp: None,
             piped_stdin,
-            file_mtime,
+            file_modification_time,
             reload_pending: false,
-            status_left_cache: String::new(),
-            line_scratch: Vec::new(),
+            status_left_text_cache: String::new(),
+            line_text_scratch: Vec::new(),
         }
     }
 
     pub fn run(&mut self) -> io::Result<()> {
-        // Center view on restored cursor position
-        if self.cursor() != Pos::zero() {
+        // Center viewport on restored cursor position
+        if self.cursor() != TextPosition::zero() {
             self.center_view_on_line(self.cursor().line);
         }
 
@@ -211,7 +212,7 @@ impl Editor {
             if let Some(t) = self.status_time
                 && t.elapsed().as_secs() >= 3
             {
-                self.status_msg.clear();
+                self.status_message.clear();
                 self.status_time = None;
             }
 
@@ -252,25 +253,25 @@ impl Editor {
 
     /// Resize the terminal while keeping the logical center near the same content.
     fn resize_view(&mut self, width: u16, height: u16) {
-        let line_count = self.doc.buf.line_count();
-        let gutter = if self.ruler_on {
+        let line_count = self.document.buffer.line_count();
+        let gutter = if self.line_numbers_visible {
             gutter_width(line_count)
         } else {
             0
         };
         let anchor = {
-            let buf = &self.doc.buf;
-            let mut widths = |line: usize| buf.display_col_at(line, usize::MAX);
-            self.view.center_anchor(line_count, gutter, &mut widths)
+            let buf = &self.document.buffer;
+            let mut widths = |line: usize| buf.display_column_at(line, usize::MAX);
+            self.viewport.center_anchor(line_count, gutter, &mut widths)
         };
 
-        self.view.width = width;
-        self.view.height = height;
+        self.viewport.width = width;
+        self.viewport.height = height;
 
         if let Some(anchor) = anchor {
-            let buf = &self.doc.buf;
-            let mut widths = |line: usize| buf.display_col_at(line, usize::MAX);
-            self.view
+            let buf = &self.document.buffer;
+            let mut widths = |line: usize| buf.display_column_at(line, usize::MAX);
+            self.viewport
                 .center_on_anchor(anchor, line_count, gutter, &mut widths);
         }
         self.renderer.force_full_redraw();
@@ -279,14 +280,14 @@ impl Editor {
     fn dispatch_event(&mut self, ev: EditorEvent) {
         match ev {
             EditorEvent::Key(key) => {
-                if self.cmd_buf.active {
+                if self.command_buffer.active {
                     self.handle_cmd_key(key);
                 } else {
                     self.handle_key(key);
                 }
             }
             EditorEvent::Mouse(mouse, mods) => {
-                if !self.cmd_buf.active {
+                if !self.command_buffer.active {
                     if self.find.active {
                         self.exit_find_mode();
                     }
@@ -294,9 +295,9 @@ impl Editor {
                 }
             }
             EditorEvent::Paste(text) => {
-                if self.cmd_buf.active {
-                    let result = self.cmd_buf.insert_str(&text);
-                    let mode = self.cmd_buf.mode;
+                if self.command_buffer.active {
+                    let result = self.command_buffer.insert_str(&text);
+                    let mode = self.command_buffer.mode;
                     self.handle_cmd_result(mode, result);
                 } else {
                     self.paste_text(&text);
@@ -309,26 +310,26 @@ impl Editor {
     }
 
     fn set_status(&mut self, msg: String) {
-        self.status_msg = msg;
+        self.status_message = msg;
         self.status_time = Some(Instant::now());
     }
 
-    fn cursor(&self) -> Pos {
+    fn cursor(&self) -> TextPosition {
         self.carets.cursor()
     }
 
-    fn set_cursor(&mut self, pos: Pos) {
+    fn set_cursor(&mut self, pos: TextPosition) {
         self.carets.set_single_selection(Selection::caret(pos));
     }
 
-    fn set_cursor_preserving_desired_col(&mut self, pos: Pos) {
-        let desired_col = self.desired_col();
+    fn set_cursor_preserving_desired_col(&mut self, pos: TextPosition) {
+        let desired_column = self.desired_column();
         self.carets.set_single_selection(Selection::caret(pos));
-        self.set_desired_col(desired_col);
+        self.set_desired_col(desired_column);
     }
 
-    fn set_selection(&mut self, sel: Selection) {
-        self.carets.set_single_selection(sel);
+    fn set_selection(&mut self, selection: Selection) {
+        self.carets.set_single_selection(selection);
     }
 
     fn restore_carets(&mut self, snapshot: CaretSnapshot) {
@@ -343,17 +344,17 @@ impl Editor {
         self.carets.selection()
     }
 
-    fn desired_col(&self) -> Option<usize> {
-        self.carets.primary().desired_col
+    fn desired_column(&self) -> Option<usize> {
+        self.carets.primary().desired_column
     }
 
-    fn set_desired_col(&mut self, desired_col: Option<usize>) {
-        self.carets.primary_mut().desired_col = desired_col;
+    fn set_desired_col(&mut self, desired_column: Option<usize>) {
+        self.carets.primary_mut().desired_column = desired_column;
     }
 
-    fn move_cursor(&mut self, pos: Pos, extend: bool) {
+    fn move_cursor(&mut self, pos: TextPosition, extend: bool) {
         if extend {
-            self.carets.primary_mut().sel.cursor = pos;
+            self.carets.primary_mut().selection.cursor = pos;
         } else {
             self.set_cursor_preserving_desired_col(pos);
         }
@@ -364,93 +365,101 @@ impl Editor {
         normalize: bool,
         mut f: impl FnMut(&Document, &mut Vec<u8>, &mut crate::selection::Caret),
     ) {
-        let doc = &self.doc;
-        let mut scratch = std::mem::take(&mut self.line_scratch);
+        let document = &self.document;
+        let mut scratch = std::mem::take(&mut self.line_text_scratch);
         for caret in &mut self.carets.carets {
-            f(doc, &mut scratch, caret);
+            f(document, &mut scratch, caret);
         }
-        self.line_scratch = scratch;
+        self.line_text_scratch = scratch;
         if normalize {
             self.carets.normalize();
         }
     }
 
-    fn offset_for_pos(&self, pos: Pos) -> usize {
-        self.doc.buf.pos_to_offset(pos.line, pos.col)
+    fn offset_for_pos(&self, pos: TextPosition) -> usize {
+        self.document
+            .buffer
+            .position_to_byte_offset(pos.line, pos.column)
     }
 
-    fn map_offset_after_edits(offset: usize, edits: &[RawEdit]) -> usize {
+    fn map_offset_after_edits(offset: usize, edits: &[TextEdit]) -> usize {
         let mut delta: isize = 0;
         for edit in edits {
-            let mapped_start = (edit.start as isize + delta) as usize;
-            if offset < edit.start {
+            let mapped_start = (edit.start_byte as isize + delta) as usize;
+            if offset < edit.start_byte {
                 break;
             }
-            if offset <= edit.end {
-                return mapped_start + edit.insert.len();
+            if offset <= edit.end_byte {
+                return mapped_start + edit.inserted_bytes.len();
             }
-            delta += edit.insert.len() as isize - (edit.end - edit.start) as isize;
+            delta +=
+                edit.inserted_bytes.len() as isize - (edit.end_byte - edit.start_byte) as isize;
         }
         (offset as isize + delta) as usize
     }
 
-    fn apply_raw_edits_with_offsets(
+    fn apply_text_edits_with_offsets(
         &mut self,
-        raw_edits: Vec<RawEdit>,
+        text_edits: Vec<TextEdit>,
         final_offsets: Vec<(usize, usize)>,
     ) {
         let before = self.carets.snapshot();
-        let after = self
-            .doc
-            .apply_batch(&raw_edits, &before, &final_offsets, self.carets.primary);
+        let after =
+            self.document
+                .apply_batch(&text_edits, &before, &final_offsets, self.carets.primary);
         self.restore_carets(after);
     }
 
-    fn apply_raw_edits_preserving_carets(&mut self, mut raw_edits: Vec<RawEdit>) {
-        if raw_edits.is_empty() {
+    fn apply_text_edits_preserving_carets(&mut self, mut text_edits: Vec<TextEdit>) {
+        if text_edits.is_empty() {
             return;
         }
-        raw_edits.sort_by_key(|edit| edit.start);
+        text_edits.sort_by_key(|edit| edit.start_byte);
         let before = self.carets.snapshot();
         let final_offsets: Vec<(usize, usize)> = before
             .selections
             .iter()
-            .map(|sel| {
-                let anchor =
-                    Self::map_offset_after_edits(self.offset_for_pos(sel.anchor), &raw_edits);
-                let cursor =
-                    Self::map_offset_after_edits(self.offset_for_pos(sel.cursor), &raw_edits);
+            .map(|selection| {
+                let anchor = Self::map_offset_after_edits(
+                    self.offset_for_pos(selection.anchor),
+                    &text_edits,
+                );
+                let cursor = Self::map_offset_after_edits(
+                    self.offset_for_pos(selection.cursor),
+                    &text_edits,
+                );
                 (anchor, cursor)
             })
             .collect();
-        self.apply_raw_edits_with_offsets(raw_edits, final_offsets);
+        self.apply_text_edits_with_offsets(text_edits, final_offsets);
     }
 
     fn apply_multi_caret_edits(&mut self, planned: Vec<PlannedCaretEdit>) {
         let mut final_offsets = Vec::with_capacity(planned.len());
         let mut delta: isize = 0;
-        let mut raw_edits = Vec::with_capacity(planned.len());
+        let mut text_edits = Vec::with_capacity(planned.len());
 
         for edit in planned {
             final_offsets.push((
-                (edit.anchor_after as isize + delta) as usize,
-                (edit.cursor_after as isize + delta) as usize,
+                (edit.anchor_after_byte as isize + delta) as usize,
+                (edit.cursor_after_byte as isize + delta) as usize,
             ));
-            delta += edit.insert.len() as isize - (edit.end - edit.start) as isize;
-            raw_edits.push(RawEdit {
-                start: edit.start,
-                end: edit.end,
-                insert: edit.insert,
-                deleted: edit.deleted,
+            delta +=
+                edit.inserted_bytes.len() as isize - (edit.end_byte - edit.start_byte) as isize;
+            text_edits.push(TextEdit {
+                start_byte: edit.start_byte,
+                end_byte: edit.end_byte,
+                inserted_bytes: edit.inserted_bytes,
+                deleted_bytes: edit.deleted_bytes,
             });
         }
 
-        self.apply_raw_edits_with_offsets(raw_edits, final_offsets);
+        self.apply_text_edits_with_offsets(text_edits, final_offsets);
     }
 
-    fn line_range_for_selection(sel: Selection) -> (usize, usize) {
-        let (start, end) = sel.ordered();
-        let end_line = if !sel.is_empty() && end.col == 0 && end.line > start.line {
+    fn line_range_for_selection(selection: Selection) -> (usize, usize) {
+        let (start, end) = selection.ordered();
+        let end_line = if !selection.is_empty() && end.column == 0 && end.line > start.line {
             end.line - 1
         } else {
             end.line
@@ -461,7 +470,7 @@ impl Editor {
     fn targeted_lines_for_carets(&self) -> Vec<usize> {
         let mut lines = std::collections::BTreeSet::new();
         for caret in self.carets.iter() {
-            let (start_line, end_line) = Self::line_range_for_selection(caret.sel);
+            let (start_line, end_line) = Self::line_range_for_selection(caret.selection);
             for line in start_line..=end_line {
                 lines.insert(line);
             }
@@ -469,29 +478,32 @@ impl Editor {
         lines.into_iter().collect()
     }
 
-    fn indent_snap_left_for(doc: &Document, line: usize, col: usize) -> usize {
-        let ls = doc.buf.line_start(line);
-        let le = doc.buf.line_end(line);
+    fn indent_snap_left_for(document: &Document, line: usize, column: usize) -> usize {
+        let ls = document.buffer.line_start(line);
+        let le = document.buffer.line_end(line);
         let mut leading_ws = 0;
         while ls + leading_ws < le {
-            match doc.buf.byte_at(ls + leading_ws) {
+            match document.buffer.byte_at(ls + leading_ws) {
                 b' ' | b'\t' => leading_ws += 1,
                 _ => break,
             }
         }
-        if col <= leading_ws && col >= 1 && (0..col).all(|i| doc.buf.byte_at(ls + i) == b' ') {
-            return (col - 1) / 2 * 2;
+        if column <= leading_ws
+            && column >= 1
+            && (0..column).all(|i| document.buffer.byte_at(ls + i) == b' ')
+        {
+            return (column - 1) / 2 * 2;
         }
-        col - 1
+        column - 1
     }
 
-    fn indent_snap_right_for(doc: &Document, line: usize, col: usize) -> usize {
-        let ls = doc.buf.line_start(line);
-        let le = doc.buf.line_end(line);
+    fn indent_snap_right_for(document: &Document, line: usize, column: usize) -> usize {
+        let ls = document.buffer.line_start(line);
+        let le = document.buffer.line_end(line);
         let mut leading_ws = 0;
         let mut all_spaces = true;
         while ls + leading_ws < le {
-            match doc.buf.byte_at(ls + leading_ws) {
+            match document.buffer.byte_at(ls + leading_ws) {
                 b' ' => leading_ws += 1,
                 b'\t' => {
                     all_spaces = false;
@@ -500,31 +512,35 @@ impl Editor {
                 _ => break,
             }
         }
-        if col < leading_ws && all_spaces {
-            return ((col / 2 + 1) * 2).min(leading_ws);
+        if column < leading_ws && all_spaces {
+            return ((column / 2 + 1) * 2).min(leading_ws);
         }
-        col + 1
+        column + 1
     }
 
-    fn bracket_jump_target_at(doc: &Document, scratch: &mut Vec<u8>, pos: Pos) -> Option<Pos> {
-        let line_count = doc.buf.line_count();
+    fn bracket_jump_target_at(
+        document: &Document,
+        scratch: &mut Vec<u8>,
+        pos: TextPosition,
+    ) -> Option<TextPosition> {
+        let line_count = document.buffer.line_count();
         highlight::find_bracket_match(
             pos,
-            &mut |line_idx, buf| doc.buf.line_text_into(line_idx, buf),
+            &mut |line_idx, buf| document.buffer.line_text_into(line_idx, buf),
             scratch,
             line_count,
         )
     }
 
     fn use_tab_indent(&self) -> bool {
-        self.doc.filename.as_ref().is_some_and(|f| {
+        self.document.file_path.as_ref().is_some_and(|f| {
             f.ends_with(".c") || f.ends_with(".h") || f.ends_with(".go") || f.contains("Makefile")
         })
     }
 
     fn draw(&mut self, out: &mut impl Write) -> io::Result<()> {
-        let line_count = self.doc.buf.line_count();
-        let gw = if self.ruler_on {
+        let line_count = self.document.buffer.line_count();
+        let gw = if self.line_numbers_visible {
             gutter_width(line_count)
         } else {
             0
@@ -533,13 +549,13 @@ impl Editor {
         let display_col = self.cursor_display_col();
         let cursor_line = self.cursor().line;
         let mut line_display_width =
-            |line: usize| -> usize { self.doc.buf.display_col_at(line, usize::MAX) };
-        self.view
+            |line: usize| -> usize { self.document.buffer.display_column_at(line, usize::MAX) };
+        self.viewport
             .ensure_cursor_visible(cursor_line, display_col, gw, &mut line_display_width);
 
-        let lang = self.doc.detect_language();
+        let lang = self.document.detect_language();
         let lang_name = lang.map(|l| l.name).unwrap_or("Text");
-        let sel = if self.selection().is_empty() {
+        let selection = if self.selection().is_empty() {
             None
         } else {
             Some(self.selection())
@@ -549,34 +565,34 @@ impl Editor {
             .iter()
             .enumerate()
             .filter_map(|(idx, caret)| {
-                if idx == self.carets.primary || caret.sel.is_empty() {
+                if idx == self.carets.primary || caret.selection.is_empty() {
                     None
                 } else {
-                    Some(caret.sel)
+                    Some(caret.selection)
                 }
             })
             .collect();
-        let secondary_cursors: Vec<Pos> = self
+        let secondary_cursors: Vec<TextPosition> = self
             .carets
             .iter()
             .enumerate()
             .filter_map(|(idx, caret)| {
-                if idx == self.carets.primary || !caret.sel.is_empty() {
+                if idx == self.carets.primary || !caret.selection.is_empty() {
                     None
                 } else {
-                    Some(caret.sel.cursor)
+                    Some(caret.selection.cursor)
                 }
             })
             .collect();
-        let ruler_on = self.ruler_on;
+        let line_numbers_visible = self.line_numbers_visible;
 
-        // All &mut self calls must happen before we borrow status_left_cache.
+        // All &mut self calls must happen before we borrow status_left_text_cache.
         let bracket_pair = self.find_matching_bracket();
 
         // Refresh viewport matches on every draw (cheap — only scans visible lines).
         if self.find.re.is_some() {
             self.find
-                .refresh_viewport_matches(&self.doc.buf, &self.view);
+                .refresh_viewport_matches(&self.document.buffer, &self.viewport);
         }
 
         let rules = lang.and_then(|l| highlight::rules_for_language(l.name));
@@ -597,42 +613,47 @@ impl Editor {
             None
         };
 
-        let completions = &self.cmd_buf.completions;
+        let completions = &self.command_buffer.completions;
 
-        let cmd_cursor = if self.cmd_buf.active {
-            Some(self.cmd_buf.prompt.len() + self.cmd_buf.cursor)
+        let cmd_cursor = if self.command_buffer.active {
+            Some(self.command_buffer.prompt.len() + self.command_buffer.cursor)
         } else {
             None
         };
 
-        // Avoid cloning status_msg: borrow it directly as &str.
+        // Avoid cloning status_message: borrow it directly as &str.
         let display_line_owned;
-        let cmd_ref: Option<&str> = if self.cmd_buf.active {
-            display_line_owned = self.cmd_buf.display_line();
+        let cmd_ref: Option<&str> = if self.command_buffer.active {
+            display_line_owned = self.command_buffer.display_line();
             Some(&display_line_owned)
-        } else if !self.status_msg.is_empty() {
-            Some(&self.status_msg)
+        } else if !self.status_message.is_empty() {
+            Some(&self.status_message)
         } else {
             None
         };
 
         // Rebuild status_left into the reused cache buffer (no allocation after warm-up).
-        let name = self.doc.filename.as_deref().unwrap_or("[scratch]");
-        Self::build_status_left(name, self.doc.dirty, lang_name, &mut self.status_left_cache);
-        let status_left = &self.status_left_cache;
+        let name = self.document.file_path.as_deref().unwrap_or("[scratch]");
+        Self::build_status_left(
+            name,
+            self.document.is_dirty,
+            lang_name,
+            &mut self.status_left_text_cache,
+        );
+        let status_left = &self.status_left_text_cache;
         let status_right = Self::status_right();
 
         self.renderer.render(
             out,
-            &mut self.doc.buf,
-            &self.view,
+            &mut self.document.buffer,
+            &self.viewport,
             cursor_line,
             display_col,
-            ruler_on,
+            line_numbers_visible,
             status_left,
             status_right,
             cmd_ref,
-            sel,
+            selection,
             &secondary_selections,
             &secondary_cursors,
             find_matches,
@@ -658,9 +679,9 @@ impl Editor {
 
     #[cfg(test)]
     fn status_left(&self, lang_name: &str) -> String {
-        let name = self.doc.filename.as_deref().unwrap_or("[scratch]");
+        let name = self.document.file_path.as_deref().unwrap_or("[scratch]");
         let mut s = String::new();
-        Self::build_status_left(name, self.doc.dirty, lang_name, &mut s);
+        Self::build_status_left(name, self.document.is_dirty, lang_name, &mut s);
         s
     }
 
@@ -669,42 +690,42 @@ impl Editor {
     }
 
     fn center_view_on_line(&mut self, line: usize) {
-        let gw = if self.ruler_on {
-            gutter_width(self.doc.buf.line_count())
+        let gw = if self.line_numbers_visible {
+            gutter_width(self.document.buffer.line_count())
         } else {
             0
         };
-        let mut ldw = |l: usize| -> usize { self.doc.buf.display_col_at(l, usize::MAX) };
-        self.view.center_on_line(line, &mut ldw, gw);
+        let mut ldw = |l: usize| -> usize { self.document.buffer.display_column_at(l, usize::MAX) };
+        self.viewport.center_on_line(line, &mut ldw, gw);
     }
 
     fn cursor_display_col(&self) -> usize {
-        self.doc
-            .buf
-            .display_col_at(self.cursor().line, self.cursor().col)
+        self.document
+            .buffer
+            .display_column_at(self.cursor().line, self.cursor().column)
     }
 
-    fn find_matching_bracket(&mut self) -> Option<(Pos, Pos)> {
+    fn find_matching_bracket(&mut self) -> Option<(TextPosition, TextPosition)> {
         let cursor = self.cursor();
-        let line_count = self.doc.buf.line_count();
+        let line_count = self.document.buffer.line_count();
         // Reuse the editor's scratch buffer to avoid a per-frame allocation.
-        let mut scratch = std::mem::take(&mut self.line_scratch);
+        let mut scratch = std::mem::take(&mut self.line_text_scratch);
         if let Some(match_pos) = highlight::find_bracket_match(
             cursor,
-            &mut |line_idx, buf| self.doc.buf.line_text_into(line_idx, buf),
+            &mut |line_idx, buf| self.document.buffer.line_text_into(line_idx, buf),
             &mut scratch,
             line_count,
         ) {
-            self.line_scratch = scratch;
+            self.line_text_scratch = scratch;
             return Some((cursor, match_pos));
         }
         let match_pos = highlight::find_quote_match(
             cursor,
-            &mut |line_idx, buf| self.doc.buf.line_text_into(line_idx, buf),
+            &mut |line_idx, buf| self.document.buffer.line_text_into(line_idx, buf),
             &mut scratch,
             line_count,
         );
-        self.line_scratch = scratch;
+        self.line_text_scratch = scratch;
         match_pos.map(|p| (cursor, p))
     }
 
@@ -714,9 +735,9 @@ impl Editor {
             match key {
                 Key::Char('y') | Key::Char('Y') => {
                     self.save_file();
-                    if !self.cmd_buf.active {
+                    if !self.command_buffer.active {
                         // Named file: save completed (or failed); quit now.
-                        // If cmd_buf is active, save_file opened a "Save as:" prompt;
+                        // If command_buffer is active, save_file opened a "Save as:" prompt;
                         // quit_pending stays true and the Prompt handler will quit after save.
                         self.running = false;
                     }
@@ -727,7 +748,7 @@ impl Editor {
                 }
                 _ => {
                     self.quit_pending = false;
-                    self.status_msg.clear();
+                    self.status_message.clear();
                     self.status_time = None;
                 }
             }
@@ -766,11 +787,11 @@ impl Editor {
             }
         }
 
-        let desired_col = match key {
-            Key::Up | Key::Down | Key::PageUp | Key::PageDown => self.desired_col(),
+        let desired_column = match key {
+            Key::Up | Key::Down | Key::PageUp | Key::PageDown => self.desired_column(),
             _ => None,
         };
-        self.set_desired_col(desired_col);
+        self.set_desired_col(desired_column);
 
         // Check keybinding table first
         if let Some(action) = self.keybindings.lookup(key).cloned() {
@@ -787,25 +808,27 @@ impl Editor {
                 EditorAction::GotoTop => self.goto_top(),
                 EditorAction::GotoEnd => self.goto_end(),
                 EditorAction::ToggleRuler => {
-                    self.ruler_on = !self.ruler_on;
+                    self.line_numbers_visible = !self.line_numbers_visible;
                     self.renderer.force_full_redraw();
                 }
                 EditorAction::CommandPalette => {
-                    self.cmd_buf.open(CommandBufferMode::Command, "> ", "");
+                    self.command_buffer
+                        .open(CommandBufferMode::Command, "> ", "");
                 }
                 EditorAction::GotoLine => {
-                    self.cmd_buf.open(CommandBufferMode::Goto, "goto: ", "");
+                    self.command_buffer
+                        .open(CommandBufferMode::Goto, "goto: ", "");
                 }
                 EditorAction::Find => {
                     let prefill = if self.has_selection() {
                         let (start, end) = self.selection().ordered();
-                        let text = self.doc.text_in_range(start, end);
+                        let text = self.document.text_in_range(start, end);
                         let s = String::from_utf8_lossy(&text).to_string();
                         if s.len() <= 100 { s } else { String::new() }
                     } else {
                         String::new()
                     };
-                    self.cmd_buf
+                    self.command_buffer
                         .open(CommandBufferMode::Find, "find: ", &prefill);
                     self.find.clear();
                     self.find.search_start = self.cursor();
@@ -863,9 +886,9 @@ impl Editor {
     }
 
     fn try_quit(&mut self) {
-        if self.doc.dirty {
-            let name = self.doc.filename.as_deref().unwrap_or("[scratch]");
-            self.status_msg = format!("Save changes to {}? (y/n)", name);
+        if self.document.is_dirty {
+            let name = self.document.file_path.as_deref().unwrap_or("[scratch]");
+            self.status_message = format!("Save changes to {}? (y/n)", name);
             self.status_time = None; // don't expire this message
             self.quit_pending = true;
         } else {
@@ -875,12 +898,12 @@ impl Editor {
     }
 
     fn save_undo_if_named(&mut self) {
-        if let Some(name) = self.doc.filename.clone() {
+        if let Some(name) = self.document.file_path.clone() {
             let path = std::path::Path::new(&name);
             crate::file_io::save_cursor_position(path, self.cursor());
             if path.exists() {
-                self.doc.seal_undo();
-                crate::file_io::save_undo_history(path, &self.doc.undo_stack);
+                self.document.seal_undo();
+                crate::file_io::save_undo_history(path, &self.document.undo_stack);
             }
         }
     }
@@ -894,15 +917,15 @@ impl Editor {
         } else {
             key
         };
-        let mode = self.cmd_buf.mode;
-        let result = self.cmd_buf.handle_key(key);
+        let mode = self.command_buffer.mode;
+        let result = self.command_buffer.handle_key(key);
         self.handle_cmd_result(mode, result);
     }
 
     fn handle_cmd_result(&mut self, mode: CommandBufferMode, result: CommandBufferResult) {
         match result {
             CommandBufferResult::Submit(val) => {
-                self.cmd_buf.close();
+                self.command_buffer.close();
                 match mode {
                     CommandBufferMode::Command => self.execute_command(&val),
                     CommandBufferMode::Find => self.find_next_from_submit(&val),
@@ -912,9 +935,9 @@ impl Editor {
                     }
                     CommandBufferMode::Prompt => {
                         // save-as prompt
-                        self.doc.filename = Some(val.clone());
+                        self.document.file_path = Some(val.clone());
                         self.save_file();
-                        if self.quit_pending && !self.cmd_buf.active {
+                        if self.quit_pending && !self.command_buffer.active {
                             self.quit_pending = false;
                             self.running = false;
                         }
@@ -925,10 +948,10 @@ impl Editor {
                 }
             }
             CommandBufferResult::Cancel => {
-                self.cmd_buf.close();
+                self.command_buffer.close();
                 if mode == CommandBufferMode::Find {
                     self.find.clear();
-                    self.status_msg.clear();
+                    self.status_message.clear();
                     self.status_time = None;
                 }
                 if mode == CommandBufferMode::SudoSave {
@@ -958,12 +981,12 @@ impl Editor {
     }
 
     fn complete_command(&mut self) {
-        let input = self.cmd_buf.input.trim().to_string();
+        let input = self.command_buffer.input.trim().to_string();
         let names = self.commands.command_names();
 
         if input.is_empty() {
             // Show all commands
-            self.cmd_buf.completions = names.iter().map(|s| s.to_string()).collect();
+            self.command_buffer.completions = names.iter().map(|s| s.to_string()).collect();
         } else {
             let matches: Vec<&str> = names
                 .iter()
@@ -973,21 +996,22 @@ impl Editor {
 
             match matches.len() {
                 0 => {
-                    self.cmd_buf.completions.clear();
+                    self.command_buffer.completions.clear();
                 }
                 1 => {
                     // Single match — autocomplete
-                    self.cmd_buf.input = matches[0].to_string();
-                    self.cmd_buf.cursor = self.cmd_buf.input.len();
-                    self.cmd_buf.completions.clear();
+                    self.command_buffer.input = matches[0].to_string();
+                    self.command_buffer.cursor = self.command_buffer.input.len();
+                    self.command_buffer.completions.clear();
                 }
                 _ => {
                     // Multiple matches — show them and complete common prefix
-                    self.cmd_buf.completions = matches.iter().map(|s| s.to_string()).collect();
+                    self.command_buffer.completions =
+                        matches.iter().map(|s| s.to_string()).collect();
                     let common = common_prefix(&matches);
                     if common.len() > input.len() {
-                        self.cmd_buf.input = common;
-                        self.cmd_buf.cursor = self.cmd_buf.input.len();
+                        self.command_buffer.input = common;
+                        self.command_buffer.cursor = self.command_buffer.input.len();
                     }
                 }
             }
@@ -1002,7 +1026,7 @@ impl Editor {
             CommandAction::None => {}
             CommandAction::Save => self.save_file(),
             CommandAction::SaveAs(name) => {
-                self.doc.filename = Some(name);
+                self.document.file_path = Some(name);
                 self.save_file();
             }
             CommandAction::Quit => {
@@ -1011,7 +1035,7 @@ impl Editor {
             }
             CommandAction::Goto(n) => self.goto_line(n),
             CommandAction::ToggleRuler => {
-                self.ruler_on = !self.ruler_on;
+                self.line_numbers_visible = !self.line_numbers_visible;
                 self.renderer.force_full_redraw();
             }
             CommandAction::ReplaceAll {
@@ -1036,63 +1060,67 @@ impl Editor {
     }
 
     fn goto_line(&mut self, n: usize) {
-        let line_count = self.doc.buf.line_count();
+        let line_count = self.document.buffer.line_count();
         let target = if n == 0 {
             0
         } else {
             (n - 1).min(line_count.saturating_sub(1))
         };
-        self.set_cursor(Pos::new(target, 0));
+        self.set_cursor(TextPosition::new(target, 0));
         self.center_view_on_line(target);
         self.renderer.force_full_redraw();
     }
 
     fn goto_top(&mut self) {
-        self.set_cursor(Pos::zero());
+        self.set_cursor(TextPosition::zero());
         self.renderer.force_full_redraw();
     }
 
     fn goto_end(&mut self) {
-        let line_count = self.doc.buf.line_count();
+        let line_count = self.document.buffer.line_count();
         let last_line = line_count.saturating_sub(1);
-        let last_col = self.doc.buf.line_char_len(last_line);
-        self.set_cursor(Pos::new(last_line, last_col));
+        let last_col = self.document.buffer.line_character_count(last_line);
+        self.set_cursor(TextPosition::new(last_line, last_col));
         self.renderer.force_full_redraw();
     }
 
     fn kill_line(&mut self) {
         let c = self.cursor();
-        let line_count = self.doc.buf.line_count();
+        let line_count = self.document.buffer.line_count();
         if line_count == 0 {
             return;
         }
-        self.doc.seal_undo();
-        let start = Pos::new(c.line, 0);
+        self.document.seal_undo();
+        let start = TextPosition::new(c.line, 0);
         let end = if c.line + 1 < line_count {
-            Pos::new(c.line + 1, 0)
+            TextPosition::new(c.line + 1, 0)
         } else {
-            let len = self.doc.buf.line_char_len(c.line);
-            Pos::new(c.line, len)
+            let len = self.document.buffer.line_character_count(c.line);
+            TextPosition::new(c.line, len)
         };
-        self.doc.delete_range(start, end);
-        self.doc.seal_undo();
+        self.document.delete_range(start, end);
+        self.document.seal_undo();
         // Clamp cursor
-        let new_line_count = self.doc.buf.line_count();
+        let new_line_count = self.document.buffer.line_count();
         let new_line = c.line.min(new_line_count.saturating_sub(1));
-        let new_col = self.doc.buf.line_char_len(new_line).min(c.col);
-        self.set_cursor(Pos::new(new_line, new_col));
+        let new_col = self
+            .document
+            .buffer
+            .line_character_count(new_line)
+            .min(c.column);
+        self.set_cursor(TextPosition::new(new_line, new_col));
     }
 
     // -- find ---------------------------------------------------------------
 
     fn update_find_highlights(&mut self, pattern: &str) {
         self.find
-            .update_highlights_lazy(pattern, &self.doc.buf, &self.view);
+            .update_highlights_lazy(pattern, &self.document.buffer, &self.viewport);
     }
 
     fn find_next_from_submit(&mut self, pattern: &str) {
         self.find
-            .update_highlights(pattern, &self.doc.buf, &self.view);
+            .update_highlights(pattern, &self.document.buffer, &self.viewport);
         if self.find.current.is_none() {
             self.set_status("Find: no matches".to_string());
             return;
@@ -1107,7 +1135,7 @@ impl Editor {
 
     fn find_next(&mut self) {
         let cursor = self.cursor();
-        if let Some(m) = self.find.find_next(&self.doc.buf, cursor) {
+        if let Some(m) = self.find.find_next(&self.document.buffer, cursor) {
             let (_, end) = m;
             self.set_cursor(end);
             self.center_view_on_line(end.line);
@@ -1117,7 +1145,7 @@ impl Editor {
 
     fn find_prev(&mut self) {
         let cursor = self.cursor();
-        if let Some(m) = self.find.find_prev(&self.doc.buf, cursor) {
+        if let Some(m) = self.find.find_prev(&self.document.buffer, cursor) {
             let (_, end) = m;
             self.set_cursor(end);
             self.center_view_on_line(end.line);
@@ -1126,7 +1154,7 @@ impl Editor {
     }
 
     fn set_find_status(&mut self) {
-        self.status_msg = self.find.status_text();
+        self.status_message = self.find.status_text();
         self.status_time = None; // don't auto-expire while browsing
     }
 
@@ -1137,7 +1165,7 @@ impl Editor {
                 cursor: end,
             });
         }
-        self.status_msg.clear();
+        self.status_message.clear();
         self.status_time = None;
     }
 
@@ -1164,13 +1192,13 @@ impl Editor {
         let (range_start, range_end) = if self.has_selection() {
             self.selection().ordered()
         } else {
-            let line_count = self.doc.buf.line_count();
+            let line_count = self.document.buffer.line_count();
             let last_line = line_count.saturating_sub(1);
-            let last_col = self.doc.buf.line_char_len(last_line);
-            (Pos::zero(), Pos::new(last_line, last_col))
+            let last_col = self.document.buffer.line_character_count(last_line);
+            (TextPosition::zero(), TextPosition::new(last_line, last_col))
         };
 
-        let text_bytes = self.doc.text_in_range(range_start, range_end);
+        let text_bytes = self.document.text_in_range(range_start, range_end);
         let text = String::from_utf8_lossy(&text_bytes);
 
         let count = re.find_iter(&text).count();
@@ -1181,14 +1209,14 @@ impl Editor {
 
         let new_text = re.replace_all(&text, replacement).into_owned();
 
-        self.doc.seal_undo();
-        self.doc.replace_range_with_deleted(
+        self.document.seal_undo();
+        self.document.replace_range_with_deleted(
             range_start,
             range_end,
             new_text.as_bytes(),
             text_bytes,
         );
-        self.doc.seal_undo();
+        self.document.seal_undo();
 
         self.clear_selection();
         self.set_status(format!("Replaced {} occurrences", count));
@@ -1217,12 +1245,18 @@ impl Editor {
         }
     }
 
-    fn screen_to_buffer_pos(&self, x: u16, y: u16) -> Pos {
-        crate::mouse::screen_to_buffer_pos(x, y, &self.doc.buf, &self.view, self.ruler_on)
+    fn screen_to_buffer_position(&self, x: u16, y: u16) -> TextPosition {
+        crate::mouse::screen_to_buffer_position(
+            x,
+            y,
+            &self.document.buffer,
+            &self.viewport,
+            self.line_numbers_visible,
+        )
     }
 
     fn mouse_press(&mut self, x: u16, y: u16, mods: MouseMods) {
-        let pos = self.screen_to_buffer_pos(x, y);
+        let pos = self.screen_to_buffer_position(x, y);
         if mods.ctrl {
             self.carets.add_caret(pos);
             self.mouse.dragging = false;
@@ -1245,80 +1279,80 @@ impl Editor {
         if !self.mouse.dragging {
             return;
         }
-        let pos = self.screen_to_buffer_pos(x, y);
-        self.carets.primary_mut().sel.cursor = pos;
+        let pos = self.screen_to_buffer_position(x, y);
+        self.carets.primary_mut().selection.cursor = pos;
     }
 
-    fn select_word_at(&mut self, pos: Pos) {
-        self.doc
-            .buf
-            .line_text_into(pos.line, &mut self.line_scratch);
-        let line_text = &self.line_scratch;
+    fn select_word_at(&mut self, pos: TextPosition) {
+        self.document
+            .buffer
+            .line_text_into(pos.line, &mut self.line_text_scratch);
+        let line_text = &self.line_text_scratch;
         if line_text.is_empty() {
             return;
         }
-        let col = pos.col.min(line_text.len().saturating_sub(1));
-        if col < line_text.len() && is_word_char(line_text[col]) {
-            let mut start = col;
+        let column = pos.column.min(line_text.len().saturating_sub(1));
+        if column < line_text.len() && is_word_char(line_text[column]) {
+            let mut start = column;
             while start > 0 && is_word_char(line_text[start - 1]) {
                 start -= 1;
             }
-            let mut end = col;
+            let mut end = column;
             while end < line_text.len() && is_word_char(line_text[end]) {
                 end += 1;
             }
             self.set_selection(Selection {
-                anchor: Pos::new(pos.line, end),
-                cursor: Pos::new(pos.line, start),
+                anchor: TextPosition::new(pos.line, end),
+                cursor: TextPosition::new(pos.line, start),
             });
         }
     }
 
     fn select_line_at(&mut self, line: usize) {
-        let line_count = self.doc.buf.line_count();
+        let line_count = self.document.buffer.line_count();
         if line >= line_count {
             return;
         }
         let end = if line + 1 < line_count {
-            Pos::new(line + 1, 0)
+            TextPosition::new(line + 1, 0)
         } else {
-            let len = self.doc.buf.line_char_len(line);
-            Pos::new(line, len)
+            let len = self.document.buffer.line_character_count(line);
+            TextPosition::new(line, len)
         };
         self.set_selection(Selection {
-            anchor: Pos::new(line, 0),
+            anchor: TextPosition::new(line, 0),
             cursor: end,
         });
     }
 
     fn scroll_up(&mut self) {
-        if self.view.scroll_line == 0 && self.view.scroll_wrap == 0 {
+        if self.viewport.scroll_line == 0 && self.viewport.scroll_wrap == 0 {
             return;
         }
-        let gw = if self.ruler_on {
-            gutter_width(self.doc.buf.line_count())
+        let gw = if self.line_numbers_visible {
+            gutter_width(self.document.buffer.line_count())
         } else {
             0
         };
-        let text_cols = self.view.text_cols(gw);
+        let text_cols = self.viewport.text_cols(gw);
         // Scroll back by SCROLL_LINES screen rows
         let mut remaining = SCROLL_LINES;
         while remaining > 0 {
-            if self.view.scroll_wrap > 0 {
-                let step = remaining.min(self.view.scroll_wrap);
-                self.view.scroll_wrap -= step;
+            if self.viewport.scroll_wrap > 0 {
+                let step = remaining.min(self.viewport.scroll_wrap);
+                self.viewport.scroll_wrap -= step;
                 remaining -= step;
-            } else if self.view.scroll_line > 0 {
-                self.view.scroll_line -= 1;
+            } else if self.viewport.scroll_line > 0 {
+                self.viewport.scroll_line -= 1;
                 let dw = self
-                    .doc
-                    .buf
-                    .display_col_at(self.view.scroll_line, usize::MAX);
-                let wraps = crate::view::wrapped_rows(dw, text_cols);
+                    .document
+                    .buffer
+                    .display_column_at(self.viewport.scroll_line, usize::MAX);
+                let wraps = crate::viewport::wrapped_rows(dw, text_cols);
                 remaining -= 1;
                 if remaining > 0 && wraps > 1 {
                     let step = remaining.min(wraps - 1);
-                    self.view.scroll_wrap = (wraps - 1).saturating_sub(step);
+                    self.viewport.scroll_wrap = (wraps - 1).saturating_sub(step);
                     remaining -= step;
                 }
             } else {
@@ -1330,32 +1364,32 @@ impl Editor {
     }
 
     fn scroll_down(&mut self) {
-        let line_count = self.doc.buf.line_count();
-        if self.view.scroll_line >= line_count.saturating_sub(1) {
+        let line_count = self.document.buffer.line_count();
+        if self.viewport.scroll_line >= line_count.saturating_sub(1) {
             return;
         }
-        let gw = if self.ruler_on {
+        let gw = if self.line_numbers_visible {
             gutter_width(line_count)
         } else {
             0
         };
-        let text_cols = self.view.text_cols(gw);
+        let text_cols = self.viewport.text_cols(gw);
         // Scroll forward by SCROLL_LINES screen rows
         let mut remaining = SCROLL_LINES;
-        while remaining > 0 && self.view.scroll_line < line_count.saturating_sub(1) {
+        while remaining > 0 && self.viewport.scroll_line < line_count.saturating_sub(1) {
             let dw = self
-                .doc
-                .buf
-                .display_col_at(self.view.scroll_line, usize::MAX);
-            let wraps = crate::view::wrapped_rows(dw, text_cols);
-            let remaining_in_line = wraps.saturating_sub(self.view.scroll_wrap);
+                .document
+                .buffer
+                .display_column_at(self.viewport.scroll_line, usize::MAX);
+            let wraps = crate::viewport::wrapped_rows(dw, text_cols);
+            let remaining_in_line = wraps.saturating_sub(self.viewport.scroll_wrap);
             if remaining < remaining_in_line {
-                self.view.scroll_wrap += remaining;
+                self.viewport.scroll_wrap += remaining;
                 remaining = 0;
             } else {
                 remaining -= remaining_in_line;
-                self.view.scroll_line += 1;
-                self.view.scroll_wrap = 0;
+                self.viewport.scroll_line += 1;
+                self.viewport.scroll_wrap = 0;
             }
         }
         // Move cursor into viewport if it scrolled past the top
@@ -1364,42 +1398,48 @@ impl Editor {
 
     /// After a mouse-wheel scroll, move the cursor so it stays within the visible area.
     fn clamp_cursor_to_viewport(&mut self, _gw: usize, text_cols: usize) {
-        let text_rows = self.view.text_rows();
+        let text_rows = self.viewport.text_rows();
         if text_rows == 0 || text_cols == 0 {
             return;
         }
-        let line_count = self.doc.buf.line_count();
+        let line_count = self.document.buffer.line_count();
         let cursor = self.cursor();
         let cursor_dcol = self.cursor_display_col();
         let cursor_wrap = cursor_dcol / text_cols;
 
         // Check if cursor is above viewport
-        if cursor.line < self.view.scroll_line
-            || (cursor.line == self.view.scroll_line && cursor_wrap < self.view.scroll_wrap)
+        if cursor.line < self.viewport.scroll_line
+            || (cursor.line == self.viewport.scroll_line && cursor_wrap < self.viewport.scroll_wrap)
         {
             // Snap cursor to the first visible position
-            // The first visible char col is scroll_wrap * text_cols
-            let first_dcol = self.view.scroll_wrap * text_cols;
-            let char_col = self
-                .doc
-                .buf
-                .char_col_from_display(self.view.scroll_line, first_dcol);
-            let line_len = self.doc.buf.line_char_len(self.view.scroll_line);
-            self.set_cursor(Pos::new(self.view.scroll_line, char_col.min(line_len)));
+            // The first visible char column is scroll_wrap * text_cols
+            let first_dcol = self.viewport.scroll_wrap * text_cols;
+            let character_column = self
+                .document
+                .buffer
+                .character_column_from_display(self.viewport.scroll_line, first_dcol);
+            let line_len = self
+                .document
+                .buffer
+                .line_character_count(self.viewport.scroll_line);
+            self.set_cursor(TextPosition::new(
+                self.viewport.scroll_line,
+                character_column.min(line_len),
+            ));
             return;
         }
 
         // Check if cursor is below viewport — walk screen rows to find last visible position
         let mut screen_row = 0usize;
-        let mut line_idx = self.view.scroll_line;
-        let mut last_visible_line = self.view.scroll_line;
-        let mut last_visible_wrap = self.view.scroll_wrap;
+        let mut line_idx = self.viewport.scroll_line;
+        let mut last_visible_line = self.viewport.scroll_line;
+        let mut last_visible_wrap = self.viewport.scroll_wrap;
 
         while screen_row < text_rows && line_idx < line_count {
-            let dw = self.doc.buf.display_col_at(line_idx, usize::MAX);
-            let total = crate::view::wrapped_rows(dw, text_cols);
-            let start_w = if line_idx == self.view.scroll_line {
-                self.view.scroll_wrap
+            let dw = self.document.buffer.display_column_at(line_idx, usize::MAX);
+            let total = crate::viewport::wrapped_rows(dw, text_cols);
+            let start_w = if line_idx == self.viewport.scroll_line {
+                self.viewport.scroll_wrap
             } else {
                 0
             };
@@ -1419,12 +1459,15 @@ impl Editor {
         {
             // Snap cursor to last visible wrap row
             let target_dcol = last_visible_wrap * text_cols;
-            let char_col = self
-                .doc
-                .buf
-                .char_col_from_display(last_visible_line, target_dcol);
-            let line_len = self.doc.buf.line_char_len(last_visible_line);
-            self.set_cursor(Pos::new(last_visible_line, char_col.min(line_len)));
+            let character_column = self
+                .document
+                .buffer
+                .character_column_from_display(last_visible_line, target_dcol);
+            let line_len = self.document.buffer.line_character_count(last_visible_line);
+            self.set_cursor(TextPosition::new(
+                last_visible_line,
+                character_column.min(line_len),
+            ));
         }
     }
 
@@ -1435,9 +1478,9 @@ impl Editor {
             return;
         }
         let (start, end) = self.selection().ordered();
-        self.doc.seal_undo();
-        let pos = self.doc.delete_range(start, end);
-        self.doc.seal_undo();
+        self.document.seal_undo();
+        let pos = self.document.delete_range(start, end);
+        self.document.seal_undo();
         self.set_cursor(pos);
     }
 
@@ -1446,29 +1489,29 @@ impl Editor {
     }
 
     fn select_all(&mut self) {
-        let line_count = self.doc.buf.line_count();
+        let line_count = self.document.buffer.line_count();
         let last_line = line_count.saturating_sub(1);
-        let last_col = self.doc.buf.line_char_len(last_line);
+        let last_col = self.document.buffer.line_character_count(last_line);
         self.set_selection(Selection {
-            anchor: Pos::zero(),
-            cursor: Pos::new(last_line, last_col),
+            anchor: TextPosition::zero(),
+            cursor: TextPosition::new(last_line, last_col),
         });
     }
 
     fn select_above(&mut self) {
         self.set_selection(Selection {
             anchor: self.cursor(),
-            cursor: Pos::zero(),
+            cursor: TextPosition::zero(),
         });
         self.set_desired_col(None);
     }
 
     fn select_below(&mut self) {
-        let last_line = self.doc.buf.line_count().saturating_sub(1);
-        let last_col = self.doc.buf.line_char_len(last_line);
+        let last_line = self.document.buffer.line_count().saturating_sub(1);
+        let last_col = self.document.buffer.line_character_count(last_line);
         self.set_selection(Selection {
             anchor: self.cursor(),
-            cursor: Pos::new(last_line, last_col),
+            cursor: TextPosition::new(last_line, last_col),
         });
         self.set_desired_col(None);
     }
@@ -1477,30 +1520,33 @@ impl Editor {
 
     fn move_up_impl(&mut self, extend: bool) {
         if self.carets.is_multicursor() {
-            self.mutate_carets(true, |doc, _, caret| {
-                let cursor = caret.sel.cursor;
+            self.mutate_carets(true, |document, _, caret| {
+                let cursor = caret.selection.cursor;
                 if cursor.line == 0 {
                     return;
                 }
-                let target_col = caret.desired_col.unwrap_or(cursor.col);
-                caret.desired_col = Some(target_col);
+                let target_col = caret.desired_column.unwrap_or(cursor.column);
+                caret.desired_column = Some(target_col);
                 let new_line = cursor.line - 1;
-                let line_len = doc.buf.line_char_len(new_line);
-                let pos = Pos::new(new_line, target_col.min(line_len));
+                let line_len = document.buffer.line_character_count(new_line);
+                let pos = TextPosition::new(new_line, target_col.min(line_len));
                 if extend {
-                    caret.sel.cursor = pos;
+                    caret.selection.cursor = pos;
                 } else {
-                    caret.sel = Selection::caret(pos);
+                    caret.selection = Selection::caret(pos);
                 }
             });
             return;
         }
         if self.cursor().line > 0 {
-            let target_col = self.desired_col().unwrap_or(self.cursor().col);
+            let target_col = self.desired_column().unwrap_or(self.cursor().column);
             self.set_desired_col(Some(target_col));
             let new_line = self.cursor().line - 1;
-            let line_len = self.doc.buf.line_char_len(new_line);
-            self.move_cursor(Pos::new(new_line, target_col.min(line_len)), extend);
+            let line_len = self.document.buffer.line_character_count(new_line);
+            self.move_cursor(
+                TextPosition::new(new_line, target_col.min(line_len)),
+                extend,
+            );
         }
     }
 
@@ -1510,31 +1556,34 @@ impl Editor {
 
     fn move_down_impl(&mut self, extend: bool) {
         if self.carets.is_multicursor() {
-            self.mutate_carets(true, |doc, _, caret| {
-                let cursor = caret.sel.cursor;
-                if cursor.line + 1 >= doc.buf.line_count() {
+            self.mutate_carets(true, |document, _, caret| {
+                let cursor = caret.selection.cursor;
+                if cursor.line + 1 >= document.buffer.line_count() {
                     return;
                 }
-                let target_col = caret.desired_col.unwrap_or(cursor.col);
-                caret.desired_col = Some(target_col);
+                let target_col = caret.desired_column.unwrap_or(cursor.column);
+                caret.desired_column = Some(target_col);
                 let new_line = cursor.line + 1;
-                let line_len = doc.buf.line_char_len(new_line);
-                let pos = Pos::new(new_line, target_col.min(line_len));
+                let line_len = document.buffer.line_character_count(new_line);
+                let pos = TextPosition::new(new_line, target_col.min(line_len));
                 if extend {
-                    caret.sel.cursor = pos;
+                    caret.selection.cursor = pos;
                 } else {
-                    caret.sel = Selection::caret(pos);
+                    caret.selection = Selection::caret(pos);
                 }
             });
             return;
         }
-        let line_count = self.doc.buf.line_count();
+        let line_count = self.document.buffer.line_count();
         if self.cursor().line + 1 < line_count {
-            let target_col = self.desired_col().unwrap_or(self.cursor().col);
+            let target_col = self.desired_column().unwrap_or(self.cursor().column);
             self.set_desired_col(Some(target_col));
             let new_line = self.cursor().line + 1;
-            let line_len = self.doc.buf.line_char_len(new_line);
-            self.move_cursor(Pos::new(new_line, target_col.min(line_len)), extend);
+            let line_len = self.document.buffer.line_character_count(new_line);
+            self.move_cursor(
+                TextPosition::new(new_line, target_col.min(line_len)),
+                extend,
+            );
         }
     }
 
@@ -1542,38 +1591,38 @@ impl Editor {
         self.move_down_impl(false);
     }
 
-    fn indent_snap_left(&mut self, line: usize, col: usize) -> usize {
-        Self::indent_snap_left_for(&self.doc, line, col)
+    fn indent_snap_left(&mut self, line: usize, column: usize) -> usize {
+        Self::indent_snap_left_for(&self.document, line, column)
     }
 
-    fn indent_snap_right(&mut self, line: usize, col: usize) -> usize {
-        Self::indent_snap_right_for(&self.doc, line, col)
+    fn indent_snap_right(&mut self, line: usize, column: usize) -> usize {
+        Self::indent_snap_right_for(&self.document, line, column)
     }
 
     fn move_left_impl(&mut self, extend: bool) {
         if self.carets.is_multicursor() {
-            self.mutate_carets(true, |doc, _, caret| {
-                if !extend && !caret.sel.is_empty() {
-                    let (start, _) = caret.sel.ordered();
-                    caret.sel = Selection::caret(start);
+            self.mutate_carets(true, |document, _, caret| {
+                if !extend && !caret.selection.is_empty() {
+                    let (start, _) = caret.selection.ordered();
+                    caret.selection = Selection::caret(start);
                     return;
                 }
-                let cursor = caret.sel.cursor;
-                if cursor.col > 0 {
-                    let new_col = Self::indent_snap_left_for(doc, cursor.line, cursor.col);
-                    let pos = Pos::new(cursor.line, new_col);
+                let cursor = caret.selection.cursor;
+                if cursor.column > 0 {
+                    let new_col = Self::indent_snap_left_for(document, cursor.line, cursor.column);
+                    let pos = TextPosition::new(cursor.line, new_col);
                     if extend {
-                        caret.sel.cursor = pos;
+                        caret.selection.cursor = pos;
                     } else {
-                        caret.sel = Selection::caret(pos);
+                        caret.selection = Selection::caret(pos);
                     }
                 } else if cursor.line > 0 {
-                    let prev_len = doc.buf.line_char_len(cursor.line - 1);
-                    let pos = Pos::new(cursor.line - 1, prev_len);
+                    let prev_len = document.buffer.line_character_count(cursor.line - 1);
+                    let pos = TextPosition::new(cursor.line - 1, prev_len);
                     if extend {
-                        caret.sel.cursor = pos;
+                        caret.selection.cursor = pos;
                     } else {
-                        caret.sel = Selection::caret(pos);
+                        caret.selection = Selection::caret(pos);
                     }
                 }
             });
@@ -1585,12 +1634,12 @@ impl Editor {
             return;
         }
         let c = self.cursor();
-        if c.col > 0 {
-            let new_col = self.indent_snap_left(c.line, c.col);
-            self.move_cursor(Pos::new(c.line, new_col), extend);
+        if c.column > 0 {
+            let new_col = self.indent_snap_left(c.line, c.column);
+            self.move_cursor(TextPosition::new(c.line, new_col), extend);
         } else if c.line > 0 {
-            let prev_len = self.doc.buf.line_char_len(c.line - 1);
-            self.move_cursor(Pos::new(c.line - 1, prev_len), extend);
+            let prev_len = self.document.buffer.line_character_count(c.line - 1);
+            self.move_cursor(TextPosition::new(c.line - 1, prev_len), extend);
         }
     }
 
@@ -1601,28 +1650,28 @@ impl Editor {
 
     fn move_right_impl(&mut self, extend: bool) {
         if self.carets.is_multicursor() {
-            self.mutate_carets(true, |doc, _, caret| {
-                if !extend && !caret.sel.is_empty() {
-                    let (_, end) = caret.sel.ordered();
-                    caret.sel = Selection::caret(end);
+            self.mutate_carets(true, |document, _, caret| {
+                if !extend && !caret.selection.is_empty() {
+                    let (_, end) = caret.selection.ordered();
+                    caret.selection = Selection::caret(end);
                     return;
                 }
-                let cursor = caret.sel.cursor;
-                let line_len = doc.buf.line_char_len(cursor.line);
-                if cursor.col < line_len {
-                    let new_col = Self::indent_snap_right_for(doc, cursor.line, cursor.col);
-                    let pos = Pos::new(cursor.line, new_col);
+                let cursor = caret.selection.cursor;
+                let line_len = document.buffer.line_character_count(cursor.line);
+                if cursor.column < line_len {
+                    let new_col = Self::indent_snap_right_for(document, cursor.line, cursor.column);
+                    let pos = TextPosition::new(cursor.line, new_col);
                     if extend {
-                        caret.sel.cursor = pos;
+                        caret.selection.cursor = pos;
                     } else {
-                        caret.sel = Selection::caret(pos);
+                        caret.selection = Selection::caret(pos);
                     }
-                } else if cursor.line + 1 < doc.buf.line_count() {
-                    let pos = Pos::new(cursor.line + 1, 0);
+                } else if cursor.line + 1 < document.buffer.line_count() {
+                    let pos = TextPosition::new(cursor.line + 1, 0);
                     if extend {
-                        caret.sel.cursor = pos;
+                        caret.selection.cursor = pos;
                     } else {
-                        caret.sel = Selection::caret(pos);
+                        caret.selection = Selection::caret(pos);
                     }
                 }
             });
@@ -1634,12 +1683,12 @@ impl Editor {
             return;
         }
         let c = self.cursor();
-        let line_len = self.doc.buf.line_char_len(c.line);
-        if c.col < line_len {
-            let new_col = self.indent_snap_right(c.line, c.col);
-            self.move_cursor(Pos::new(c.line, new_col), extend);
-        } else if c.line + 1 < self.doc.buf.line_count() {
-            self.move_cursor(Pos::new(c.line + 1, 0), extend);
+        let line_len = self.document.buffer.line_character_count(c.line);
+        if c.column < line_len {
+            let new_col = self.indent_snap_right(c.line, c.column);
+            self.move_cursor(TextPosition::new(c.line, new_col), extend);
+        } else if c.line + 1 < self.document.buffer.line_count() {
+            self.move_cursor(TextPosition::new(c.line + 1, 0), extend);
         }
     }
 
@@ -1649,38 +1698,39 @@ impl Editor {
     }
 
     /// If the cursor is on a bracket character, return the matching bracket position.
-    fn bracket_jump_target(&mut self) -> Option<Pos> {
-        let mut scratch = std::mem::take(&mut self.line_scratch);
-        let result = Self::bracket_jump_target_at(&self.doc, &mut scratch, self.cursor());
-        self.line_scratch = scratch;
+    fn bracket_jump_target(&mut self) -> Option<TextPosition> {
+        let mut scratch = std::mem::take(&mut self.line_text_scratch);
+        let result = Self::bracket_jump_target_at(&self.document, &mut scratch, self.cursor());
+        self.line_text_scratch = scratch;
         result
     }
 
     fn word_left(&mut self) {
         self.set_desired_col(None);
         if self.carets.is_multicursor() {
-            self.mutate_carets(true, |doc, scratch, caret| {
-                caret.desired_col = None;
-                if !caret.sel.is_empty() {
-                    let (start, _) = caret.sel.ordered();
-                    caret.sel = Selection::caret(start);
+            self.mutate_carets(true, |document, scratch, caret| {
+                caret.desired_column = None;
+                if !caret.selection.is_empty() {
+                    let (start, _) = caret.selection.ordered();
+                    caret.selection = Selection::caret(start);
                     return;
                 }
-                let cursor = caret.sel.cursor;
-                if let Some(target) = Self::bracket_jump_target_at(doc, scratch, cursor) {
-                    caret.sel = Selection::caret(target);
+                let cursor = caret.selection.cursor;
+                if let Some(target) = Self::bracket_jump_target_at(document, scratch, cursor) {
+                    caret.selection = Selection::caret(target);
                     return;
                 }
-                if cursor.col == 0 {
+                if cursor.column == 0 {
                     if cursor.line > 0 {
-                        let prev_len = doc.buf.line_char_len(cursor.line - 1);
-                        caret.sel = Selection::caret(Pos::new(cursor.line - 1, prev_len));
+                        let prev_len = document.buffer.line_character_count(cursor.line - 1);
+                        caret.selection =
+                            Selection::caret(TextPosition::new(cursor.line - 1, prev_len));
                     }
                     return;
                 }
-                doc.buf.line_text_into(cursor.line, scratch);
-                let boundary = prev_word_boundary(scratch, cursor.col);
-                caret.sel = Selection::caret(Pos::new(cursor.line, boundary));
+                document.buffer.line_text_into(cursor.line, scratch);
+                let boundary = prev_word_boundary(scratch, cursor.column);
+                caret.selection = Selection::caret(TextPosition::new(cursor.line, boundary));
             });
             return;
         }
@@ -1694,43 +1744,45 @@ impl Editor {
             return;
         }
         let c = self.cursor();
-        if c.col == 0 {
+        if c.column == 0 {
             if c.line > 0 {
-                let prev_len = self.doc.buf.line_char_len(c.line - 1);
-                self.set_cursor(Pos::new(c.line - 1, prev_len));
+                let prev_len = self.document.buffer.line_character_count(c.line - 1);
+                self.set_cursor(TextPosition::new(c.line - 1, prev_len));
             }
             return;
         }
-        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
-        let boundary = prev_word_boundary(&self.line_scratch, c.col);
-        self.set_cursor(Pos::new(c.line, boundary));
+        self.document
+            .buffer
+            .line_text_into(c.line, &mut self.line_text_scratch);
+        let boundary = prev_word_boundary(&self.line_text_scratch, c.column);
+        self.set_cursor(TextPosition::new(c.line, boundary));
     }
 
     fn word_right(&mut self) {
         self.set_desired_col(None);
         if self.carets.is_multicursor() {
-            self.mutate_carets(true, |doc, scratch, caret| {
-                caret.desired_col = None;
-                if !caret.sel.is_empty() {
-                    let (_, end) = caret.sel.ordered();
-                    caret.sel = Selection::caret(end);
+            self.mutate_carets(true, |document, scratch, caret| {
+                caret.desired_column = None;
+                if !caret.selection.is_empty() {
+                    let (_, end) = caret.selection.ordered();
+                    caret.selection = Selection::caret(end);
                     return;
                 }
-                let cursor = caret.sel.cursor;
-                if let Some(target) = Self::bracket_jump_target_at(doc, scratch, cursor) {
-                    caret.sel = Selection::caret(target);
+                let cursor = caret.selection.cursor;
+                if let Some(target) = Self::bracket_jump_target_at(document, scratch, cursor) {
+                    caret.selection = Selection::caret(target);
                     return;
                 }
-                let line_len = doc.buf.line_char_len(cursor.line);
-                if cursor.col >= line_len {
-                    if cursor.line + 1 < doc.buf.line_count() {
-                        caret.sel = Selection::caret(Pos::new(cursor.line + 1, 0));
+                let line_len = document.buffer.line_character_count(cursor.line);
+                if cursor.column >= line_len {
+                    if cursor.line + 1 < document.buffer.line_count() {
+                        caret.selection = Selection::caret(TextPosition::new(cursor.line + 1, 0));
                     }
                     return;
                 }
-                doc.buf.line_text_into(cursor.line, scratch);
-                let boundary = next_word_boundary(scratch, cursor.col);
-                caret.sel = Selection::caret(Pos::new(cursor.line, boundary));
+                document.buffer.line_text_into(cursor.line, scratch);
+                let boundary = next_word_boundary(scratch, cursor.column);
+                caret.selection = Selection::caret(TextPosition::new(cursor.line, boundary));
             });
             return;
         }
@@ -1744,166 +1796,182 @@ impl Editor {
             return;
         }
         let c = self.cursor();
-        let line_len = self.doc.buf.line_char_len(c.line);
-        if c.col >= line_len {
-            if c.line + 1 < self.doc.buf.line_count() {
-                self.set_cursor(Pos::new(c.line + 1, 0));
+        let line_len = self.document.buffer.line_character_count(c.line);
+        if c.column >= line_len {
+            if c.line + 1 < self.document.buffer.line_count() {
+                self.set_cursor(TextPosition::new(c.line + 1, 0));
             }
             return;
         }
-        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
-        let boundary = next_word_boundary(&self.line_scratch, c.col);
-        self.set_cursor(Pos::new(c.line, boundary));
+        self.document
+            .buffer
+            .line_text_into(c.line, &mut self.line_text_scratch);
+        let boundary = next_word_boundary(&self.line_text_scratch, c.column);
+        self.set_cursor(TextPosition::new(c.line, boundary));
     }
 
     fn word_left_extend(&mut self) {
         if self.carets.is_multicursor() {
-            self.mutate_carets(true, |doc, scratch, caret| {
-                caret.desired_col = None;
-                let cursor = caret.sel.cursor;
-                if let Some(target) = Self::bracket_jump_target_at(doc, scratch, cursor) {
-                    caret.sel.cursor = target;
+            self.mutate_carets(true, |document, scratch, caret| {
+                caret.desired_column = None;
+                let cursor = caret.selection.cursor;
+                if let Some(target) = Self::bracket_jump_target_at(document, scratch, cursor) {
+                    caret.selection.cursor = target;
                     return;
                 }
-                if cursor.col == 0 {
+                if cursor.column == 0 {
                     if cursor.line > 0 {
-                        let prev_len = doc.buf.line_char_len(cursor.line - 1);
-                        caret.sel.cursor = Pos::new(cursor.line - 1, prev_len);
+                        let prev_len = document.buffer.line_character_count(cursor.line - 1);
+                        caret.selection.cursor = TextPosition::new(cursor.line - 1, prev_len);
                     }
                     return;
                 }
-                doc.buf.line_text_into(cursor.line, scratch);
-                let boundary = prev_word_boundary(scratch, cursor.col);
-                caret.sel.cursor = Pos::new(cursor.line, boundary);
+                document.buffer.line_text_into(cursor.line, scratch);
+                let boundary = prev_word_boundary(scratch, cursor.column);
+                caret.selection.cursor = TextPosition::new(cursor.line, boundary);
             });
             return;
         }
         if let Some(target) = self.bracket_jump_target() {
-            self.carets.primary_mut().sel.cursor = target;
+            self.carets.primary_mut().selection.cursor = target;
             return;
         }
         let c = self.cursor();
-        if c.col == 0 {
+        if c.column == 0 {
             if c.line > 0 {
-                let prev_len = self.doc.buf.line_char_len(c.line - 1);
-                self.carets.primary_mut().sel.cursor = Pos::new(c.line - 1, prev_len);
+                let prev_len = self.document.buffer.line_character_count(c.line - 1);
+                self.carets.primary_mut().selection.cursor =
+                    TextPosition::new(c.line - 1, prev_len);
             }
             return;
         }
-        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
-        let boundary = prev_word_boundary(&self.line_scratch, c.col);
-        self.carets.primary_mut().sel.cursor = Pos::new(c.line, boundary);
+        self.document
+            .buffer
+            .line_text_into(c.line, &mut self.line_text_scratch);
+        let boundary = prev_word_boundary(&self.line_text_scratch, c.column);
+        self.carets.primary_mut().selection.cursor = TextPosition::new(c.line, boundary);
     }
 
     fn word_right_extend(&mut self) {
         if self.carets.is_multicursor() {
-            self.mutate_carets(true, |doc, scratch, caret| {
-                caret.desired_col = None;
-                let cursor = caret.sel.cursor;
-                if let Some(target) = Self::bracket_jump_target_at(doc, scratch, cursor) {
-                    caret.sel.cursor = target;
+            self.mutate_carets(true, |document, scratch, caret| {
+                caret.desired_column = None;
+                let cursor = caret.selection.cursor;
+                if let Some(target) = Self::bracket_jump_target_at(document, scratch, cursor) {
+                    caret.selection.cursor = target;
                     return;
                 }
-                let line_len = doc.buf.line_char_len(cursor.line);
-                if cursor.col >= line_len {
-                    if cursor.line + 1 < doc.buf.line_count() {
-                        caret.sel.cursor = Pos::new(cursor.line + 1, 0);
+                let line_len = document.buffer.line_character_count(cursor.line);
+                if cursor.column >= line_len {
+                    if cursor.line + 1 < document.buffer.line_count() {
+                        caret.selection.cursor = TextPosition::new(cursor.line + 1, 0);
                     }
                     return;
                 }
-                doc.buf.line_text_into(cursor.line, scratch);
-                let boundary = next_word_boundary(scratch, cursor.col);
-                caret.sel.cursor = Pos::new(cursor.line, boundary);
+                document.buffer.line_text_into(cursor.line, scratch);
+                let boundary = next_word_boundary(scratch, cursor.column);
+                caret.selection.cursor = TextPosition::new(cursor.line, boundary);
             });
             return;
         }
         if let Some(target) = self.bracket_jump_target() {
-            self.carets.primary_mut().sel.cursor = target;
+            self.carets.primary_mut().selection.cursor = target;
             return;
         }
         let c = self.cursor();
-        let line_len = self.doc.buf.line_char_len(c.line);
-        if c.col >= line_len {
-            if c.line + 1 < self.doc.buf.line_count() {
-                self.carets.primary_mut().sel.cursor = Pos::new(c.line + 1, 0);
+        let line_len = self.document.buffer.line_character_count(c.line);
+        if c.column >= line_len {
+            if c.line + 1 < self.document.buffer.line_count() {
+                self.carets.primary_mut().selection.cursor = TextPosition::new(c.line + 1, 0);
             }
             return;
         }
-        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
-        let boundary = next_word_boundary(&self.line_scratch, c.col);
-        self.carets.primary_mut().sel.cursor = Pos::new(c.line, boundary);
+        self.document
+            .buffer
+            .line_text_into(c.line, &mut self.line_text_scratch);
+        let boundary = next_word_boundary(&self.line_text_scratch, c.column);
+        self.carets.primary_mut().selection.cursor = TextPosition::new(c.line, boundary);
     }
 
     fn move_home(&mut self) {
         self.set_desired_col(None);
         if self.carets.is_multicursor() {
             self.mutate_carets(true, |_, _, caret| {
-                caret.desired_col = None;
-                let pos = Pos::new(caret.sel.cursor.line, 0);
-                caret.sel = Selection::caret(pos);
+                caret.desired_column = None;
+                let pos = TextPosition::new(caret.selection.cursor.line, 0);
+                caret.selection = Selection::caret(pos);
             });
             return;
         }
-        self.set_cursor(Pos::new(self.cursor().line, 0));
+        self.set_cursor(TextPosition::new(self.cursor().line, 0));
     }
 
     fn move_end(&mut self) {
         self.set_desired_col(None);
         if self.carets.is_multicursor() {
-            self.mutate_carets(true, |doc, _, caret| {
-                caret.desired_col = None;
-                let cursor = caret.sel.cursor;
-                let len = doc.buf.line_char_len(cursor.line);
-                caret.sel = Selection::caret(Pos::new(cursor.line, len));
+            self.mutate_carets(true, |document, _, caret| {
+                caret.desired_column = None;
+                let cursor = caret.selection.cursor;
+                let len = document.buffer.line_character_count(cursor.line);
+                caret.selection = Selection::caret(TextPosition::new(cursor.line, len));
             });
             return;
         }
         let c = self.cursor();
-        let len = self.doc.buf.line_char_len(c.line);
-        self.set_cursor(Pos::new(c.line, len));
+        let len = self.document.buffer.line_character_count(c.line);
+        self.set_cursor(TextPosition::new(c.line, len));
     }
 
     fn page_up(&mut self) {
         if self.carets.is_multicursor() {
-            let rows = self.view.text_rows();
-            self.mutate_carets(true, |doc, _, caret| {
-                let cursor = caret.sel.cursor;
-                let target_col = caret.desired_col.unwrap_or(cursor.col);
-                caret.desired_col = Some(target_col);
+            let rows = self.viewport.text_rows();
+            self.mutate_carets(true, |document, _, caret| {
+                let cursor = caret.selection.cursor;
+                let target_col = caret.desired_column.unwrap_or(cursor.column);
+                caret.desired_column = Some(target_col);
                 let new_line = cursor.line.saturating_sub(rows);
-                let line_len = doc.buf.line_char_len(new_line);
-                caret.sel = Selection::caret(Pos::new(new_line, target_col.min(line_len)));
+                let line_len = document.buffer.line_character_count(new_line);
+                caret.selection =
+                    Selection::caret(TextPosition::new(new_line, target_col.min(line_len)));
             });
             return;
         }
-        let rows = self.view.text_rows();
-        let target_col = self.desired_col().unwrap_or(self.cursor().col);
+        let rows = self.viewport.text_rows();
+        let target_col = self.desired_column().unwrap_or(self.cursor().column);
         self.set_desired_col(Some(target_col));
         let new_line = self.cursor().line.saturating_sub(rows);
-        let line_len = self.doc.buf.line_char_len(new_line);
-        self.set_cursor_preserving_desired_col(Pos::new(new_line, target_col.min(line_len)));
+        let line_len = self.document.buffer.line_character_count(new_line);
+        self.set_cursor_preserving_desired_col(TextPosition::new(
+            new_line,
+            target_col.min(line_len),
+        ));
     }
 
     fn page_down(&mut self) {
         if self.carets.is_multicursor() {
-            let rows = self.view.text_rows();
-            self.mutate_carets(true, |doc, _, caret| {
-                let cursor = caret.sel.cursor;
-                let target_col = caret.desired_col.unwrap_or(cursor.col);
-                caret.desired_col = Some(target_col);
-                let new_line = (cursor.line + rows).min(doc.buf.line_count().saturating_sub(1));
-                let line_len = doc.buf.line_char_len(new_line);
-                caret.sel = Selection::caret(Pos::new(new_line, target_col.min(line_len)));
+            let rows = self.viewport.text_rows();
+            self.mutate_carets(true, |document, _, caret| {
+                let cursor = caret.selection.cursor;
+                let target_col = caret.desired_column.unwrap_or(cursor.column);
+                caret.desired_column = Some(target_col);
+                let new_line =
+                    (cursor.line + rows).min(document.buffer.line_count().saturating_sub(1));
+                let line_len = document.buffer.line_character_count(new_line);
+                caret.selection =
+                    Selection::caret(TextPosition::new(new_line, target_col.min(line_len)));
             });
             return;
         }
-        let rows = self.view.text_rows();
-        let line_count = self.doc.buf.line_count();
-        let target_col = self.desired_col().unwrap_or(self.cursor().col);
+        let rows = self.viewport.text_rows();
+        let line_count = self.document.buffer.line_count();
+        let target_col = self.desired_column().unwrap_or(self.cursor().column);
         self.set_desired_col(Some(target_col));
         let new_line = (self.cursor().line + rows).min(line_count.saturating_sub(1));
-        let line_len = self.doc.buf.line_char_len(new_line);
-        self.set_cursor_preserving_desired_col(Pos::new(new_line, target_col.min(line_len)));
+        let line_len = self.document.buffer.line_character_count(new_line);
+        self.set_cursor_preserving_desired_col(TextPosition::new(
+            new_line,
+            target_col.min(line_len),
+        ));
     }
 
     // -- movement (extend selection) ----------------------------------------
@@ -1927,7 +1995,7 @@ impl Editor {
     // -- editing ------------------------------------------------------------
 
     fn insert_char(&mut self, c: char) {
-        let lang_name = self.doc.detect_language().map(|l| l.name);
+        let lang_name = self.document.detect_language().map(|l| l.name);
         if self.carets.is_multicursor() {
             let mut planned = Vec::with_capacity(self.carets.len());
             let mut char_buf = [0u8; 4];
@@ -1935,11 +2003,11 @@ impl Editor {
             let encoded_bytes = encoded.as_bytes();
 
             for caret in self.carets.iter().copied() {
-                let sel = caret.sel;
-                if !sel.is_empty() {
-                    let (start, end) = sel.ordered();
+                let selection = caret.selection;
+                if !selection.is_empty() {
+                    let (start, end) = selection.ordered();
                     let start_offset = self.offset_for_pos(start);
-                    let deleted = self.doc.text_in_range(start, end);
+                    let deleted = self.document.text_in_range(start, end);
                     let end_offset = start_offset + deleted.len();
                     if let Some(close) = auto_close_char(c, lang_name) {
                         let mut insert =
@@ -1948,52 +2016,54 @@ impl Editor {
                         insert.extend_from_slice(&deleted);
                         insert.push(close as u8);
                         planned.push(PlannedCaretEdit {
-                            start: start_offset,
-                            end: end_offset,
-                            insert,
-                            deleted,
-                            anchor_after: start_offset + encoded_bytes.len(),
-                            cursor_after: start_offset
+                            start_byte: start_offset,
+                            end_byte: end_offset,
+                            inserted_bytes: insert,
+                            deleted_bytes: deleted,
+                            anchor_after_byte: start_offset + encoded_bytes.len(),
+                            cursor_after_byte: start_offset
                                 + encoded_bytes.len()
                                 + (end_offset - start_offset),
                         });
                     } else {
                         planned.push(PlannedCaretEdit {
-                            start: start_offset,
-                            end: end_offset,
-                            insert: encoded_bytes.to_vec(),
-                            deleted,
-                            anchor_after: start_offset + encoded_bytes.len(),
-                            cursor_after: start_offset + encoded_bytes.len(),
+                            start_byte: start_offset,
+                            end_byte: end_offset,
+                            inserted_bytes: encoded_bytes.to_vec(),
+                            deleted_bytes: deleted,
+                            anchor_after_byte: start_offset + encoded_bytes.len(),
+                            cursor_after_byte: start_offset + encoded_bytes.len(),
                         });
                     }
                     continue;
                 }
 
-                let pos = sel.cursor;
+                let pos = selection.cursor;
                 let offset = self.offset_for_pos(pos);
 
                 if is_close_char(c) {
-                    let ls = self.doc.buf.line_start(pos.line);
-                    let le = self.doc.buf.line_end(pos.line);
-                    if ls + pos.col < le && self.doc.buf.byte_at(ls + pos.col) == c as u8 {
+                    let ls = self.document.buffer.line_start(pos.line);
+                    let le = self.document.buffer.line_end(pos.line);
+                    if ls + pos.column < le
+                        && self.document.buffer.byte_at(ls + pos.column) == c as u8
+                    {
                         planned.push(PlannedCaretEdit {
-                            start: offset,
-                            end: offset,
-                            insert: Vec::new(),
-                            deleted: Vec::new(),
-                            anchor_after: offset + 1,
-                            cursor_after: offset + 1,
+                            start_byte: offset,
+                            end_byte: offset,
+                            inserted_bytes: Vec::new(),
+                            deleted_bytes: Vec::new(),
+                            anchor_after_byte: offset + 1,
+                            cursor_after_byte: offset + 1,
                         });
                         continue;
                     }
                 }
 
                 if let Some(close) = auto_close_char(c, lang_name) {
-                    let ls = self.doc.buf.line_start(pos.line);
-                    let le = self.doc.buf.line_end(pos.line);
-                    let next = if ls + pos.col < le {
-                        self.doc.buf.byte_at(ls + pos.col)
+                    let ls = self.document.buffer.line_start(pos.line);
+                    let le = self.document.buffer.line_end(pos.line);
+                    let next = if ls + pos.column < le {
+                        self.document.buffer.byte_at(ls + pos.column)
                     } else {
                         b'\n'
                     };
@@ -2006,24 +2076,24 @@ impl Editor {
                         insert.extend_from_slice(encoded_bytes);
                         insert.push(close as u8);
                         planned.push(PlannedCaretEdit {
-                            start: offset,
-                            end: offset,
-                            insert,
-                            deleted: Vec::new(),
-                            anchor_after: offset + encoded_bytes.len(),
-                            cursor_after: offset + encoded_bytes.len(),
+                            start_byte: offset,
+                            end_byte: offset,
+                            inserted_bytes: insert,
+                            deleted_bytes: Vec::new(),
+                            anchor_after_byte: offset + encoded_bytes.len(),
+                            cursor_after_byte: offset + encoded_bytes.len(),
                         });
                         continue;
                     }
                 }
 
                 planned.push(PlannedCaretEdit {
-                    start: offset,
-                    end: offset,
-                    insert: encoded_bytes.to_vec(),
-                    deleted: Vec::new(),
-                    anchor_after: offset + encoded_bytes.len(),
-                    cursor_after: offset + encoded_bytes.len(),
+                    start_byte: offset,
+                    end_byte: offset,
+                    inserted_bytes: encoded_bytes.to_vec(),
+                    deleted_bytes: Vec::new(),
+                    anchor_after_byte: offset + encoded_bytes.len(),
+                    cursor_after_byte: offset + encoded_bytes.len(),
                 });
             }
 
@@ -2035,18 +2105,18 @@ impl Editor {
             // Wrap selection with matching pairs
             if let Some(close) = auto_close_char(c, lang_name) {
                 let (start, end) = self.selection().ordered();
-                let text = self.doc.text_in_range(start, end);
+                let text = self.document.text_in_range(start, end);
                 let mut wrapped = vec![c as u8];
                 wrapped.extend_from_slice(&text);
                 wrapped.push(close as u8);
-                self.doc.begin_undo_group();
-                self.doc.delete_range(start, end);
-                let after = self.doc.insert(start.line, start.col, &wrapped);
-                self.doc.end_undo_group();
+                self.document.begin_undo_group();
+                self.document.delete_range(start, end);
+                let after = self.document.insert(start.line, start.column, &wrapped);
+                self.document.end_undo_group();
                 // Select the inner text (between the pair chars)
                 self.set_selection(Selection {
-                    anchor: Pos::new(start.line, start.col + 1),
-                    cursor: Pos::new(after.line, after.col - 1),
+                    anchor: TextPosition::new(start.line, start.column + 1),
+                    cursor: TextPosition::new(after.line, after.column - 1),
                 });
                 return;
             }
@@ -2054,14 +2124,14 @@ impl Editor {
         }
 
         // Skip over closing char if it's already the next character.
-        // close chars are ASCII so byte_at(line_start + col) == the char at col.
+        // close chars are ASCII so byte_at(line_start + column) == the char at column.
         if is_close_char(c) {
             let line = self.cursor().line;
-            let col = self.cursor().col;
-            let ls = self.doc.buf.line_start(line);
-            let le = self.doc.buf.line_end(line);
-            if ls + col < le && self.doc.buf.byte_at(ls + col) == c as u8 {
-                self.set_cursor(Pos::new(line, col + 1));
+            let column = self.cursor().column;
+            let ls = self.document.buffer.line_start(line);
+            let le = self.document.buffer.line_end(line);
+            if ls + column < le && self.document.buffer.byte_at(ls + column) == c as u8 {
+                self.set_cursor(TextPosition::new(line, column + 1));
                 return;
             }
         }
@@ -2072,12 +2142,12 @@ impl Editor {
         // Auto-close pairs: insert open+close on a stack buffer, no heap alloc.
         if let Some(close) = auto_close_char(c, lang_name) {
             let line = self.cursor().line;
-            let col = self.cursor().col;
-            let ls = self.doc.buf.line_start(line);
-            let le = self.doc.buf.line_end(line);
+            let column = self.cursor().column;
+            let ls = self.document.buffer.line_start(line);
+            let le = self.document.buffer.line_end(line);
             // Treat end-of-line (\n or past end) as a boundary.
-            let next = if ls + col < le {
-                self.doc.buf.byte_at(ls + col)
+            let next = if ls + column < le {
+                self.document.buffer.byte_at(ls + column)
             } else {
                 b'\n'
             };
@@ -2089,44 +2159,44 @@ impl Editor {
                 let mut pair = [0u8; 5];
                 pair[..cb.len()].copy_from_slice(cb);
                 pair[cb.len()] = close as u8;
-                let pos = self.doc.insert(line, col, &pair[..cb.len() + 1]);
+                let pos = self.document.insert(line, column, &pair[..cb.len() + 1]);
                 // Place cursor between the pair
-                self.set_cursor(Pos::new(pos.line, pos.col - 1));
+                self.set_cursor(TextPosition::new(pos.line, pos.column - 1));
                 return;
             }
         }
 
         let pos = self
-            .doc
-            .insert(self.cursor().line, self.cursor().col, s.as_bytes());
+            .document
+            .insert(self.cursor().line, self.cursor().column, s.as_bytes());
         self.set_cursor(pos);
     }
 
     fn insert_tab(&mut self) {
         if self.carets.is_multicursor() {
-            if self.carets.iter().any(|caret| !caret.sel.is_empty()) {
+            if self.carets.iter().any(|caret| !caret.selection.is_empty()) {
                 self.indent_caret_lines();
                 return;
             }
             let bytes: &[u8] = if self.use_tab_indent() { b"\t" } else { b"  " };
             let mut planned = Vec::with_capacity(self.carets.len());
             for caret in self.carets.iter().copied() {
-                let sel = caret.sel;
-                let (start, end) = sel.ordered();
+                let selection = caret.selection;
+                let (start, end) = selection.ordered();
                 let start_offset = self.offset_for_pos(start);
-                let deleted = if sel.is_empty() {
+                let deleted = if selection.is_empty() {
                     Vec::new()
                 } else {
-                    self.doc.text_in_range(start, end)
+                    self.document.text_in_range(start, end)
                 };
                 let end_offset = start_offset + deleted.len();
                 planned.push(PlannedCaretEdit {
-                    start: start_offset,
-                    end: end_offset,
-                    insert: bytes.to_vec(),
-                    deleted,
-                    anchor_after: start_offset + bytes.len(),
-                    cursor_after: start_offset + bytes.len(),
+                    start_byte: start_offset,
+                    end_byte: end_offset,
+                    inserted_bytes: bytes.to_vec(),
+                    deleted_bytes: deleted,
+                    anchor_after_byte: start_offset + bytes.len(),
+                    cursor_after_byte: start_offset + bytes.len(),
                 });
             }
             self.apply_multi_caret_edits(planned);
@@ -2139,36 +2209,36 @@ impl Editor {
         }
         let bytes: &[u8] = if self.use_tab_indent() { b"\t" } else { b"  " };
         let pos = self
-            .doc
-            .insert(self.cursor().line, self.cursor().col, bytes);
+            .document
+            .insert(self.cursor().line, self.cursor().column, bytes);
         self.set_cursor(pos);
     }
 
     fn indent_caret_lines(&mut self) {
         let use_tab = self.use_tab_indent();
         let indent_bytes: &[u8] = if use_tab { b"\t" } else { b"  " };
-        let mut raw_edits = Vec::new();
+        let mut text_edits = Vec::new();
 
         for line in self.targeted_lines_for_carets() {
-            let text = self.doc.buf.line_text(line);
+            let text = self.document.buffer.line_text(line);
             let is_blank = text.iter().all(|&b| b == b' ' || b == b'\t');
             if is_blank {
                 continue;
             }
-            raw_edits.push(RawEdit {
-                start: self.doc.buf.line_start(line),
-                end: self.doc.buf.line_start(line),
-                insert: indent_bytes.to_vec(),
-                deleted: Vec::new(),
+            text_edits.push(TextEdit {
+                start_byte: self.document.buffer.line_start(line),
+                end_byte: self.document.buffer.line_start(line),
+                inserted_bytes: indent_bytes.to_vec(),
+                deleted_bytes: Vec::new(),
             });
         }
 
-        self.apply_raw_edits_preserving_carets(raw_edits);
+        self.apply_text_edits_preserving_carets(text_edits);
     }
 
     fn indent_selection(&mut self) {
         let (s, e) = self.selection().ordered();
-        let end_line = if e.col == 0 && e.line > s.line {
+        let end_line = if e.column == 0 && e.line > s.line {
             e.line - 1
         } else {
             e.line
@@ -2181,11 +2251,16 @@ impl Editor {
 
         // Pre-read line data to avoid O(n²) cache rebuilds
         let lines: Vec<(Vec<u8>, usize)> = (start_line..=end_line)
-            .map(|i| (self.doc.buf.line_text(i), self.doc.buf.line_start(i)))
+            .map(|i| {
+                (
+                    self.document.buffer.line_text(i),
+                    self.document.buffer.line_start(i),
+                )
+            })
             .collect();
 
         let cursor_pos = self.cursor();
-        self.doc.begin_undo_group();
+        self.document.begin_undo_group();
         let anchor_line = self.selection().anchor.line;
         let cursor_line = self.selection().cursor.line;
         let mut anchor_added = 0usize;
@@ -2195,7 +2270,7 @@ impl Editor {
             if is_blank {
                 continue;
             }
-            self.doc
+            self.document
                 .insert_at_byte(*line_offset, indent_bytes, cursor_pos, cursor_pos);
             let line_idx = start_line + idx;
             if line_idx == cursor_line {
@@ -2205,42 +2280,46 @@ impl Editor {
                 anchor_added = indent_char_len;
             }
         }
-        self.doc.end_undo_group();
+        self.document.end_undo_group();
 
         // Preserve the selection so the user can indent multiple times.
-        self.carets.primary_mut().sel.cursor.col += cursor_added;
-        self.carets.primary_mut().sel.anchor.col += anchor_added;
+        self.carets.primary_mut().selection.cursor.column += cursor_added;
+        self.carets.primary_mut().selection.anchor.column += anchor_added;
     }
 
     fn insert_newline(&mut self) {
         if self.carets.is_multicursor() {
             let mut planned = Vec::with_capacity(self.carets.len());
             for caret in self.carets.iter().copied() {
-                let sel = caret.sel;
-                let (start, end) = sel.ordered();
-                let base = if sel.is_empty() { sel.cursor } else { start };
+                let selection = caret.selection;
+                let (start, end) = selection.ordered();
+                let base = if selection.is_empty() {
+                    selection.cursor
+                } else {
+                    start
+                };
                 let start_offset = self.offset_for_pos(start);
-                let deleted = if sel.is_empty() {
+                let deleted = if selection.is_empty() {
                     Vec::new()
                 } else {
-                    self.doc.text_in_range(start, end)
+                    self.document.text_in_range(start, end)
                 };
                 let end_offset = start_offset + deleted.len();
 
-                self.doc
-                    .buf
-                    .line_text_into(base.line, &mut self.line_scratch);
+                self.document
+                    .buffer
+                    .line_text_into(base.line, &mut self.line_text_scratch);
                 let indent: Vec<u8> = self
-                    .line_scratch
+                    .line_text_scratch
                     .iter()
                     .take_while(|&&b| b == b' ' || b == b'\t')
                     .copied()
                     .collect();
 
-                if sel.is_empty() && base.col > 0 {
-                    let ls = self.doc.buf.line_start(base.line);
-                    let le = self.doc.buf.line_end(base.line);
-                    let prev = self.doc.buf.byte_at(ls + base.col - 1);
+                if selection.is_empty() && base.column > 0 {
+                    let ls = self.document.buffer.line_start(base.line);
+                    let le = self.document.buffer.line_end(base.line);
+                    let prev = self.document.buffer.byte_at(ls + base.column - 1);
                     let close_opt = match prev {
                         b'(' => Some(b')'),
                         b'[' => Some(b']'),
@@ -2248,8 +2327,8 @@ impl Editor {
                         _ => None,
                     };
                     if let Some(close) = close_opt
-                        && ls + base.col < le
-                        && self.doc.buf.byte_at(ls + base.col) == close
+                        && ls + base.column < le
+                        && self.document.buffer.byte_at(ls + base.column) == close
                     {
                         let extra: &[u8] = if self.use_tab_indent() { b"\t" } else { b"  " };
                         let mut insert = vec![b'\n'];
@@ -2259,12 +2338,12 @@ impl Editor {
                         insert.push(b'\n');
                         insert.extend_from_slice(&indent);
                         planned.push(PlannedCaretEdit {
-                            start: start_offset,
-                            end: end_offset,
-                            insert,
-                            deleted,
-                            anchor_after: cursor_offset,
-                            cursor_after: cursor_offset,
+                            start_byte: start_offset,
+                            end_byte: end_offset,
+                            inserted_bytes: insert,
+                            deleted_bytes: deleted,
+                            anchor_after_byte: cursor_offset,
+                            cursor_after_byte: cursor_offset,
                         });
                         continue;
                     }
@@ -2274,12 +2353,12 @@ impl Editor {
                 insert.extend_from_slice(&indent);
                 let cursor_offset = start_offset + insert.len();
                 planned.push(PlannedCaretEdit {
-                    start: start_offset,
-                    end: end_offset,
-                    insert,
-                    deleted,
-                    anchor_after: cursor_offset,
-                    cursor_after: cursor_offset,
+                    start_byte: start_offset,
+                    end_byte: end_offset,
+                    inserted_bytes: insert,
+                    deleted_bytes: deleted,
+                    anchor_after_byte: cursor_offset,
+                    cursor_after_byte: cursor_offset,
                 });
             }
             self.apply_multi_caret_edits(planned);
@@ -2290,19 +2369,21 @@ impl Editor {
             self.delete_selection();
         }
         let c = self.cursor();
-        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
+        self.document
+            .buffer
+            .line_text_into(c.line, &mut self.line_text_scratch);
         let indent: Vec<u8> = self
-            .line_scratch
+            .line_text_scratch
             .iter()
             .take_while(|&&b| b == b' ' || b == b'\t')
             .copied()
             .collect();
 
         // Between bracket pairs ({|}, (|), [|]): split with extra indent level.
-        if c.col > 0 {
-            let ls = self.doc.buf.line_start(c.line);
-            let le = self.doc.buf.line_end(c.line);
-            let prev = self.doc.buf.byte_at(ls + c.col - 1);
+        if c.column > 0 {
+            let ls = self.document.buffer.line_start(c.line);
+            let le = self.document.buffer.line_end(c.line);
+            let prev = self.document.buffer.byte_at(ls + c.column - 1);
             let close_opt = match prev {
                 b'(' => Some(b')'),
                 b'[' => Some(b']'),
@@ -2310,8 +2391,8 @@ impl Editor {
                 _ => None,
             };
             if let Some(close) = close_opt
-                && ls + c.col < le
-                && self.doc.buf.byte_at(ls + c.col) == close
+                && ls + c.column < le
+                && self.document.buffer.byte_at(ls + c.column) == close
             {
                 let extra: &[u8] = if self.use_tab_indent() { b"\t" } else { b"  " };
                 let mut split = vec![b'\n'];
@@ -2320,10 +2401,10 @@ impl Editor {
                 let cursor_col = indent.len() + extra.len();
                 split.push(b'\n');
                 split.extend_from_slice(&indent);
-                self.doc.seal_undo();
-                self.doc.insert(c.line, c.col, &split);
-                self.doc.seal_undo();
-                self.set_cursor(Pos::new(c.line + 1, cursor_col));
+                self.document.seal_undo();
+                self.document.insert(c.line, c.column, &split);
+                self.document.seal_undo();
+                self.set_cursor(TextPosition::new(c.line + 1, cursor_col));
                 return;
             }
         }
@@ -2331,11 +2412,11 @@ impl Editor {
         let mut newline = vec![b'\n'];
         newline.extend_from_slice(&indent);
 
-        self.doc.seal_undo();
+        self.document.seal_undo();
         let pos = self
-            .doc
-            .insert(self.cursor().line, self.cursor().col, &newline);
-        self.doc.seal_undo();
+            .document
+            .insert(self.cursor().line, self.cursor().column, &newline);
+        self.document.seal_undo();
         self.set_cursor(pos);
     }
 
@@ -2343,109 +2424,110 @@ impl Editor {
         if self.carets.is_multicursor() {
             let mut planned = Vec::with_capacity(self.carets.len());
             for caret in self.carets.iter().copied() {
-                let sel = caret.sel;
-                if !sel.is_empty() {
-                    let (start, end) = sel.ordered();
+                let selection = caret.selection;
+                if !selection.is_empty() {
+                    let (start, end) = selection.ordered();
                     let start_offset = self.offset_for_pos(start);
-                    let deleted = self.doc.text_in_range(start, end);
+                    let deleted = self.document.text_in_range(start, end);
                     planned.push(PlannedCaretEdit {
-                        start: start_offset,
-                        end: start_offset + deleted.len(),
-                        insert: Vec::new(),
-                        deleted,
-                        anchor_after: start_offset,
-                        cursor_after: start_offset,
+                        start_byte: start_offset,
+                        end_byte: start_offset + deleted.len(),
+                        inserted_bytes: Vec::new(),
+                        deleted_bytes: deleted,
+                        anchor_after_byte: start_offset,
+                        cursor_after_byte: start_offset,
                     });
                     continue;
                 }
 
-                let c = sel.cursor;
-                if c.col > 0 {
-                    let ls = self.doc.buf.line_start(c.line);
-                    let le = self.doc.buf.line_end(c.line);
+                let c = selection.cursor;
+                if c.column > 0 {
+                    let ls = self.document.buffer.line_start(c.line);
+                    let le = self.document.buffer.line_end(c.line);
                     let mut leading_ws = 0;
                     while ls + leading_ws < le {
-                        match self.doc.buf.byte_at(ls + leading_ws) {
+                        match self.document.buffer.byte_at(ls + leading_ws) {
                             b' ' | b'\t' => leading_ws += 1,
                             _ => break,
                         }
                     }
 
-                    if c.col <= leading_ws && c.col >= 2 {
-                        let all_spaces = (0..c.col).all(|i| self.doc.buf.byte_at(ls + i) == b' ');
-                        if all_spaces && c.col.is_multiple_of(2) {
-                            let start = Pos::new(c.line, c.col - 2);
-                            let end = Pos::new(c.line, c.col);
+                    if c.column <= leading_ws && c.column >= 2 {
+                        let all_spaces =
+                            (0..c.column).all(|i| self.document.buffer.byte_at(ls + i) == b' ');
+                        if all_spaces && c.column.is_multiple_of(2) {
+                            let start = TextPosition::new(c.line, c.column - 2);
+                            let end = TextPosition::new(c.line, c.column);
                             let start_offset = self.offset_for_pos(start);
-                            let deleted = self.doc.text_in_range(start, end);
+                            let deleted = self.document.text_in_range(start, end);
                             planned.push(PlannedCaretEdit {
-                                start: start_offset,
-                                end: start_offset + deleted.len(),
-                                insert: Vec::new(),
-                                deleted,
-                                anchor_after: start_offset,
-                                cursor_after: start_offset,
+                                start_byte: start_offset,
+                                end_byte: start_offset + deleted.len(),
+                                inserted_bytes: Vec::new(),
+                                deleted_bytes: deleted,
+                                anchor_after_byte: start_offset,
+                                cursor_after_byte: start_offset,
                             });
                             continue;
                         }
                     }
 
-                    let prev = self.doc.buf.byte_at(ls + c.col - 1);
-                    if ls + c.col < le {
-                        let next = self.doc.buf.byte_at(ls + c.col);
-                        let lang_name = self.doc.detect_language().map(|l| l.name);
+                    let prev = self.document.buffer.byte_at(ls + c.column - 1);
+                    if ls + c.column < le {
+                        let next = self.document.buffer.byte_at(ls + c.column);
+                        let lang_name = self.document.detect_language().map(|l| l.name);
                         if auto_close_char(prev as char, lang_name) == Some(next as char) {
-                            let start = Pos::new(c.line, c.col - 1);
-                            let end = Pos::new(c.line, c.col + 1);
+                            let start = TextPosition::new(c.line, c.column - 1);
+                            let end = TextPosition::new(c.line, c.column + 1);
                             let start_offset = self.offset_for_pos(start);
-                            let deleted = self.doc.text_in_range(start, end);
+                            let deleted = self.document.text_in_range(start, end);
                             planned.push(PlannedCaretEdit {
-                                start: start_offset,
-                                end: start_offset + deleted.len(),
-                                insert: Vec::new(),
-                                deleted,
-                                anchor_after: start_offset,
-                                cursor_after: start_offset,
+                                start_byte: start_offset,
+                                end_byte: start_offset + deleted.len(),
+                                inserted_bytes: Vec::new(),
+                                deleted_bytes: deleted,
+                                anchor_after_byte: start_offset,
+                                cursor_after_byte: start_offset,
                             });
                             continue;
                         }
                     }
 
-                    let start = Pos::new(c.line, c.col - 1);
-                    let end = Pos::new(c.line, c.col);
+                    let start = TextPosition::new(c.line, c.column - 1);
+                    let end = TextPosition::new(c.line, c.column);
                     let start_offset = self.offset_for_pos(start);
-                    let deleted = self.doc.text_in_range(start, end);
+                    let deleted = self.document.text_in_range(start, end);
                     planned.push(PlannedCaretEdit {
-                        start: start_offset,
-                        end: start_offset + deleted.len(),
-                        insert: Vec::new(),
-                        deleted,
-                        anchor_after: start_offset,
-                        cursor_after: start_offset,
+                        start_byte: start_offset,
+                        end_byte: start_offset + deleted.len(),
+                        inserted_bytes: Vec::new(),
+                        deleted_bytes: deleted,
+                        anchor_after_byte: start_offset,
+                        cursor_after_byte: start_offset,
                     });
                 } else if c.line > 0 {
-                    let prev_len = self.doc.buf.line_char_len(c.line - 1);
-                    let start = Pos::new(c.line - 1, prev_len);
-                    let end = Pos::new(c.line, 0);
+                    let prev_len = self.document.buffer.line_character_count(c.line - 1);
+                    let start = TextPosition::new(c.line - 1, prev_len);
+                    let end = TextPosition::new(c.line, 0);
                     let start_offset = self.offset_for_pos(start);
-                    let deleted = self.doc.text_in_range(start, end);
+                    let deleted = self.document.text_in_range(start, end);
                     planned.push(PlannedCaretEdit {
-                        start: start_offset,
-                        end: start_offset + deleted.len(),
-                        insert: Vec::new(),
-                        deleted,
-                        anchor_after: start_offset,
-                        cursor_after: start_offset,
+                        start_byte: start_offset,
+                        end_byte: start_offset + deleted.len(),
+                        inserted_bytes: Vec::new(),
+                        deleted_bytes: deleted,
+                        anchor_after_byte: start_offset,
+                        cursor_after_byte: start_offset,
                     });
                 } else {
                     let offset = self.offset_for_pos(c);
                     planned.push(PlannedCaretEdit {
-                        start: offset,
-                        end: offset,
-                        insert: Vec::new(),
-                        deleted: Vec::new(),
-                        anchor_after: offset,
-                        cursor_after: offset,
+                        start_byte: offset,
+                        end_byte: offset,
+                        inserted_bytes: Vec::new(),
+                        deleted_bytes: Vec::new(),
+                        anchor_after_byte: offset,
+                        cursor_after_byte: offset,
                     });
                 }
             }
@@ -2458,53 +2540,54 @@ impl Editor {
             return;
         }
         let c = self.cursor();
-        if c.col > 0 {
-            let ls = self.doc.buf.line_start(c.line);
-            let le = self.doc.buf.line_end(c.line);
+        if c.column > 0 {
+            let ls = self.document.buffer.line_start(c.line);
+            let le = self.document.buffer.line_end(c.line);
             // Count leading whitespace (ASCII: byte offset == char offset here).
             let mut leading_ws = 0;
             while ls + leading_ws < le {
-                match self.doc.buf.byte_at(ls + leading_ws) {
+                match self.document.buffer.byte_at(ls + leading_ws) {
                     b' ' | b'\t' => leading_ws += 1,
                     _ => break,
                 }
             }
 
             // Smart 2-space dedent
-            if c.col <= leading_ws && c.col >= 2 {
-                let all_spaces = (0..c.col).all(|i| self.doc.buf.byte_at(ls + i) == b' ');
-                if all_spaces && c.col.is_multiple_of(2) {
-                    let end = Pos::new(c.line, c.col);
-                    let start = Pos::new(c.line, c.col - 2);
-                    self.doc.delete_range(start, end);
+            if c.column <= leading_ws && c.column >= 2 {
+                let all_spaces =
+                    (0..c.column).all(|i| self.document.buffer.byte_at(ls + i) == b' ');
+                if all_spaces && c.column.is_multiple_of(2) {
+                    let end = TextPosition::new(c.line, c.column);
+                    let start = TextPosition::new(c.line, c.column - 2);
+                    self.document.delete_range(start, end);
                     self.set_cursor(start);
                     return;
                 }
             }
 
             // Delete matching auto-close pair if cursor is between them.
-            let prev = self.doc.buf.byte_at(ls + c.col - 1);
-            if ls + c.col < le {
-                let next = self.doc.buf.byte_at(ls + c.col);
-                let lang_name = self.doc.detect_language().map(|l| l.name);
+            let prev = self.document.buffer.byte_at(ls + c.column - 1);
+            if ls + c.column < le {
+                let next = self.document.buffer.byte_at(ls + c.column);
+                let lang_name = self.document.detect_language().map(|l| l.name);
                 if auto_close_char(prev as char, lang_name) == Some(next as char) {
-                    let start = Pos::new(c.line, c.col - 1);
-                    let end = Pos::new(c.line, c.col + 1);
-                    self.doc.delete_range(start, end);
+                    let start = TextPosition::new(c.line, c.column - 1);
+                    let end = TextPosition::new(c.line, c.column + 1);
+                    self.document.delete_range(start, end);
                     self.set_cursor(start);
                     return;
                 }
             }
 
-            let start = Pos::new(c.line, c.col - 1);
-            let end = Pos::new(c.line, c.col);
-            self.doc.delete_range(start, end);
+            let start = TextPosition::new(c.line, c.column - 1);
+            let end = TextPosition::new(c.line, c.column);
+            self.document.delete_range(start, end);
             self.set_cursor(start);
         } else if c.line > 0 {
-            let prev_len = self.doc.buf.line_char_len(c.line - 1);
-            let start = Pos::new(c.line - 1, prev_len);
-            let end = Pos::new(c.line, 0);
-            self.doc.delete_range(start, end);
+            let prev_len = self.document.buffer.line_character_count(c.line - 1);
+            let start = TextPosition::new(c.line - 1, prev_len);
+            let end = TextPosition::new(c.line, 0);
+            self.document.delete_range(start, end);
             self.set_cursor(start);
         }
     }
@@ -2513,65 +2596,67 @@ impl Editor {
         if self.carets.is_multicursor() {
             let mut planned = Vec::with_capacity(self.carets.len());
             for caret in self.carets.iter().copied() {
-                let sel = caret.sel;
-                if !sel.is_empty() {
-                    let (start, end) = sel.ordered();
+                let selection = caret.selection;
+                if !selection.is_empty() {
+                    let (start, end) = selection.ordered();
                     let start_offset = self.offset_for_pos(start);
-                    let deleted = self.doc.text_in_range(start, end);
+                    let deleted = self.document.text_in_range(start, end);
                     planned.push(PlannedCaretEdit {
-                        start: start_offset,
-                        end: start_offset + deleted.len(),
-                        insert: Vec::new(),
-                        deleted,
-                        anchor_after: start_offset,
-                        cursor_after: start_offset,
+                        start_byte: start_offset,
+                        end_byte: start_offset + deleted.len(),
+                        inserted_bytes: Vec::new(),
+                        deleted_bytes: deleted,
+                        anchor_after_byte: start_offset,
+                        cursor_after_byte: start_offset,
                     });
                     continue;
                 }
 
-                let c = sel.cursor;
-                if c.col == 0 && c.line == 0 {
+                let c = selection.cursor;
+                if c.column == 0 && c.line == 0 {
                     let offset = self.offset_for_pos(c);
                     planned.push(PlannedCaretEdit {
-                        start: offset,
-                        end: offset,
-                        insert: Vec::new(),
-                        deleted: Vec::new(),
-                        anchor_after: offset,
-                        cursor_after: offset,
+                        start_byte: offset,
+                        end_byte: offset,
+                        inserted_bytes: Vec::new(),
+                        deleted_bytes: Vec::new(),
+                        anchor_after_byte: offset,
+                        cursor_after_byte: offset,
                     });
                     continue;
                 }
-                if c.col == 0 {
-                    let prev_len = self.doc.buf.line_char_len(c.line - 1);
-                    let start = Pos::new(c.line - 1, prev_len);
-                    let end = Pos::new(c.line, 0);
+                if c.column == 0 {
+                    let prev_len = self.document.buffer.line_character_count(c.line - 1);
+                    let start = TextPosition::new(c.line - 1, prev_len);
+                    let end = TextPosition::new(c.line, 0);
                     let start_offset = self.offset_for_pos(start);
-                    let deleted = self.doc.text_in_range(start, end);
+                    let deleted = self.document.text_in_range(start, end);
                     planned.push(PlannedCaretEdit {
-                        start: start_offset,
-                        end: start_offset + deleted.len(),
-                        insert: Vec::new(),
-                        deleted,
-                        anchor_after: start_offset,
-                        cursor_after: start_offset,
+                        start_byte: start_offset,
+                        end_byte: start_offset + deleted.len(),
+                        inserted_bytes: Vec::new(),
+                        deleted_bytes: deleted,
+                        anchor_after_byte: start_offset,
+                        cursor_after_byte: start_offset,
                     });
                     continue;
                 }
 
-                self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
-                let boundary = prev_word_boundary(&self.line_scratch, c.col);
-                let start = Pos::new(c.line, boundary);
-                let end = Pos::new(c.line, c.col);
+                self.document
+                    .buffer
+                    .line_text_into(c.line, &mut self.line_text_scratch);
+                let boundary = prev_word_boundary(&self.line_text_scratch, c.column);
+                let start = TextPosition::new(c.line, boundary);
+                let end = TextPosition::new(c.line, c.column);
                 let start_offset = self.offset_for_pos(start);
-                let deleted = self.doc.text_in_range(start, end);
+                let deleted = self.document.text_in_range(start, end);
                 planned.push(PlannedCaretEdit {
-                    start: start_offset,
-                    end: start_offset + deleted.len(),
-                    insert: Vec::new(),
-                    deleted,
-                    anchor_after: start_offset,
-                    cursor_after: start_offset,
+                    start_byte: start_offset,
+                    end_byte: start_offset + deleted.len(),
+                    inserted_bytes: Vec::new(),
+                    deleted_bytes: deleted,
+                    anchor_after_byte: start_offset,
+                    cursor_after_byte: start_offset,
                 });
             }
             self.apply_multi_caret_edits(planned);
@@ -2583,26 +2668,28 @@ impl Editor {
             return;
         }
         let c = self.cursor();
-        if c.col == 0 && c.line == 0 {
+        if c.column == 0 && c.line == 0 {
             return;
         }
-        if c.col == 0 {
-            let prev_len = self.doc.buf.line_char_len(c.line - 1);
-            let start = Pos::new(c.line - 1, prev_len);
-            let end = Pos::new(c.line, 0);
-            self.doc.seal_undo();
-            self.doc.delete_range(start, end);
-            self.doc.seal_undo();
+        if c.column == 0 {
+            let prev_len = self.document.buffer.line_character_count(c.line - 1);
+            let start = TextPosition::new(c.line - 1, prev_len);
+            let end = TextPosition::new(c.line, 0);
+            self.document.seal_undo();
+            self.document.delete_range(start, end);
+            self.document.seal_undo();
             self.set_cursor(start);
             return;
         }
-        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
-        let boundary = prev_word_boundary(&self.line_scratch, c.col);
-        let start = Pos::new(c.line, boundary);
-        let end = Pos::new(c.line, c.col);
-        self.doc.seal_undo();
-        self.doc.delete_range(start, end);
-        self.doc.seal_undo();
+        self.document
+            .buffer
+            .line_text_into(c.line, &mut self.line_text_scratch);
+        let boundary = prev_word_boundary(&self.line_text_scratch, c.column);
+        let start = TextPosition::new(c.line, boundary);
+        let end = TextPosition::new(c.line, c.column);
+        self.document.seal_undo();
+        self.document.delete_range(start, end);
+        self.document.seal_undo();
         self.set_cursor(start);
     }
 
@@ -2610,59 +2697,59 @@ impl Editor {
         if self.carets.is_multicursor() {
             let mut planned = Vec::with_capacity(self.carets.len());
             for caret in self.carets.iter().copied() {
-                let sel = caret.sel;
-                if !sel.is_empty() {
-                    let (start, end) = sel.ordered();
+                let selection = caret.selection;
+                if !selection.is_empty() {
+                    let (start, end) = selection.ordered();
                     let start_offset = self.offset_for_pos(start);
-                    let deleted = self.doc.text_in_range(start, end);
+                    let deleted = self.document.text_in_range(start, end);
                     planned.push(PlannedCaretEdit {
-                        start: start_offset,
-                        end: start_offset + deleted.len(),
-                        insert: Vec::new(),
-                        deleted,
-                        anchor_after: start_offset,
-                        cursor_after: start_offset,
+                        start_byte: start_offset,
+                        end_byte: start_offset + deleted.len(),
+                        inserted_bytes: Vec::new(),
+                        deleted_bytes: deleted,
+                        anchor_after_byte: start_offset,
+                        cursor_after_byte: start_offset,
                     });
                     continue;
                 }
 
-                let c = sel.cursor;
-                let line_len = self.doc.buf.line_char_len(c.line);
-                if c.col < line_len {
-                    let start = Pos::new(c.line, c.col);
-                    let end = Pos::new(c.line, c.col + 1);
+                let c = selection.cursor;
+                let line_len = self.document.buffer.line_character_count(c.line);
+                if c.column < line_len {
+                    let start = TextPosition::new(c.line, c.column);
+                    let end = TextPosition::new(c.line, c.column + 1);
                     let start_offset = self.offset_for_pos(start);
-                    let deleted = self.doc.text_in_range(start, end);
+                    let deleted = self.document.text_in_range(start, end);
                     planned.push(PlannedCaretEdit {
-                        start: start_offset,
-                        end: start_offset + deleted.len(),
-                        insert: Vec::new(),
-                        deleted,
-                        anchor_after: start_offset,
-                        cursor_after: start_offset,
+                        start_byte: start_offset,
+                        end_byte: start_offset + deleted.len(),
+                        inserted_bytes: Vec::new(),
+                        deleted_bytes: deleted,
+                        anchor_after_byte: start_offset,
+                        cursor_after_byte: start_offset,
                     });
-                } else if c.line + 1 < self.doc.buf.line_count() {
-                    let start = Pos::new(c.line, c.col);
-                    let end = Pos::new(c.line + 1, 0);
+                } else if c.line + 1 < self.document.buffer.line_count() {
+                    let start = TextPosition::new(c.line, c.column);
+                    let end = TextPosition::new(c.line + 1, 0);
                     let start_offset = self.offset_for_pos(start);
-                    let deleted = self.doc.text_in_range(start, end);
+                    let deleted = self.document.text_in_range(start, end);
                     planned.push(PlannedCaretEdit {
-                        start: start_offset,
-                        end: start_offset + deleted.len(),
-                        insert: Vec::new(),
-                        deleted,
-                        anchor_after: start_offset,
-                        cursor_after: start_offset,
+                        start_byte: start_offset,
+                        end_byte: start_offset + deleted.len(),
+                        inserted_bytes: Vec::new(),
+                        deleted_bytes: deleted,
+                        anchor_after_byte: start_offset,
+                        cursor_after_byte: start_offset,
                     });
                 } else {
                     let offset = self.offset_for_pos(c);
                     planned.push(PlannedCaretEdit {
-                        start: offset,
-                        end: offset,
-                        insert: Vec::new(),
-                        deleted: Vec::new(),
-                        anchor_after: offset,
-                        cursor_after: offset,
+                        start_byte: offset,
+                        end_byte: offset,
+                        inserted_bytes: Vec::new(),
+                        deleted_bytes: Vec::new(),
+                        anchor_after_byte: offset,
+                        cursor_after_byte: offset,
                     });
                 }
             }
@@ -2675,26 +2762,33 @@ impl Editor {
             return;
         }
         let c = self.cursor();
-        let line_len = self.doc.buf.line_char_len(c.line);
-        if c.col < line_len {
-            self.doc
-                .delete_range(Pos::new(c.line, c.col), Pos::new(c.line, c.col + 1));
-        } else if c.line + 1 < self.doc.buf.line_count() {
-            self.doc
-                .delete_range(Pos::new(c.line, c.col), Pos::new(c.line + 1, 0));
+        let line_len = self.document.buffer.line_character_count(c.line);
+        if c.column < line_len {
+            self.document.delete_range(
+                TextPosition::new(c.line, c.column),
+                TextPosition::new(c.line, c.column + 1),
+            );
+        } else if c.line + 1 < self.document.buffer.line_count() {
+            self.document.delete_range(
+                TextPosition::new(c.line, c.column),
+                TextPosition::new(c.line + 1, 0),
+            );
         }
     }
 
     fn duplicate_line(&mut self) {
         let c = self.cursor();
-        self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
+        self.document
+            .buffer
+            .line_text_into(c.line, &mut self.line_text_scratch);
         let mut new_content = vec![b'\n'];
-        new_content.extend_from_slice(&self.line_scratch);
-        let line_char_len = self.doc.buf.line_char_len(c.line);
-        self.doc.seal_undo();
-        self.doc.insert(c.line, line_char_len, &new_content);
-        self.doc.seal_undo();
-        self.set_cursor(Pos::new(c.line + 1, c.col));
+        new_content.extend_from_slice(&self.line_text_scratch);
+        let line_character_count = self.document.buffer.line_character_count(c.line);
+        self.document.seal_undo();
+        self.document
+            .insert(c.line, line_character_count, &new_content);
+        self.document.seal_undo();
+        self.set_cursor(TextPosition::new(c.line + 1, c.column));
     }
 
     // -- commenting ---------------------------------------------------------
@@ -2709,7 +2803,7 @@ impl Editor {
 
     /// `force`: None = toggle, Some(true) = comment, Some(false) = uncomment.
     fn comment_impl(&mut self, force: Option<bool>) {
-        let comment = match self.doc.detect_language() {
+        let comment = match self.document.detect_language() {
             Some(lang) => lang.comment,
             None => {
                 self.set_status("No language detected for commenting".to_string());
@@ -2722,7 +2816,12 @@ impl Editor {
             let targeted_lines = self.targeted_lines_for_carets();
             let lines: Vec<(Vec<u8>, usize)> = targeted_lines
                 .iter()
-                .map(|&line| (self.doc.buf.line_text(line), self.doc.buf.line_start(line)))
+                .map(|&line| {
+                    (
+                        self.document.buffer.line_text(line),
+                        self.document.buffer.line_start(line),
+                    )
+                })
                 .collect();
 
             let all_commented = lines.iter().all(|(text, _)| {
@@ -2739,7 +2838,7 @@ impl Editor {
                 None => all_commented,
             };
 
-            let mut raw_edits = Vec::new();
+            let mut text_edits = Vec::new();
             if do_uncomment {
                 for (text, line_offset) in &lines {
                     let indent_pos = text
@@ -2747,11 +2846,11 @@ impl Editor {
                         .position(|&b| b != b' ' && b != b'\t')
                         .unwrap_or(text.len());
                     if text[indent_pos..].starts_with(prefix.as_bytes()) {
-                        raw_edits.push(RawEdit {
-                            start: line_offset + indent_pos,
-                            end: line_offset + indent_pos + prefix.len(),
-                            insert: Vec::new(),
-                            deleted: prefix.as_bytes().to_vec(),
+                        text_edits.push(TextEdit {
+                            start_byte: line_offset + indent_pos,
+                            end_byte: line_offset + indent_pos + prefix.len(),
+                            inserted_bytes: Vec::new(),
+                            deleted_bytes: prefix.as_bytes().to_vec(),
                         });
                     }
                 }
@@ -2773,16 +2872,16 @@ impl Editor {
                     if text[indent_pos..].starts_with(prefix.as_bytes()) {
                         continue;
                     }
-                    raw_edits.push(RawEdit {
-                        start: line_offset + min_indent,
-                        end: line_offset + min_indent,
-                        insert: prefix.as_bytes().to_vec(),
-                        deleted: Vec::new(),
+                    text_edits.push(TextEdit {
+                        start_byte: line_offset + min_indent,
+                        end_byte: line_offset + min_indent,
+                        inserted_bytes: prefix.as_bytes().to_vec(),
+                        deleted_bytes: Vec::new(),
                     });
                 }
             }
 
-            self.apply_raw_edits_preserving_carets(raw_edits);
+            self.apply_text_edits_preserving_carets(text_edits);
             return;
         }
 
@@ -2791,7 +2890,7 @@ impl Editor {
             (self.cursor().line, self.cursor().line)
         } else {
             let (s, e) = self.selection().ordered();
-            let end = if e.col == 0 && e.line > s.line {
+            let end = if e.column == 0 && e.line > s.line {
                 e.line - 1
             } else {
                 e.line
@@ -2807,8 +2906,8 @@ impl Editor {
         // the cache exactly once.
         let lines: Vec<(Vec<u8>, usize)> = (start_line..=end_line)
             .map(|i| {
-                let text = self.doc.buf.line_text(i);
-                let offset = self.doc.buf.line_start(i);
+                let text = self.document.buffer.line_text(i);
+                let offset = self.document.buffer.line_start(i);
                 (text, offset)
             })
             .collect();
@@ -2829,7 +2928,7 @@ impl Editor {
         };
 
         let cursor_pos = self.cursor();
-        self.doc.begin_undo_group();
+        self.document.begin_undo_group();
         if do_uncomment {
             // Uncomment: remove first occurrence of "comment " from each line
             for (text, line_offset) in lines.iter().rev() {
@@ -2838,7 +2937,7 @@ impl Editor {
                     .position(|&b| b != b' ' && b != b'\t')
                     .unwrap_or(text.len());
                 if text[indent_pos..].starts_with(prefix.as_bytes()) {
-                    self.doc.delete_at_byte(
+                    self.document.delete_at_byte(
                         line_offset + indent_pos,
                         prefix.len(),
                         cursor_pos,
@@ -2866,7 +2965,7 @@ impl Editor {
                 if text[indent_pos..].starts_with(prefix.as_bytes()) {
                     continue;
                 }
-                self.doc.insert_at_byte(
+                self.document.insert_at_byte(
                     line_offset + min_indent,
                     prefix.as_bytes(),
                     cursor_pos,
@@ -2874,41 +2973,41 @@ impl Editor {
                 );
             }
         }
-        self.doc.end_undo_group();
+        self.document.end_undo_group();
     }
 
     // -- dedent -------------------------------------------------------------
 
     fn dedent(&mut self) {
         if self.carets.is_multicursor() {
-            let mut raw_edits = Vec::new();
+            let mut text_edits = Vec::new();
             for line in self.targeted_lines_for_carets() {
-                let text = self.doc.buf.line_text(line);
-                let line_offset = self.doc.buf.line_start(line);
+                let text = self.document.buffer.line_text(line);
+                let line_offset = self.document.buffer.line_start(line);
                 if text.starts_with(b"\t") {
-                    raw_edits.push(RawEdit {
-                        start: line_offset,
-                        end: line_offset + 1,
-                        insert: Vec::new(),
-                        deleted: vec![b'\t'],
+                    text_edits.push(TextEdit {
+                        start_byte: line_offset,
+                        end_byte: line_offset + 1,
+                        inserted_bytes: Vec::new(),
+                        deleted_bytes: vec![b'\t'],
                     });
                 } else if text.starts_with(b"  ") {
-                    raw_edits.push(RawEdit {
-                        start: line_offset,
-                        end: line_offset + 2,
-                        insert: Vec::new(),
-                        deleted: b"  ".to_vec(),
+                    text_edits.push(TextEdit {
+                        start_byte: line_offset,
+                        end_byte: line_offset + 2,
+                        inserted_bytes: Vec::new(),
+                        deleted_bytes: b"  ".to_vec(),
                     });
                 }
             }
-            self.apply_raw_edits_preserving_carets(raw_edits);
+            self.apply_text_edits_preserving_carets(text_edits);
             return;
         }
         let (start_line, end_line) = if !self.has_selection() {
             (self.cursor().line, self.cursor().line)
         } else {
             let (s, e) = self.selection().ordered();
-            let end = if e.col == 0 && e.line > s.line {
+            let end = if e.column == 0 && e.line > s.line {
                 e.line - 1
             } else {
                 e.line
@@ -2918,22 +3017,27 @@ impl Editor {
 
         // Pre-read line data to avoid O(n²) cache rebuilds
         let lines: Vec<(Vec<u8>, usize)> = (start_line..=end_line)
-            .map(|i| (self.doc.buf.line_text(i), self.doc.buf.line_start(i)))
+            .map(|i| {
+                (
+                    self.document.buffer.line_text(i),
+                    self.document.buffer.line_start(i),
+                )
+            })
             .collect();
 
         let cursor_pos = self.cursor();
-        self.doc.begin_undo_group();
+        self.document.begin_undo_group();
         let anchor_line = self.selection().anchor.line;
         let cursor_line = self.selection().cursor.line;
         let mut anchor_removed = 0usize;
         let mut cursor_removed = 0usize;
         for (idx, (text, line_offset)) in lines.iter().enumerate().rev() {
             let removed = if text.starts_with(b"\t") {
-                self.doc
+                self.document
                     .delete_at_byte(*line_offset, 1, cursor_pos, cursor_pos);
                 1
             } else if text.starts_with(b"  ") {
-                self.doc
+                self.document
                     .delete_at_byte(*line_offset, 2, cursor_pos, cursor_pos);
                 2
             } else {
@@ -2947,12 +3051,16 @@ impl Editor {
                 anchor_removed = removed;
             }
         }
-        self.doc.end_undo_group();
+        self.document.end_undo_group();
 
         // Preserve the selection so the user can dedent multiple times.
-        self.carets.primary_mut().sel.cursor.col = self.cursor().col.saturating_sub(cursor_removed);
-        self.carets.primary_mut().sel.anchor.col =
-            self.selection().anchor.col.saturating_sub(anchor_removed);
+        self.carets.primary_mut().selection.cursor.column =
+            self.cursor().column.saturating_sub(cursor_removed);
+        self.carets.primary_mut().selection.anchor.column = self
+            .selection()
+            .anchor
+            .column
+            .saturating_sub(anchor_removed);
     }
 
     // -- clipboard ----------------------------------------------------------
@@ -2963,11 +3071,11 @@ impl Editor {
                 .carets
                 .iter()
                 .filter_map(|caret| {
-                    if caret.sel.is_empty() {
+                    if caret.selection.is_empty() {
                         return None;
                     }
-                    let (start, end) = caret.sel.ordered();
-                    let text = self.doc.text_in_range(start, end);
+                    let (start, end) = caret.selection.ordered();
+                    let text = self.document.text_in_range(start, end);
                     Some(String::from_utf8_lossy(&text).to_string())
                 })
                 .collect();
@@ -2986,7 +3094,7 @@ impl Editor {
             return;
         }
         let (start, end) = self.selection().ordered();
-        let text = self.doc.text_in_range(start, end);
+        let text = self.document.text_in_range(start, end);
         let s = String::from_utf8_lossy(&text).to_string();
         self.clipboard.copy(&s);
     }
@@ -2997,11 +3105,11 @@ impl Editor {
                 .carets
                 .iter()
                 .filter_map(|caret| {
-                    if caret.sel.is_empty() {
+                    if caret.selection.is_empty() {
                         return None;
                     }
-                    let (start, end) = caret.sel.ordered();
-                    let text = self.doc.text_in_range(start, end);
+                    let (start, end) = caret.selection.ordered();
+                    let text = self.document.text_in_range(start, end);
                     Some(String::from_utf8_lossy(&text).to_string())
                 })
                 .collect();
@@ -3015,21 +3123,21 @@ impl Editor {
             }
             let mut planned = Vec::with_capacity(self.carets.len());
             for caret in self.carets.iter().copied() {
-                let sel = caret.sel;
-                let (start, end) = sel.ordered();
+                let selection = caret.selection;
+                let (start, end) = selection.ordered();
                 let start_offset = self.offset_for_pos(start);
-                let deleted = if sel.is_empty() {
+                let deleted = if selection.is_empty() {
                     Vec::new()
                 } else {
-                    self.doc.text_in_range(start, end)
+                    self.document.text_in_range(start, end)
                 };
                 planned.push(PlannedCaretEdit {
-                    start: start_offset,
-                    end: start_offset + deleted.len(),
-                    insert: Vec::new(),
-                    deleted,
-                    anchor_after: start_offset,
-                    cursor_after: start_offset,
+                    start_byte: start_offset,
+                    end_byte: start_offset + deleted.len(),
+                    inserted_bytes: Vec::new(),
+                    deleted_bytes: deleted,
+                    anchor_after_byte: start_offset,
+                    cursor_after_byte: start_offset,
                 });
             }
             self.apply_multi_caret_edits(planned);
@@ -3056,29 +3164,36 @@ impl Editor {
                     .as_ref()
                     .map(|fragments| fragments[idx].as_str())
                     .unwrap_or(contents.text.as_str());
-                let sel = caret.sel;
-                let (start, end) = sel.ordered();
-                let mut insert_pos = if sel.is_empty() { sel.cursor } else { start };
+                let selection = caret.selection;
+                let (start, end) = selection.ordered();
+                let mut insert_pos = if selection.is_empty() {
+                    selection.cursor
+                } else {
+                    start
+                };
                 let mut start_offset = self.offset_for_pos(start);
-                let mut deleted = if sel.is_empty() {
+                let mut deleted = if selection.is_empty() {
                     Vec::new()
                 } else {
-                    self.doc.text_in_range(start, end)
+                    self.document.text_in_range(start, end)
                 };
 
-                if sel.is_empty() && text.contains('\n') {
-                    self.doc
-                        .buf
-                        .line_text_into(insert_pos.line, &mut self.line_scratch);
-                    let is_blank = self.line_scratch.iter().all(|&b| b == b' ' || b == b'\t');
+                if selection.is_empty() && text.contains('\n') {
+                    self.document
+                        .buffer
+                        .line_text_into(insert_pos.line, &mut self.line_text_scratch);
+                    let is_blank = self
+                        .line_text_scratch
+                        .iter()
+                        .all(|&b| b == b' ' || b == b'\t');
                     if is_blank {
-                        let char_len = crate::buffer::char_count(&self.line_scratch);
+                        let char_len = crate::buffer::character_count(&self.line_text_scratch);
                         if char_len > 0 {
-                            deleted = self.doc.text_in_range(
-                                Pos::new(insert_pos.line, 0),
-                                Pos::new(insert_pos.line, char_len),
+                            deleted = self.document.text_in_range(
+                                TextPosition::new(insert_pos.line, 0),
+                                TextPosition::new(insert_pos.line, char_len),
                             );
-                            insert_pos = Pos::new(insert_pos.line, 0);
+                            insert_pos = TextPosition::new(insert_pos.line, 0);
                             start_offset = self.offset_for_pos(insert_pos);
                         }
                     }
@@ -3087,12 +3202,12 @@ impl Editor {
                 let insert_text = self.reindent_paste_for_cursor(text, insert_pos);
                 let insert_len = insert_text.len();
                 planned.push(PlannedCaretEdit {
-                    start: start_offset,
-                    end: start_offset + deleted.len(),
-                    insert: insert_text.into_bytes(),
-                    deleted,
-                    anchor_after: start_offset + insert_len,
-                    cursor_after: start_offset + insert_len,
+                    start_byte: start_offset,
+                    end_byte: start_offset + deleted.len(),
+                    inserted_bytes: insert_text.into_bytes(),
+                    deleted_bytes: deleted,
+                    anchor_after_byte: start_offset + insert_len,
+                    cursor_after_byte: start_offset + insert_len,
                 });
             }
             self.apply_multi_caret_edits(planned);
@@ -3110,27 +3225,34 @@ impl Editor {
             self.delete_selection();
         }
         // Multi-line paste: clear any auto-indent on a blank line and anchor at
-        // col 0 so the pasted text's own indentation is used as-is.
+        // column 0 so the pasted text's own indentation is used as-is.
         // Indentation is a copy-time property, not a paste-time one.
         if text.contains('\n') {
             let c = self.cursor();
-            self.doc.buf.line_text_into(c.line, &mut self.line_scratch);
-            let is_blank = self.line_scratch.iter().all(|&b| b == b' ' || b == b'\t');
+            self.document
+                .buffer
+                .line_text_into(c.line, &mut self.line_text_scratch);
+            let is_blank = self
+                .line_text_scratch
+                .iter()
+                .all(|&b| b == b' ' || b == b'\t');
             if is_blank {
-                let char_len = crate::buffer::char_count(&self.line_scratch);
+                let char_len = crate::buffer::character_count(&self.line_text_scratch);
                 if char_len > 0 {
-                    self.doc
-                        .delete_range(Pos::new(c.line, 0), Pos::new(c.line, char_len));
+                    self.document.delete_range(
+                        TextPosition::new(c.line, 0),
+                        TextPosition::new(c.line, char_len),
+                    );
                 }
-                self.set_cursor(Pos::new(c.line, 0));
+                self.set_cursor(TextPosition::new(c.line, 0));
             }
         }
         let text = self.reindent_paste(text);
-        self.doc.seal_undo();
+        self.document.seal_undo();
         let pos = self
-            .doc
-            .insert(self.cursor().line, self.cursor().col, text.as_bytes());
-        self.doc.seal_undo();
+            .document
+            .insert(self.cursor().line, self.cursor().column, text.as_bytes());
+        self.document.seal_undo();
         self.set_cursor(pos);
     }
 
@@ -3140,31 +3262,31 @@ impl Editor {
     /// each line's new indent = cursor_col + original_indent_of_that_line.
     ///
     /// For multi-line paste on a blank line, `paste_text` already resets the cursor
-    /// to col 0, so this function is effectively a no-op in that case.
+    /// to column 0, so this function is effectively a no-op in that case.
     fn reindent_paste(&mut self, text: &str) -> String {
         self.reindent_paste_for_cursor(text, self.cursor())
     }
 
-    fn reindent_paste_for_cursor(&mut self, text: &str, cursor: Pos) -> String {
+    fn reindent_paste_for_cursor(&mut self, text: &str, cursor: TextPosition) -> String {
         let lines: Vec<&str> = text.split('\n').collect();
         if lines.len() < 2 {
             return text.to_string();
         }
 
         // Get the indent of the current line at cursor
-        self.doc
-            .buf
-            .line_text_into(cursor.line, &mut self.line_scratch);
+        self.document
+            .buffer
+            .line_text_into(cursor.line, &mut self.line_text_scratch);
         let cur_indent: usize = self
-            .line_scratch
+            .line_text_scratch
             .iter()
             .take_while(|&&b| b == b' ' || b == b'\t')
             .count();
 
-        // If lines[0] has content it lands at cursor.col; otherwise the pasted
+        // If lines[0] has content it lands at cursor.column; otherwise the pasted
         // block starts on a new line relative to the current line's indent.
         let target_base = if !lines[0].trim().is_empty() {
-            cursor.col
+            cursor.column
         } else {
             cur_indent
         };
@@ -3181,7 +3303,7 @@ impl Editor {
             if line.trim().is_empty() {
                 result.push_str(line);
             } else {
-                // Preserve relative indentation: new position = cursor col + original indent.
+                // Preserve relative indentation: new position = cursor column + original indent.
                 let ik = line.len() - line.trim_start().len();
                 let new_indent = target_base + ik;
                 for _ in 0..new_indent {
@@ -3196,13 +3318,13 @@ impl Editor {
     // -- undo/redo ----------------------------------------------------------
 
     fn undo(&mut self) {
-        if let Some(carets) = self.doc.undo() {
+        if let Some(carets) = self.document.undo() {
             self.restore_carets(carets);
         }
     }
 
     fn redo(&mut self) {
-        if let Some(carets) = self.doc.redo() {
+        if let Some(carets) = self.document.redo() {
             self.restore_carets(carets);
         }
     }
@@ -3210,151 +3332,159 @@ impl Editor {
     // -- file I/O -----------------------------------------------------------
 
     fn strip_trailing_whitespace(&mut self) {
-        let line_count = self.doc.buf.line_count();
-        self.doc.seal_undo();
+        let line_count = self.document.buffer.line_count();
+        self.document.seal_undo();
         for line_idx in (0..line_count).rev() {
-            self.doc
-                .buf
-                .line_text_into(line_idx, &mut self.line_scratch);
+            self.document
+                .buffer
+                .line_text_into(line_idx, &mut self.line_text_scratch);
             let trimmed_len = self
-                .line_scratch
+                .line_text_scratch
                 .iter()
                 .rposition(|&b| b != b' ' && b != b'\t')
                 .map(|i| i + 1)
                 .unwrap_or(0);
-            let char_len = crate::buffer::char_count(&self.line_scratch);
-            let trim_char_len = crate::buffer::char_count(&self.line_scratch[..trimmed_len]);
+            let char_len = crate::buffer::character_count(&self.line_text_scratch);
+            let trim_char_len =
+                crate::buffer::character_count(&self.line_text_scratch[..trimmed_len]);
             if trim_char_len < char_len {
-                self.doc.delete_range(
-                    Pos::new(line_idx, trim_char_len),
-                    Pos::new(line_idx, char_len),
+                self.document.delete_range(
+                    TextPosition::new(line_idx, trim_char_len),
+                    TextPosition::new(line_idx, char_len),
                 );
             }
         }
-        self.doc.seal_undo();
+        self.document.seal_undo();
         // Adjust cursor if past end of line
         let c = self.cursor();
-        let line_len = self.doc.buf.line_char_len(c.line);
-        if c.col > line_len {
-            self.set_cursor(Pos::new(c.line, line_len));
+        let line_len = self.document.buffer.line_character_count(c.line);
+        if c.column > line_len {
+            self.set_cursor(TextPosition::new(c.line, line_len));
         }
     }
 
     fn tabs_to_spaces(&mut self) {
-        let line_count = self.doc.buf.line_count();
-        self.doc.seal_undo();
+        let line_count = self.document.buffer.line_count();
+        self.document.seal_undo();
         for line_idx in 0..line_count {
-            self.doc
-                .buf
-                .line_text_into(line_idx, &mut self.line_scratch);
-            if !self.line_scratch.contains(&b'\t') {
+            self.document
+                .buffer
+                .line_text_into(line_idx, &mut self.line_text_scratch);
+            if !self.line_text_scratch.contains(&b'\t') {
                 continue;
             }
-            let mut new_text = Vec::with_capacity(self.line_scratch.len() * 2);
-            for &b in &self.line_scratch {
+            let mut new_text = Vec::with_capacity(self.line_text_scratch.len() * 2);
+            for &b in &self.line_text_scratch {
                 if b == b'\t' {
                     new_text.extend_from_slice(b"  ");
                 } else {
                     new_text.push(b);
                 }
             }
-            let char_len = crate::buffer::char_count(&self.line_scratch);
-            self.doc
-                .delete_range(Pos::new(line_idx, 0), Pos::new(line_idx, char_len));
-            self.doc.insert(line_idx, 0, &new_text);
+            let char_len = crate::buffer::character_count(&self.line_text_scratch);
+            self.document.delete_range(
+                TextPosition::new(line_idx, 0),
+                TextPosition::new(line_idx, char_len),
+            );
+            self.document.insert(line_idx, 0, &new_text);
         }
-        self.doc.seal_undo();
+        self.document.seal_undo();
         let c = self.cursor();
-        let line_len = self.doc.buf.line_char_len(c.line);
-        if c.col > line_len {
-            self.set_cursor(Pos::new(c.line, line_len));
+        let line_len = self.document.buffer.line_character_count(c.line);
+        if c.column > line_len {
+            self.set_cursor(TextPosition::new(c.line, line_len));
         }
         self.set_status("Converted tabs to spaces".to_string());
     }
 
     fn spaces_to_tabs(&mut self) {
-        let line_count = self.doc.buf.line_count();
-        self.doc.seal_undo();
+        let line_count = self.document.buffer.line_count();
+        self.document.seal_undo();
         for line_idx in 0..line_count {
-            self.doc
-                .buf
-                .line_text_into(line_idx, &mut self.line_scratch);
+            self.document
+                .buffer
+                .line_text_into(line_idx, &mut self.line_text_scratch);
             // Only convert leading whitespace (indentation)
-            let mut new_text = Vec::with_capacity(self.line_scratch.len());
+            let mut new_text = Vec::with_capacity(self.line_text_scratch.len());
             let mut i = 0;
-            while i < self.line_scratch.len() {
-                if self.line_scratch[i] == b'\t' {
+            while i < self.line_text_scratch.len() {
+                if self.line_text_scratch[i] == b'\t' {
                     new_text.push(b'\t');
                     i += 1;
-                } else if i + 1 < self.line_scratch.len()
-                    && self.line_scratch[i] == b' '
-                    && self.line_scratch[i + 1] == b' '
+                } else if i + 1 < self.line_text_scratch.len()
+                    && self.line_text_scratch[i] == b' '
+                    && self.line_text_scratch[i + 1] == b' '
                 {
                     new_text.push(b'\t');
                     i += 2;
                 } else {
                     // End of leading whitespace (or lone space): copy rest verbatim
-                    new_text.extend_from_slice(&self.line_scratch[i..]);
+                    new_text.extend_from_slice(&self.line_text_scratch[i..]);
                     break;
                 }
             }
-            if new_text[..] == self.line_scratch[..] {
+            if new_text[..] == self.line_text_scratch[..] {
                 continue;
             }
-            let char_len = crate::buffer::char_count(&self.line_scratch);
-            self.doc
-                .delete_range(Pos::new(line_idx, 0), Pos::new(line_idx, char_len));
-            self.doc.insert(line_idx, 0, &new_text);
+            let char_len = crate::buffer::character_count(&self.line_text_scratch);
+            self.document.delete_range(
+                TextPosition::new(line_idx, 0),
+                TextPosition::new(line_idx, char_len),
+            );
+            self.document.insert(line_idx, 0, &new_text);
         }
-        self.doc.seal_undo();
+        self.document.seal_undo();
         let c = self.cursor();
-        let line_len = self.doc.buf.line_char_len(c.line);
-        if c.col > line_len {
-            self.set_cursor(Pos::new(c.line, line_len));
+        let line_len = self.document.buffer.line_character_count(c.line);
+        if c.column > line_len {
+            self.set_cursor(TextPosition::new(c.line, line_len));
         }
         self.set_status("Converted spaces to tabs".to_string());
     }
 
     fn check_external_modification(&mut self) {
-        if self.reload_pending || self.cmd_buf.active || self.quit_pending {
+        if self.reload_pending || self.command_buffer.active || self.quit_pending {
             return;
         }
-        let Some(ref name) = self.doc.filename else {
+        let Some(ref name) = self.document.file_path else {
             return;
         };
         let path = std::path::Path::new(name);
-        let disk_mtime = crate::file_io::file_mtime(path);
-        if disk_mtime != self.file_mtime && disk_mtime.is_some() {
+        let disk_mtime = crate::file_io::file_modification_time(path);
+        if disk_mtime != self.file_modification_time && disk_mtime.is_some() {
             let short = path
                 .file_name()
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_else(|| name.clone());
-            self.status_msg = format!("{} changed on disk. Reload? (y/n)", short);
+            self.status_message = format!("{} changed on disk. Reload? (y/n)", short);
             self.status_time = None;
             self.reload_pending = true;
         }
     }
 
     fn reload_file(&mut self) {
-        let Some(name) = self.doc.filename.clone() else {
+        let Some(name) = self.document.file_path.clone() else {
             return;
         };
         let read_result = crate::file_io::read_file(std::path::Path::new(&name));
         match read_result {
             Ok(data) => {
                 let path = std::path::Path::new(&name);
-                self.file_mtime = crate::file_io::file_mtime(path);
-                self.doc = Document::new(data, Some(name));
+                self.file_modification_time = crate::file_io::file_modification_time(path);
+                self.document = Document::new(data, Some(name));
                 // Clamp cursor to valid position in new buffer
-                let lc = self.doc.buf.line_count();
+                let lc = self.document.buffer.line_count();
                 if self.cursor().line >= lc {
                     let last = lc.saturating_sub(1);
-                    self.set_cursor(Pos::new(last, self.doc.buf.line_char_len(last)));
+                    self.set_cursor(TextPosition::new(
+                        last,
+                        self.document.buffer.line_character_count(last),
+                    ));
                 } else {
                     let cursor = self.cursor();
-                    let len = self.doc.buf.line_char_len(cursor.line);
-                    if cursor.col > len {
-                        self.set_cursor(Pos::new(cursor.line, len));
+                    let len = self.document.buffer.line_character_count(cursor.line);
+                    if cursor.column > len {
+                        self.set_cursor(TextPosition::new(cursor.line, len));
                     }
                 }
                 self.set_desired_col(None);
@@ -3368,16 +3498,17 @@ impl Editor {
     }
 
     fn dismiss_reload(&mut self) {
-        if let Some(ref name) = self.doc.filename {
-            self.file_mtime = crate::file_io::file_mtime(std::path::Path::new(name));
+        if let Some(ref name) = self.document.file_path {
+            self.file_modification_time =
+                crate::file_io::file_modification_time(std::path::Path::new(name));
         }
         self.reload_pending = false;
-        self.status_msg.clear();
+        self.status_message.clear();
         self.status_time = None;
     }
 
     fn save_file(&mut self) {
-        if let Some(path) = self.doc.filename.clone() {
+        if let Some(path) = self.document.file_path.clone() {
             let path_ref = std::path::Path::new(&path);
 
             // mkdir -p for parent directory
@@ -3398,12 +3529,12 @@ impl Editor {
                 }
             }
 
-            match crate::file_io::write_file(path_ref, &self.doc.buf.contents()) {
+            match crate::file_io::write_file(path_ref, &self.document.buffer.contents()) {
                 Ok(()) => {
-                    self.doc.dirty = false;
-                    self.doc.seal_undo();
-                    self.file_mtime = crate::file_io::file_mtime(path_ref);
-                    crate::file_io::save_undo_history(path_ref, &self.doc.undo_stack);
+                    self.document.is_dirty = false;
+                    self.document.seal_undo();
+                    self.file_modification_time = crate::file_io::file_modification_time(path_ref);
+                    crate::file_io::save_undo_history(path_ref, &self.document.undo_stack);
                     self.set_status(format!("Saved {}", path));
                 }
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
@@ -3415,7 +3546,7 @@ impl Editor {
             }
         } else {
             // Prompt for filename
-            self.cmd_buf
+            self.command_buffer
                 .open(CommandBufferMode::Prompt, "Save as: ", "");
         }
     }
@@ -3423,14 +3554,15 @@ impl Editor {
     fn start_sudo_save(&mut self) {
         let pid = std::process::id();
         let tmp = format!("/tmp/e_sudo_{}", pid);
-        let contents = self.doc.buf.contents();
+        let contents = self.document.buffer.contents();
         let cleaned = crate::file_io::clean_for_write(&contents);
         match std::fs::write(&tmp, &cleaned) {
             Ok(()) => {
                 self.sudo_save_tmp = Some(tmp);
-                let path = self.doc.filename.as_deref().unwrap_or("?");
+                let path = self.document.file_path.as_deref().unwrap_or("?");
                 let prompt = format!("sudo password (to save {}): ", path);
-                self.cmd_buf.open(CommandBufferMode::SudoSave, &prompt, "");
+                self.command_buffer
+                    .open(CommandBufferMode::SudoSave, &prompt, "");
             }
             Err(e) => {
                 self.set_status(format!("Error writing temp file: {}", e));
@@ -3440,7 +3572,7 @@ impl Editor {
 
     #[cfg(test)]
     fn test_text(&self) -> String {
-        String::from_utf8_lossy(&self.doc.buf.contents()).to_string()
+        String::from_utf8_lossy(&self.document.buffer.contents()).to_string()
     }
 
     fn save_file_sudo(&mut self, password: &str) {
@@ -3448,7 +3580,7 @@ impl Editor {
             Some(t) => t,
             None => return,
         };
-        let path = match self.doc.filename.clone() {
+        let path = match self.document.file_path.clone() {
             Some(p) => p,
             None => return,
         };
@@ -3509,10 +3641,10 @@ impl Editor {
 
         match status {
             Ok(s) if s.success() => {
-                self.doc.dirty = false;
-                self.doc.seal_undo();
-                self.file_mtime = crate::file_io::file_mtime(path_ref);
-                crate::file_io::save_undo_history(path_ref, &self.doc.undo_stack);
+                self.document.is_dirty = false;
+                self.document.seal_undo();
+                self.file_modification_time = crate::file_io::file_modification_time(path_ref);
+                crate::file_io::save_undo_history(path_ref, &self.document.undo_stack);
                 self.set_status(format!("Saved {} (sudo)", path));
             }
             _ => {
@@ -3536,19 +3668,19 @@ mod tests {
         ed_impl(text, Some(name.to_string()))
     }
 
-    fn ed_impl(text: &str, filename: Option<String>) -> Editor {
-        let doc = Document::new(text.as_bytes().to_vec(), filename);
+    fn ed_impl(text: &str, file_path: Option<String>) -> Editor {
+        let document = Document::new(text.as_bytes().to_vec(), file_path);
         Editor {
-            doc,
-            carets: CaretSet::new(Pos::zero()),
-            view: View::new(80, 24),
+            document,
+            carets: CaretSet::new(TextPosition::zero()),
+            viewport: Viewport::new(80, 24),
             renderer: Renderer::new(),
             clipboard: Clipboard::internal_only(),
             commands: CommandRegistry::new(),
             keybindings: KeybindingTable::with_defaults(),
-            cmd_buf: CommandBuffer::new(),
-            ruler_on: true,
-            status_msg: String::new(),
+            command_buffer: CommandBuffer::new(),
+            line_numbers_visible: true,
+            status_message: String::new(),
             status_time: None,
             running: true,
             quit_pending: false,
@@ -3556,19 +3688,19 @@ mod tests {
             find: FindState::new(),
             sudo_save_tmp: None,
             piped_stdin: false,
-            file_mtime: None,
+            file_modification_time: None,
             reload_pending: false,
-            status_left_cache: String::new(),
-            line_scratch: Vec::new(),
+            status_left_text_cache: String::new(),
+            line_text_scratch: Vec::new(),
         }
     }
 
-    fn sel(e: &Editor) -> Selection {
+    fn selection(e: &Editor) -> Selection {
         e.selection()
     }
 
-    fn set_sel(e: &mut Editor, sel: Selection) {
-        e.set_selection(sel);
+    fn set_sel(e: &mut Editor, selection: Selection) {
+        e.set_selection(selection);
     }
 
     // ========================================================================
@@ -3578,45 +3710,45 @@ mod tests {
     #[test]
     fn test_move_up_down_with_desired_col_stickiness() {
         let mut e = ed("short\nlonger line here\nhi");
-        // Move to end of "longer line here" (col 15)
-        e.set_cursor(Pos::new(1, 15));
+        // Move to end of "longer line here" (column 15)
+        e.set_cursor(TextPosition::new(1, 15));
         e.move_up(); // line 0 is 5 chars, should clamp to 5
-        assert_eq!(e.cursor(), Pos::new(0, 5));
-        // desired_col should be 15 (sticky)
-        e.move_down(); // back to line 1, col should restore to 15
-        assert_eq!(e.cursor(), Pos::new(1, 15));
+        assert_eq!(e.cursor(), TextPosition::new(0, 5));
+        // desired_column should be 15 (sticky)
+        e.move_down(); // back to line 1, column should restore to 15
+        assert_eq!(e.cursor(), TextPosition::new(1, 15));
         e.move_down(); // line 2 is 2 chars, clamp to 2
-        assert_eq!(e.cursor(), Pos::new(2, 2));
+        assert_eq!(e.cursor(), TextPosition::new(2, 2));
     }
 
     #[test]
     fn test_move_up_at_top() {
         let mut e = ed("hello");
         e.move_up();
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
     }
 
     #[test]
     fn test_move_down_at_bottom() {
         let mut e = ed("hello");
         e.move_down();
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
     }
 
     #[test]
     fn test_move_left_wraps_to_prev_line() {
         let mut e = ed("abc\ndef");
-        e.set_cursor(Pos::new(1, 0));
+        e.set_cursor(TextPosition::new(1, 0));
         e.move_left();
-        assert_eq!(e.cursor(), Pos::new(0, 3));
+        assert_eq!(e.cursor(), TextPosition::new(0, 3));
     }
 
     #[test]
     fn test_move_right_wraps_to_next_line() {
         let mut e = ed("abc\ndef");
-        e.set_cursor(Pos::new(0, 3));
+        e.set_cursor(TextPosition::new(0, 3));
         e.move_right();
-        assert_eq!(e.cursor(), Pos::new(1, 0));
+        assert_eq!(e.cursor(), TextPosition::new(1, 0));
     }
 
     #[test]
@@ -3625,13 +3757,13 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 2),
-                cursor: Pos::new(0, 7),
+                anchor: TextPosition::new(0, 2),
+                cursor: TextPosition::new(0, 7),
             },
         );
         e.move_left();
-        assert_eq!(e.cursor(), Pos::new(0, 2));
-        assert!(sel(&e).is_empty());
+        assert_eq!(e.cursor(), TextPosition::new(0, 2));
+        assert!(selection(&e).is_empty());
     }
 
     #[test]
@@ -3640,23 +3772,23 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 2),
-                cursor: Pos::new(0, 7),
+                anchor: TextPosition::new(0, 2),
+                cursor: TextPosition::new(0, 7),
             },
         );
         e.move_right();
-        assert_eq!(e.cursor(), Pos::new(0, 7));
-        assert!(sel(&e).is_empty());
+        assert_eq!(e.cursor(), TextPosition::new(0, 7));
+        assert!(selection(&e).is_empty());
     }
 
     #[test]
     fn test_home_end() {
         let mut e = ed("hello world");
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.move_home();
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
         e.move_end();
-        assert_eq!(e.cursor(), Pos::new(0, 11));
+        assert_eq!(e.cursor(), TextPosition::new(0, 11));
     }
 
     #[test]
@@ -3667,7 +3799,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut e = ed(&text);
-        e.set_cursor(Pos::new(25, 0));
+        e.set_cursor(TextPosition::new(25, 0));
         e.page_up();
         assert_eq!(e.cursor().line, 3); // 25 - 22 = 3
         e.page_down();
@@ -3677,26 +3809,26 @@ mod tests {
     #[test]
     fn test_indent_snap_left_right() {
         let mut e = ed("    hello"); // 4 spaces indent
-        e.set_cursor(Pos::new(0, 4));
+        e.set_cursor(TextPosition::new(0, 4));
         e.move_left(); // should snap from 4 to 2
-        assert_eq!(e.cursor().col, 2);
+        assert_eq!(e.cursor().column, 2);
         e.move_right(); // should snap from 2 to 4
-        assert_eq!(e.cursor().col, 4);
+        assert_eq!(e.cursor().column, 4);
     }
 
     #[test]
     fn test_move_left_at_origin() {
         let mut e = ed("hello");
         e.move_left();
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
     }
 
     #[test]
     fn test_move_right_at_end_of_last_line() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.move_right();
-        assert_eq!(e.cursor(), Pos::new(0, 5));
+        assert_eq!(e.cursor(), TextPosition::new(0, 5));
     }
 
     // ========================================================================
@@ -3708,59 +3840,59 @@ mod tests {
         let mut e = ed("hello");
         e.move_right_extend();
         e.move_right_extend();
-        assert_eq!(sel(&e).anchor, Pos::new(0, 0));
-        assert_eq!(sel(&e).cursor, Pos::new(0, 2));
-        assert!(!sel(&e).is_empty());
+        assert_eq!(selection(&e).anchor, TextPosition::new(0, 0));
+        assert_eq!(selection(&e).cursor, TextPosition::new(0, 2));
+        assert!(!selection(&e).is_empty());
     }
 
     #[test]
     fn test_select_all() {
         let mut e = ed("hello\nworld");
         e.select_all();
-        let (start, end) = sel(&e).ordered();
-        assert_eq!(start, Pos::new(0, 0));
-        assert_eq!(end, Pos::new(1, 5));
+        let (start, end) = selection(&e).ordered();
+        assert_eq!(start, TextPosition::new(0, 0));
+        assert_eq!(end, TextPosition::new(1, 5));
     }
 
     #[test]
     fn test_select_word_at() {
         let mut e = ed("hello world");
-        e.select_word_at(Pos::new(0, 7));
-        let (start, end) = sel(&e).ordered();
-        assert_eq!(start, Pos::new(0, 6));
-        assert_eq!(end, Pos::new(0, 11));
+        e.select_word_at(TextPosition::new(0, 7));
+        let (start, end) = selection(&e).ordered();
+        assert_eq!(start, TextPosition::new(0, 6));
+        assert_eq!(end, TextPosition::new(0, 11));
     }
 
     #[test]
     fn test_select_line_at() {
         let mut e = ed("hello\nworld\nfoo");
         e.select_line_at(1);
-        let (start, end) = sel(&e).ordered();
-        assert_eq!(start, Pos::new(1, 0));
-        assert_eq!(end, Pos::new(2, 0));
+        let (start, end) = selection(&e).ordered();
+        assert_eq!(start, TextPosition::new(1, 0));
+        assert_eq!(end, TextPosition::new(2, 0));
     }
 
     #[test]
     fn test_select_line_at_last_line() {
         let mut e = ed("hello\nworld");
         e.select_line_at(1);
-        let (start, end) = sel(&e).ordered();
-        assert_eq!(start, Pos::new(1, 0));
-        assert_eq!(end, Pos::new(1, 5));
+        let (start, end) = selection(&e).ordered();
+        assert_eq!(start, TextPosition::new(1, 0));
+        assert_eq!(end, TextPosition::new(1, 5));
     }
 
     #[test]
     fn test_select_above_below() {
         let mut e = ed("hello\nworld\nfoo");
-        e.set_cursor(Pos::new(1, 3));
+        e.set_cursor(TextPosition::new(1, 3));
         e.select_above();
-        assert_eq!(sel(&e).cursor, Pos::new(0, 0));
-        assert_eq!(sel(&e).anchor, Pos::new(1, 3));
+        assert_eq!(selection(&e).cursor, TextPosition::new(0, 0));
+        assert_eq!(selection(&e).anchor, TextPosition::new(1, 3));
 
-        e.set_cursor(Pos::new(1, 3));
+        e.set_cursor(TextPosition::new(1, 3));
         e.select_below();
-        assert_eq!(sel(&e).cursor, Pos::new(2, 3));
-        assert_eq!(sel(&e).anchor, Pos::new(1, 3));
+        assert_eq!(selection(&e).cursor, TextPosition::new(2, 3));
+        assert_eq!(selection(&e).anchor, TextPosition::new(1, 3));
     }
 
     #[test]
@@ -3769,8 +3901,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 5),
-                cursor: Pos::new(0, 11),
+                anchor: TextPosition::new(0, 5),
+                cursor: TextPosition::new(0, 11),
             },
         );
         e.delete_selection();
@@ -3783,36 +3915,36 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 5),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 5),
             },
         );
         e.clear_selection();
-        assert!(sel(&e).is_empty());
-        assert_eq!(e.cursor(), Pos::new(0, 5));
+        assert!(selection(&e).is_empty());
+        assert_eq!(e.cursor(), TextPosition::new(0, 5));
     }
 
     #[test]
     fn test_shift_up_down_extend() {
         let mut e = ed("aaa\nbbb\nccc");
-        e.set_cursor(Pos::new(1, 1));
+        e.set_cursor(TextPosition::new(1, 1));
         e.move_up_extend();
-        assert_eq!(sel(&e).anchor, Pos::new(1, 1));
-        assert_eq!(sel(&e).cursor, Pos::new(0, 1));
+        assert_eq!(selection(&e).anchor, TextPosition::new(1, 1));
+        assert_eq!(selection(&e).cursor, TextPosition::new(0, 1));
         e.move_down_extend();
-        assert_eq!(sel(&e).cursor, Pos::new(1, 1));
+        assert_eq!(selection(&e).cursor, TextPosition::new(1, 1));
         e.move_down_extend();
-        assert_eq!(sel(&e).cursor, Pos::new(2, 1));
+        assert_eq!(selection(&e).cursor, TextPosition::new(2, 1));
     }
 
     #[test]
     fn test_shift_left_right_extend() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 2));
+        e.set_cursor(TextPosition::new(0, 2));
         e.move_left_extend();
-        assert_eq!(sel(&e).cursor, Pos::new(0, 1));
+        assert_eq!(selection(&e).cursor, TextPosition::new(0, 1));
         e.move_right_extend();
-        assert_eq!(sel(&e).cursor, Pos::new(0, 2));
+        assert_eq!(selection(&e).cursor, TextPosition::new(0, 2));
     }
 
     // ========================================================================
@@ -3822,10 +3954,10 @@ mod tests {
     #[test]
     fn test_insert_char() {
         let mut e = ed("hllo");
-        e.set_cursor(Pos::new(0, 1));
+        e.set_cursor(TextPosition::new(0, 1));
         e.insert_char('e');
         assert_eq!(e.test_text(), "hello");
-        assert_eq!(e.cursor(), Pos::new(0, 2));
+        assert_eq!(e.cursor(), TextPosition::new(0, 2));
     }
 
     #[test]
@@ -3834,8 +3966,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 5),
-                cursor: Pos::new(0, 11),
+                anchor: TextPosition::new(0, 5),
+                cursor: TextPosition::new(0, 11),
             },
         );
         e.insert_char('!');
@@ -3862,8 +3994,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(2, 3),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(2, 3),
             },
         );
         e.insert_tab();
@@ -3877,23 +4009,23 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(2, 3),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(2, 3),
             },
         );
         e.insert_tab();
-        assert!(!sel(&e).is_empty());
-        assert_eq!(sel(&e).anchor, Pos::new(0, 2));
-        assert_eq!(sel(&e).cursor, Pos::new(2, 5));
+        assert!(!selection(&e).is_empty());
+        assert_eq!(selection(&e).anchor, TextPosition::new(0, 2));
+        assert_eq!(selection(&e).cursor, TextPosition::new(2, 5));
     }
 
     #[test]
     fn test_insert_newline_with_auto_indent() {
         let mut e = ed("  hello");
-        e.set_cursor(Pos::new(0, 7));
+        e.set_cursor(TextPosition::new(0, 7));
         e.insert_newline();
         assert_eq!(e.test_text(), "  hello\n  ");
-        assert_eq!(e.cursor(), Pos::new(1, 2));
+        assert_eq!(e.cursor(), TextPosition::new(1, 2));
     }
 
     #[test]
@@ -3902,8 +4034,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 5),
-                cursor: Pos::new(0, 11),
+                anchor: TextPosition::new(0, 5),
+                cursor: TextPosition::new(0, 11),
             },
         );
         e.insert_newline();
@@ -3913,53 +4045,53 @@ mod tests {
     #[test]
     fn test_insert_newline_between_braces() {
         let mut e = ed("{}");
-        e.set_cursor(Pos::new(0, 1));
+        e.set_cursor(TextPosition::new(0, 1));
         e.insert_newline();
         assert_eq!(e.test_text(), "{\n  \n}");
-        assert_eq!(e.cursor(), Pos::new(1, 2));
+        assert_eq!(e.cursor(), TextPosition::new(1, 2));
     }
 
     #[test]
     fn test_insert_newline_between_parens() {
         let mut e = ed("()");
-        e.set_cursor(Pos::new(0, 1));
+        e.set_cursor(TextPosition::new(0, 1));
         e.insert_newline();
         assert_eq!(e.test_text(), "(\n  \n)");
-        assert_eq!(e.cursor(), Pos::new(1, 2));
+        assert_eq!(e.cursor(), TextPosition::new(1, 2));
     }
 
     #[test]
     fn test_insert_newline_between_brackets() {
         let mut e = ed("[]");
-        e.set_cursor(Pos::new(0, 1));
+        e.set_cursor(TextPosition::new(0, 1));
         e.insert_newline();
         assert_eq!(e.test_text(), "[\n  \n]");
-        assert_eq!(e.cursor(), Pos::new(1, 2));
+        assert_eq!(e.cursor(), TextPosition::new(1, 2));
     }
 
     #[test]
     fn test_insert_newline_between_braces_preserves_indent() {
         let mut e = ed("  {}");
-        e.set_cursor(Pos::new(0, 3));
+        e.set_cursor(TextPosition::new(0, 3));
         e.insert_newline();
         assert_eq!(e.test_text(), "  {\n    \n  }");
-        assert_eq!(e.cursor(), Pos::new(1, 4));
+        assert_eq!(e.cursor(), TextPosition::new(1, 4));
     }
 
     #[test]
     fn test_insert_newline_not_between_pair_no_split() {
         // Cursor after `{` but no closing `}` immediately after — normal newline.
         let mut e = ed("{hello}");
-        e.set_cursor(Pos::new(0, 1));
+        e.set_cursor(TextPosition::new(0, 1));
         e.insert_newline();
         assert_eq!(e.test_text(), "{\nhello}");
-        assert_eq!(e.cursor(), Pos::new(1, 0));
+        assert_eq!(e.cursor(), TextPosition::new(1, 0));
     }
 
     #[test]
     fn test_backspace_basic() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.backspace();
         assert_eq!(e.test_text(), "hell");
     }
@@ -3967,7 +4099,7 @@ mod tests {
     #[test]
     fn test_backspace_joins_lines() {
         let mut e = ed("hello\nworld");
-        e.set_cursor(Pos::new(1, 0));
+        e.set_cursor(TextPosition::new(1, 0));
         e.backspace();
         assert_eq!(e.test_text(), "helloworld");
     }
@@ -3975,7 +4107,7 @@ mod tests {
     #[test]
     fn test_backspace_indent_snap() {
         let mut e = ed("    x");
-        e.set_cursor(Pos::new(0, 4));
+        e.set_cursor(TextPosition::new(0, 4));
         e.backspace(); // should snap from 4 to 2
         assert_eq!(e.test_text(), "  x");
     }
@@ -3986,8 +4118,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 5),
-                cursor: Pos::new(0, 11),
+                anchor: TextPosition::new(0, 5),
+                cursor: TextPosition::new(0, 11),
             },
         );
         e.backspace();
@@ -4004,7 +4136,7 @@ mod tests {
     #[test]
     fn test_delete_forward() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 0));
+        e.set_cursor(TextPosition::new(0, 0));
         e.delete_forward();
         assert_eq!(e.test_text(), "ello");
     }
@@ -4012,7 +4144,7 @@ mod tests {
     #[test]
     fn test_delete_forward_joins_lines() {
         let mut e = ed("hello\nworld");
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.delete_forward();
         assert_eq!(e.test_text(), "helloworld");
     }
@@ -4023,8 +4155,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 5),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 5),
             },
         );
         e.delete_forward();
@@ -4034,7 +4166,7 @@ mod tests {
     #[test]
     fn test_ctrl_backspace_word_delete() {
         let mut e = ed("hello world");
-        e.set_cursor(Pos::new(0, 11));
+        e.set_cursor(TextPosition::new(0, 11));
         e.ctrl_backspace();
         assert_eq!(e.test_text(), "hello ");
     }
@@ -4042,7 +4174,7 @@ mod tests {
     #[test]
     fn test_ctrl_backspace_at_line_start() {
         let mut e = ed("hello\nworld");
-        e.set_cursor(Pos::new(1, 0));
+        e.set_cursor(TextPosition::new(1, 0));
         e.ctrl_backspace();
         assert_eq!(e.test_text(), "helloworld");
     }
@@ -4060,8 +4192,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 5),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 5),
             },
         );
         e.ctrl_backspace();
@@ -4071,10 +4203,10 @@ mod tests {
     #[test]
     fn test_duplicate_line() {
         let mut e = ed("hello\nworld");
-        e.set_cursor(Pos::new(0, 2));
+        e.set_cursor(TextPosition::new(0, 2));
         e.duplicate_line();
         assert_eq!(e.test_text(), "hello\nhello\nworld");
-        assert_eq!(e.cursor(), Pos::new(1, 2));
+        assert_eq!(e.cursor(), TextPosition::new(1, 2));
     }
 
     // ========================================================================
@@ -4116,10 +4248,13 @@ mod tests {
         assert_eq!(e.find.matches.len(), 2);
         e.find.active = true;
         // Position cursor past all matches
-        e.set_cursor(Pos::new(0, 8));
+        e.set_cursor(TextPosition::new(0, 8));
         e.find_next();
-        // wrapped around to first match (col 0..2)
-        assert_eq!(e.find.current, Some((Pos::new(0, 0), Pos::new(0, 2))));
+        // wrapped around to first match (column 0..2)
+        assert_eq!(
+            e.find.current,
+            Some((TextPosition::new(0, 0), TextPosition::new(0, 2)))
+        );
     }
 
     #[test]
@@ -4127,10 +4262,13 @@ mod tests {
         let mut e = ed("aa bb aa");
         e.update_find_highlights("aa");
         e.find.active = true;
-        e.set_cursor(Pos::new(0, 0));
+        e.set_cursor(TextPosition::new(0, 0));
         e.find_prev();
-        // wrapped around to last match (col 6..8)
-        assert_eq!(e.find.current, Some((Pos::new(0, 6), Pos::new(0, 8))));
+        // wrapped around to last match (column 6..8)
+        assert_eq!(
+            e.find.current,
+            Some((TextPosition::new(0, 6), TextPosition::new(0, 8)))
+        );
     }
 
     #[test]
@@ -4147,7 +4285,7 @@ mod tests {
         let mut e = ed("hello world");
         e.find_next_from_submit("xyz");
         assert!(!e.find.active);
-        assert!(e.status_msg.contains("no matches"));
+        assert!(e.status_message.contains("no matches"));
     }
 
     #[test]
@@ -4158,7 +4296,7 @@ mod tests {
         assert!(!e.find.active);
         assert!(e.find.matches.is_empty());
         // Selection should cover the match
-        assert!(!sel(&e).is_empty());
+        assert!(!selection(&e).is_empty());
     }
 
     #[test]
@@ -4166,7 +4304,7 @@ mod tests {
         let mut e = ed("foo bar foo");
         e.replace_all("foo", "baz");
         assert_eq!(e.test_text(), "baz bar baz");
-        assert!(e.status_msg.contains("2"));
+        assert!(e.status_message.contains("2"));
     }
 
     #[test]
@@ -4175,8 +4313,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 3),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 3),
             },
         );
         e.replace_all("foo", "baz");
@@ -4187,14 +4325,14 @@ mod tests {
     fn test_replace_all_no_matches() {
         let mut e = ed("hello world");
         e.replace_all("xyz", "abc");
-        assert!(e.status_msg.contains("0"));
+        assert!(e.status_message.contains("0"));
     }
 
     #[test]
     fn test_replace_all_invalid_regex() {
         let mut e = ed("hello");
         e.replace_all("[invalid", "x");
-        assert!(e.status_msg.contains("Invalid regex"));
+        assert!(e.status_message.contains("Invalid regex"));
     }
 
     // ========================================================================
@@ -4229,17 +4367,17 @@ mod tests {
     #[test]
     fn test_goto_top_end() {
         let mut e = ed("hello\nworld\nfoo");
-        e.set_cursor(Pos::new(1, 2));
+        e.set_cursor(TextPosition::new(1, 2));
         e.goto_top();
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
         e.goto_end();
-        assert_eq!(e.cursor(), Pos::new(2, 3));
+        assert_eq!(e.cursor(), TextPosition::new(2, 3));
     }
 
     #[test]
     fn test_kill_line_middle() {
         let mut e = ed("aaa\nbbb\nccc");
-        e.set_cursor(Pos::new(1, 1));
+        e.set_cursor(TextPosition::new(1, 1));
         e.kill_line();
         assert_eq!(e.test_text(), "aaa\nccc");
     }
@@ -4247,7 +4385,7 @@ mod tests {
     #[test]
     fn test_kill_line_last() {
         let mut e = ed("aaa\nbbb");
-        e.set_cursor(Pos::new(1, 0));
+        e.set_cursor(TextPosition::new(1, 0));
         e.kill_line();
         assert_eq!(e.test_text(), "aaa\n");
     }
@@ -4262,11 +4400,11 @@ mod tests {
     #[test]
     fn test_execute_command_ruler_toggle() {
         let mut e = ed("hello");
-        assert!(e.ruler_on);
+        assert!(e.line_numbers_visible);
         e.execute_command("ruler");
-        assert!(!e.ruler_on);
+        assert!(!e.line_numbers_visible);
         e.execute_command("ruler");
-        assert!(e.ruler_on);
+        assert!(e.line_numbers_visible);
     }
 
     #[test]
@@ -4280,7 +4418,7 @@ mod tests {
     fn test_execute_command_unknown() {
         let mut e = ed("hello");
         e.execute_command("foobar");
-        assert!(e.status_msg.contains("Unknown"));
+        assert!(e.status_message.contains("Unknown"));
     }
 
     #[test]
@@ -4331,43 +4469,45 @@ mod tests {
     fn test_execute_command_selectall() {
         let mut e = ed("hello\nworld");
         e.execute_command("selectall");
-        assert!(!sel(&e).is_empty());
-        let (start, end) = sel(&e).ordered();
-        assert_eq!(start, Pos::zero());
+        assert!(!selection(&e).is_empty());
+        let (start, end) = selection(&e).ordered();
+        assert_eq!(start, TextPosition::zero());
         assert_eq!(end.line, 1);
     }
 
     #[test]
     fn test_complete_command_single_match() {
         let mut e = ed("hello");
-        e.cmd_buf.open(CommandBufferMode::Command, "> ", "rul");
+        e.command_buffer
+            .open(CommandBufferMode::Command, "> ", "rul");
         e.complete_command();
-        assert_eq!(e.cmd_buf.input, "ruler");
-        assert!(e.cmd_buf.completions.is_empty());
+        assert_eq!(e.command_buffer.input, "ruler");
+        assert!(e.command_buffer.completions.is_empty());
     }
 
     #[test]
     fn test_complete_command_multiple_matches() {
         let mut e = ed("hello");
-        e.cmd_buf.open(CommandBufferMode::Command, "> ", "q");
+        e.command_buffer.open(CommandBufferMode::Command, "> ", "q");
         e.complete_command();
-        assert_eq!(e.cmd_buf.completions.len(), 2); // "q" and "quit"
+        assert_eq!(e.command_buffer.completions.len(), 2); // "q" and "quit"
     }
 
     #[test]
     fn test_complete_command_no_matches() {
         let mut e = ed("hello");
-        e.cmd_buf.open(CommandBufferMode::Command, "> ", "xyz");
+        e.command_buffer
+            .open(CommandBufferMode::Command, "> ", "xyz");
         e.complete_command();
-        assert!(e.cmd_buf.completions.is_empty());
+        assert!(e.command_buffer.completions.is_empty());
     }
 
     #[test]
     fn test_complete_command_empty_shows_all() {
         let mut e = ed("hello");
-        e.cmd_buf.open(CommandBufferMode::Command, "> ", "");
+        e.command_buffer.open(CommandBufferMode::Command, "> ", "");
         e.complete_command();
-        assert!(!e.cmd_buf.completions.is_empty());
+        assert!(!e.command_buffer.completions.is_empty());
     }
 
     // ========================================================================
@@ -4404,14 +4544,17 @@ mod tests {
             CommandBufferMode::Prompt,
             CommandBufferResult::Submit(path.to_str().unwrap().to_string()),
         );
-        assert_eq!(e.doc.filename.as_deref(), Some(path.to_str().unwrap()));
+        assert_eq!(
+            e.document.file_path.as_deref(),
+            Some(path.to_str().unwrap())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_handle_cmd_result_cancel_find() {
         let mut e = ed("hello");
-        e.find.matches = vec![(Pos::new(0, 0), Pos::new(0, 5))];
+        e.find.matches = vec![(TextPosition::new(0, 0), TextPosition::new(0, 5))];
         e.handle_cmd_result(CommandBufferMode::Find, CommandBufferResult::Cancel);
         assert!(e.find.matches.is_empty());
     }
@@ -4422,7 +4565,7 @@ mod tests {
         e.sudo_save_tmp = Some("/tmp/nonexistent_test_file".to_string());
         e.handle_cmd_result(CommandBufferMode::SudoSave, CommandBufferResult::Cancel);
         assert!(e.sudo_save_tmp.is_none());
-        assert!(e.status_msg.contains("cancelled"));
+        assert!(e.status_message.contains("cancelled"));
     }
 
     #[test]
@@ -4438,9 +4581,10 @@ mod tests {
     #[test]
     fn test_handle_cmd_result_tab_complete() {
         let mut e = ed("hello");
-        e.cmd_buf.open(CommandBufferMode::Command, "> ", "rul");
+        e.command_buffer
+            .open(CommandBufferMode::Command, "> ", "rul");
         e.handle_cmd_result(CommandBufferMode::Command, CommandBufferResult::TabComplete);
-        assert_eq!(e.cmd_buf.input, "ruler");
+        assert_eq!(e.command_buffer.input, "ruler");
     }
 
     #[test]
@@ -4465,29 +4609,29 @@ mod tests {
     #[test]
     fn test_handle_event_mouse_ignored_when_cmd_active() {
         let mut e = ed("hello");
-        e.cmd_buf.open(CommandBufferMode::Command, "> ", "");
+        e.command_buffer.open(CommandBufferMode::Command, "> ", "");
         e.dispatch_event(EditorEvent::Mouse(
             MouseEvent::Press(MouseButton::Left, 1, 1),
             MouseMods::default(),
         ));
-        // Mouse should be ignored when cmd_buf is active
-        assert!(e.cmd_buf.active);
+        // Mouse should be ignored when command_buffer is active
+        assert!(e.command_buffer.active);
     }
 
     #[test]
     fn test_handle_event_unsupported_ctrl_shift_up() {
         let mut e = ed("hello\nworld");
-        e.set_cursor(Pos::new(1, 3));
+        e.set_cursor(TextPosition::new(1, 3));
         e.dispatch_event(EditorEvent::Key(Key::CtrlShiftUp));
-        assert_eq!(sel(&e).cursor, Pos::new(0, 0));
+        assert_eq!(selection(&e).cursor, TextPosition::new(0, 0));
     }
 
     #[test]
     fn test_handle_event_unsupported_ctrl_shift_down() {
         let mut e = ed("hello\nworld");
-        e.set_cursor(Pos::new(0, 2));
+        e.set_cursor(TextPosition::new(0, 2));
         e.dispatch_event(EditorEvent::Key(Key::CtrlShiftDown));
-        assert_eq!(sel(&e).cursor, Pos::new(1, 5));
+        assert_eq!(selection(&e).cursor, TextPosition::new(1, 5));
     }
 
     #[test]
@@ -4500,11 +4644,11 @@ mod tests {
     #[test]
     fn test_quit_dirty_confirms() {
         let mut e = ed("hello");
-        e.doc.dirty = true;
+        e.document.is_dirty = true;
         e.try_quit();
         assert!(e.running);
         assert!(e.quit_pending);
-        assert!(e.status_msg.contains("Save changes"));
+        assert!(e.status_message.contains("Save changes"));
     }
 
     #[test]
@@ -4514,7 +4658,7 @@ mod tests {
         let path = dir.join("test.txt");
         std::fs::write(&path, b"hello").unwrap();
         let mut e = ed_named("hello", path.to_str().unwrap());
-        e.doc.dirty = true;
+        e.document.is_dirty = true;
         e.try_quit();
         e.handle_key(Key::Char('y'));
         assert!(!e.running);
@@ -4530,12 +4674,12 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("out.txt");
         let mut e = ed("hello");
-        e.doc.dirty = true;
+        e.document.is_dirty = true;
         e.try_quit();
         // Pressing 'y' on a scratch buffer must open the save-as prompt, not quit.
         e.handle_key(Key::Char('y'));
         assert!(e.running, "editor must not quit before filename is given");
-        assert!(e.cmd_buf.active, "save-as prompt must be open");
+        assert!(e.command_buffer.active, "save-as prompt must be open");
         assert!(
             e.quit_pending,
             "quit_pending must stay true until save completes"
@@ -4554,7 +4698,7 @@ mod tests {
     #[test]
     fn test_quit_dirty_then_n() {
         let mut e = ed("hello");
-        e.doc.dirty = true;
+        e.document.is_dirty = true;
         e.try_quit();
         e.handle_key(Key::Char('n'));
         assert!(!e.running);
@@ -4563,7 +4707,7 @@ mod tests {
     #[test]
     fn test_quit_dirty_then_cancel() {
         let mut e = ed("hello");
-        e.doc.dirty = true;
+        e.document.is_dirty = true;
         e.try_quit();
         e.handle_key(Key::Esc);
         assert!(e.running);
@@ -4591,7 +4735,7 @@ mod tests {
         e.find_next_from_submit("aa");
         e.handle_key(Key::Esc);
         assert!(!e.find.active);
-        assert!(sel(&e).is_empty());
+        assert!(selection(&e).is_empty());
     }
 
     #[test]
@@ -4611,13 +4755,13 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 5),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 5),
             },
         );
-        e.find.matches = vec![(Pos::new(0, 0), Pos::new(0, 5))];
+        e.find.matches = vec![(TextPosition::new(0, 0), TextPosition::new(0, 5))];
         e.handle_key(Key::Esc);
-        assert!(sel(&e).is_empty());
+        assert!(selection(&e).is_empty());
         assert!(e.find.matches.is_empty());
     }
 
@@ -4626,15 +4770,15 @@ mod tests {
         let mut e = ed("hello");
         // Ctrl+a should select all
         e.handle_key(Key::Ctrl('a'));
-        assert!(!sel(&e).is_empty());
+        assert!(!selection(&e).is_empty());
     }
 
     #[test]
     fn test_handle_cmd_key_dispatches() {
         let mut e = ed("hello");
-        e.cmd_buf.open(CommandBufferMode::Command, "> ", "");
+        e.command_buffer.open(CommandBufferMode::Command, "> ", "");
         e.handle_cmd_key(Key::Char('a'));
-        assert_eq!(e.cmd_buf.input, "a");
+        assert_eq!(e.command_buffer.input, "a");
     }
 
     // ========================================================================
@@ -4644,7 +4788,7 @@ mod tests {
     #[test]
     fn test_mouse_single_click() {
         let mut e = ed("hello\nworld");
-        e.mouse_press(6, 2, MouseMods::default()); // col 5, row 1 (1-indexed terminal coords)
+        e.mouse_press(6, 2, MouseMods::default()); // column 5, row 1 (1-indexed terminal coords)
         assert_eq!(e.cursor().line, 1);
     }
 
@@ -4654,7 +4798,7 @@ mod tests {
         e.mouse_press(3, 1, MouseMods::default()); // start drag
         assert!(e.mouse.dragging);
         e.mouse_drag(8, 1);
-        assert_ne!(sel(&e).anchor, sel(&e).cursor);
+        assert_ne!(selection(&e).anchor, selection(&e).cursor);
     }
 
     #[test]
@@ -4668,12 +4812,12 @@ mod tests {
     #[test]
     fn test_ctrl_click_adds_caret_and_inserts_at_all_carets() {
         let mut e = ed("abc\ndef");
-        e.ruler_on = false;
+        e.line_numbers_visible = false;
 
         e.mouse_press(2, 2, MouseMods { ctrl: true });
 
         assert_eq!(e.carets.len(), 2);
-        assert_eq!(e.cursor(), Pos::new(1, 1));
+        assert_eq!(e.cursor(), TextPosition::new(1, 1));
 
         e.insert_char('X');
         assert_eq!(e.test_text(), "Xabc\ndXef");
@@ -4683,50 +4827,56 @@ mod tests {
     #[test]
     fn test_multicursor_vertical_movement_preserves_all_carets() {
         let mut e = ed("abc\n123456\nz");
-        e.carets.carets = vec![Caret::caret(Pos::new(1, 5)), Caret::caret(Pos::new(1, 2))];
+        e.carets.carets = vec![
+            Caret::caret(TextPosition::new(1, 5)),
+            Caret::caret(TextPosition::new(1, 2)),
+        ];
         e.carets.primary = 0;
         e.carets.normalize();
 
         e.move_up();
         assert_eq!(e.carets.len(), 2);
-        assert_eq!(e.cursor(), Pos::new(0, 3));
+        assert_eq!(e.cursor(), TextPosition::new(0, 3));
         assert_eq!(
             e.carets
                 .iter()
-                .map(|caret| caret.sel.cursor)
+                .map(|caret| caret.selection.cursor)
                 .collect::<Vec<_>>(),
-            vec![Pos::new(0, 2), Pos::new(0, 3)]
+            vec![TextPosition::new(0, 2), TextPosition::new(0, 3)]
         );
 
         e.move_down();
         assert_eq!(e.carets.len(), 2);
-        assert_eq!(e.cursor(), Pos::new(1, 5));
+        assert_eq!(e.cursor(), TextPosition::new(1, 5));
         assert_eq!(
             e.carets
                 .iter()
-                .map(|caret| caret.sel.cursor)
+                .map(|caret| caret.selection.cursor)
                 .collect::<Vec<_>>(),
-            vec![Pos::new(1, 2), Pos::new(1, 5)]
+            vec![TextPosition::new(1, 2), TextPosition::new(1, 5)]
         );
     }
 
     #[test]
     fn test_multicursor_word_right_moves_all_carets() {
         let mut e = ed("hello world\nfoo bar");
-        e.carets.carets = vec![Caret::caret(Pos::new(0, 0)), Caret::caret(Pos::new(1, 0))];
+        e.carets.carets = vec![
+            Caret::caret(TextPosition::new(0, 0)),
+            Caret::caret(TextPosition::new(1, 0)),
+        ];
         e.carets.primary = 1;
         e.carets.normalize();
 
         e.word_right();
 
         assert_eq!(e.carets.len(), 2);
-        assert_eq!(e.cursor(), Pos::new(1, 4));
+        assert_eq!(e.cursor(), TextPosition::new(1, 4));
         assert_eq!(
             e.carets
                 .iter()
-                .map(|caret| caret.sel.cursor)
+                .map(|caret| caret.selection.cursor)
                 .collect::<Vec<_>>(),
-            vec![Pos::new(0, 6), Pos::new(1, 4)]
+            vec![TextPosition::new(0, 6), TextPosition::new(1, 4)]
         );
     }
 
@@ -4737,42 +4887,42 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut e = ed(&text);
-        e.view.scroll_line = 10;
-        e.set_cursor(Pos::new(15, 0));
+        e.viewport.scroll_line = 10;
+        e.set_cursor(TextPosition::new(15, 0));
         e.scroll_down();
-        assert!(e.view.scroll_line > 10);
-        let prev = e.view.scroll_line;
+        assert!(e.viewport.scroll_line > 10);
+        let prev = e.viewport.scroll_line;
         e.scroll_up();
-        assert!(e.view.scroll_line < prev);
+        assert!(e.viewport.scroll_line < prev);
     }
 
     #[test]
     fn test_scroll_up_at_top() {
         let mut e = ed("hello\nworld");
         e.scroll_up();
-        assert_eq!(e.view.scroll_line, 0);
+        assert_eq!(e.viewport.scroll_line, 0);
     }
 
     #[test]
     fn test_scroll_down_at_bottom() {
         let mut e = ed("hello");
         e.scroll_down();
-        assert_eq!(e.view.scroll_line, 0);
+        assert_eq!(e.viewport.scroll_line, 0);
     }
 
     #[test]
-    fn test_screen_to_buffer_pos_normal() {
+    fn test_screen_to_buffer_position_normal() {
         let e = ed("hello\nworld");
-        let pos = e.screen_to_buffer_pos(5, 1); // col 4, row 0
+        let pos = e.screen_to_buffer_position(5, 1); // column 4, row 0
         assert_eq!(pos.line, 0);
     }
 
     #[test]
-    fn test_screen_to_buffer_pos_below_content() {
+    fn test_screen_to_buffer_position_below_content() {
         let e = ed("hello");
-        let pos = e.screen_to_buffer_pos(1, 20); // way below
+        let pos = e.screen_to_buffer_position(1, 20); // way below
         assert_eq!(pos.line, 0);
-        assert_eq!(pos.col, 5);
+        assert_eq!(pos.column, 5);
     }
 
     #[test]
@@ -4782,20 +4932,20 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut e = ed(&text);
-        e.set_cursor(Pos::new(0, 0));
-        e.view.scroll_line = 10;
-        let gw = gutter_width(e.doc.buf.line_count());
-        let tc = e.view.text_cols(gw);
+        e.set_cursor(TextPosition::new(0, 0));
+        e.viewport.scroll_line = 10;
+        let gw = gutter_width(e.document.buffer.line_count());
+        let tc = e.viewport.text_cols(gw);
         e.clamp_cursor_to_viewport(gw, tc);
         // Cursor should be moved into viewport
-        assert!(e.cursor().line >= e.view.scroll_line);
+        assert!(e.cursor().line >= e.viewport.scroll_line);
     }
 
     #[test]
     fn test_handle_event_mouse_exits_find_active() {
         let mut e = ed("hello world");
         e.find.active = true;
-        e.find.matches = vec![(Pos::new(0, 0), Pos::new(0, 5))];
+        e.find.matches = vec![(TextPosition::new(0, 0), TextPosition::new(0, 5))];
         e.dispatch_event(EditorEvent::Mouse(
             MouseEvent::Press(MouseButton::Left, 1, 1),
             MouseMods::default(),
@@ -4813,12 +4963,12 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 5),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 5),
             },
         );
         e.copy();
-        e.set_cursor(Pos::new(0, 11));
+        e.set_cursor(TextPosition::new(0, 11));
         e.paste();
         assert_eq!(e.test_text(), "hello worldhello");
     }
@@ -4829,8 +4979,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 5),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 5),
             },
         );
         e.cut();
@@ -4844,25 +4994,28 @@ mod tests {
         let mut e = ed("hello\nworld");
         e.carets.carets = vec![
             Caret {
-                sel: Selection {
-                    anchor: Pos::new(0, 0),
-                    cursor: Pos::new(0, 5),
+                selection: Selection {
+                    anchor: TextPosition::new(0, 0),
+                    cursor: TextPosition::new(0, 5),
                 },
-                desired_col: None,
+                desired_column: None,
             },
             Caret {
-                sel: Selection {
-                    anchor: Pos::new(1, 0),
-                    cursor: Pos::new(1, 5),
+                selection: Selection {
+                    anchor: TextPosition::new(1, 0),
+                    cursor: TextPosition::new(1, 5),
                 },
-                desired_col: None,
+                desired_column: None,
             },
         ];
         e.carets.primary = 0;
         e.carets.normalize();
         e.copy();
 
-        e.carets.carets = vec![Caret::caret(Pos::new(0, 5)), Caret::caret(Pos::new(1, 5))];
+        e.carets.carets = vec![
+            Caret::caret(TextPosition::new(0, 5)),
+            Caret::caret(TextPosition::new(1, 5)),
+        ];
         e.carets.primary = 1;
         e.carets.normalize();
         e.paste();
@@ -4875,18 +5028,18 @@ mod tests {
         let mut e = ed_named("aaa\nbbb\nccc", "test.rs");
         e.carets.carets = vec![
             Caret {
-                sel: Selection {
-                    anchor: Pos::new(0, 0),
-                    cursor: Pos::new(0, 3),
+                selection: Selection {
+                    anchor: TextPosition::new(0, 0),
+                    cursor: TextPosition::new(0, 3),
                 },
-                desired_col: None,
+                desired_column: None,
             },
             Caret {
-                sel: Selection {
-                    anchor: Pos::new(2, 0),
-                    cursor: Pos::new(2, 3),
+                selection: Selection {
+                    anchor: TextPosition::new(2, 0),
+                    cursor: TextPosition::new(2, 3),
                 },
-                desired_col: None,
+                desired_column: None,
             },
         ];
         e.carets.primary = 0;
@@ -4897,12 +5050,12 @@ mod tests {
         assert_eq!(e.test_text(), "  aaa\nbbb\n  ccc");
         assert_eq!(e.carets.len(), 2);
         assert_eq!(
-            e.carets.carets[0].sel.ordered(),
-            (Pos::new(0, 2), Pos::new(0, 5))
+            e.carets.carets[0].selection.ordered(),
+            (TextPosition::new(0, 2), TextPosition::new(0, 5))
         );
         assert_eq!(
-            e.carets.carets[1].sel.ordered(),
-            (Pos::new(2, 2), Pos::new(2, 5))
+            e.carets.carets[1].selection.ordered(),
+            (TextPosition::new(2, 2), TextPosition::new(2, 5))
         );
     }
 
@@ -4911,18 +5064,18 @@ mod tests {
         let mut e = ed_named("aaa\nbbb\nccc\nddd", "test.rs");
         e.carets.carets = vec![
             Caret {
-                sel: Selection {
-                    anchor: Pos::new(0, 0),
-                    cursor: Pos::new(1, 3),
+                selection: Selection {
+                    anchor: TextPosition::new(0, 0),
+                    cursor: TextPosition::new(1, 3),
                 },
-                desired_col: None,
+                desired_column: None,
             },
             Caret {
-                sel: Selection {
-                    anchor: Pos::new(3, 0),
-                    cursor: Pos::new(3, 3),
+                selection: Selection {
+                    anchor: TextPosition::new(3, 0),
+                    cursor: TextPosition::new(3, 3),
                 },
-                desired_col: None,
+                desired_column: None,
             },
         ];
         e.carets.primary = 1;
@@ -4931,77 +5084,80 @@ mod tests {
         e.insert_tab();
 
         assert_eq!(e.test_text(), "  aaa\n  bbb\nccc\n  ddd");
-        assert_eq!(e.cursor(), Pos::new(3, 5));
+        assert_eq!(e.cursor(), TextPosition::new(3, 5));
         assert_eq!(
-            e.carets.carets[0].sel.ordered(),
-            (Pos::new(0, 2), Pos::new(1, 5))
+            e.carets.carets[0].selection.ordered(),
+            (TextPosition::new(0, 2), TextPosition::new(1, 5))
         );
         assert_eq!(
-            e.carets.carets[1].sel.ordered(),
-            (Pos::new(3, 2), Pos::new(3, 5))
+            e.carets.carets[1].selection.ordered(),
+            (TextPosition::new(3, 2), TextPosition::new(3, 5))
         );
     }
 
     #[test]
     fn test_multicursor_dedent_comment_undo_redo_preserve_carets() {
         let mut e = ed_named("  aaa\n  bbb\nccc", "test.rs");
-        e.carets.carets = vec![Caret::caret(Pos::new(0, 2)), Caret::caret(Pos::new(1, 2))];
+        e.carets.carets = vec![
+            Caret::caret(TextPosition::new(0, 2)),
+            Caret::caret(TextPosition::new(1, 2)),
+        ];
         e.carets.primary = 1;
         e.carets.normalize();
 
         e.dedent();
         assert_eq!(e.test_text(), "aaa\nbbb\nccc");
-        assert_eq!(e.cursor(), Pos::new(1, 0));
+        assert_eq!(e.cursor(), TextPosition::new(1, 0));
         assert_eq!(
             e.carets
                 .iter()
-                .map(|caret| caret.sel.cursor)
+                .map(|caret| caret.selection.cursor)
                 .collect::<Vec<_>>(),
-            vec![Pos::new(0, 0), Pos::new(1, 0)]
+            vec![TextPosition::new(0, 0), TextPosition::new(1, 0)]
         );
 
         e.toggle_comment();
         assert_eq!(e.test_text(), "// aaa\n// bbb\nccc");
-        assert_eq!(e.cursor(), Pos::new(1, 3));
+        assert_eq!(e.cursor(), TextPosition::new(1, 3));
         assert_eq!(
             e.carets
                 .iter()
-                .map(|caret| caret.sel.cursor)
+                .map(|caret| caret.selection.cursor)
                 .collect::<Vec<_>>(),
-            vec![Pos::new(0, 3), Pos::new(1, 3)]
+            vec![TextPosition::new(0, 3), TextPosition::new(1, 3)]
         );
 
         e.undo();
         assert_eq!(e.test_text(), "aaa\nbbb\nccc");
-        assert_eq!(e.cursor(), Pos::new(1, 0));
+        assert_eq!(e.cursor(), TextPosition::new(1, 0));
         assert_eq!(
             e.carets
                 .iter()
-                .map(|caret| caret.sel.cursor)
+                .map(|caret| caret.selection.cursor)
                 .collect::<Vec<_>>(),
-            vec![Pos::new(0, 0), Pos::new(1, 0)]
+            vec![TextPosition::new(0, 0), TextPosition::new(1, 0)]
         );
 
         e.undo();
         assert_eq!(e.test_text(), "  aaa\n  bbb\nccc");
-        assert_eq!(e.cursor(), Pos::new(1, 2));
+        assert_eq!(e.cursor(), TextPosition::new(1, 2));
         assert_eq!(
             e.carets
                 .iter()
-                .map(|caret| caret.sel.cursor)
+                .map(|caret| caret.selection.cursor)
                 .collect::<Vec<_>>(),
-            vec![Pos::new(0, 2), Pos::new(1, 2)]
+            vec![TextPosition::new(0, 2), TextPosition::new(1, 2)]
         );
 
         e.redo();
         assert_eq!(e.test_text(), "aaa\nbbb\nccc");
-        assert_eq!(e.cursor(), Pos::new(1, 0));
+        assert_eq!(e.cursor(), TextPosition::new(1, 0));
         assert_eq!(
             e.carets
                 .iter()
-                .map(|caret| caret.sel.cursor)
+                .map(|caret| caret.selection.cursor)
                 .collect::<Vec<_>>(),
-            vec![Pos::new(0, 0), Pos::new(1, 0)]
+            vec![TextPosition::new(0, 0), TextPosition::new(1, 0)]
         );
     }
 
@@ -5011,8 +5167,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 6),
-                cursor: Pos::new(0, 11),
+                anchor: TextPosition::new(0, 6),
+                cursor: TextPosition::new(0, 11),
             },
         );
         e.paste_text("earth");
@@ -5037,10 +5193,10 @@ mod tests {
     #[test]
     fn test_undo_redo_chain() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 5));
-        e.doc.seal_undo();
+        e.set_cursor(TextPosition::new(0, 5));
+        e.document.seal_undo();
         e.insert_char('!');
-        e.doc.seal_undo();
+        e.document.seal_undo();
         assert_eq!(e.test_text(), "hello!");
         e.undo();
         assert_eq!(e.test_text(), "hello");
@@ -5055,7 +5211,7 @@ mod tests {
     #[test]
     fn test_toggle_comment_on_rs_file() {
         let mut e = ed_named("hello\nworld", "test.rs");
-        e.set_cursor(Pos::new(0, 0));
+        e.set_cursor(TextPosition::new(0, 0));
         e.toggle_comment();
         assert_eq!(e.test_text(), "// hello\nworld");
     }
@@ -5063,7 +5219,7 @@ mod tests {
     #[test]
     fn test_toggle_comment_off_rs_file() {
         let mut e = ed_named("// hello\nworld", "test.rs");
-        e.set_cursor(Pos::new(0, 0));
+        e.set_cursor(TextPosition::new(0, 0));
         e.toggle_comment();
         assert_eq!(e.test_text(), "hello\nworld");
     }
@@ -5072,7 +5228,7 @@ mod tests {
     fn test_toggle_comment_no_language() {
         let mut e = ed("hello");
         e.toggle_comment();
-        assert!(e.status_msg.contains("No language"));
+        assert!(e.status_message.contains("No language"));
     }
 
     #[test]
@@ -5081,8 +5237,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(2, 3),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(2, 3),
             },
         );
         e.toggle_comment();
@@ -5092,7 +5248,7 @@ mod tests {
     #[test]
     fn test_dedent_spaces() {
         let mut e = ed("  hello");
-        e.set_cursor(Pos::new(0, 2));
+        e.set_cursor(TextPosition::new(0, 2));
         e.dedent();
         assert_eq!(e.test_text(), "hello");
     }
@@ -5100,7 +5256,7 @@ mod tests {
     #[test]
     fn test_dedent_tab() {
         let mut e = ed("\thello");
-        e.set_cursor(Pos::new(0, 1));
+        e.set_cursor(TextPosition::new(0, 1));
         e.dedent();
         assert_eq!(e.test_text(), "hello");
     }
@@ -5108,7 +5264,7 @@ mod tests {
     #[test]
     fn test_dedent_no_indent() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 0));
+        e.set_cursor(TextPosition::new(0, 0));
         e.dedent();
         assert_eq!(e.test_text(), "hello");
     }
@@ -5119,8 +5275,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(2, 3),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(2, 3),
             },
         );
         e.indent_selection();
@@ -5134,11 +5290,11 @@ mod tests {
     #[test]
     fn test_strip_trailing_whitespace() {
         let mut e = ed("hello   \nworld  ");
-        e.set_cursor(Pos::new(0, 8));
+        e.set_cursor(TextPosition::new(0, 8));
         e.strip_trailing_whitespace();
         assert_eq!(e.test_text(), "hello\nworld");
         // Cursor should be clamped
-        assert!(e.cursor().col <= 5);
+        assert!(e.cursor().column <= 5);
     }
 
     #[test]
@@ -5173,8 +5329,8 @@ mod tests {
     fn test_save_no_filename_opens_prompt() {
         let mut e = ed("hello");
         e.save_file();
-        assert!(e.cmd_buf.active);
-        assert_eq!(e.cmd_buf.mode, CommandBufferMode::Prompt);
+        assert!(e.command_buffer.active);
+        assert_eq!(e.command_buffer.mode, CommandBufferMode::Prompt);
     }
 
     #[test]
@@ -5183,10 +5339,10 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test.txt");
         let mut e = ed_named("hello world", path.to_str().unwrap());
-        e.doc.dirty = true;
+        e.document.is_dirty = true;
         e.save_file();
-        assert!(!e.doc.dirty);
-        assert!(e.status_msg.contains("Saved"));
+        assert!(!e.document.is_dirty);
+        assert!(e.status_message.contains("Saved"));
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents, "hello world\n");
         let _ = std::fs::remove_dir_all(&dir);
@@ -5202,7 +5358,11 @@ mod tests {
     #[test]
     fn test_status_left_named_clean() {
         let e = ed_named("hello", "test.rs");
-        let lang_name = e.doc.detect_language().map(|l| l.name).unwrap_or("Text");
+        let lang_name = e
+            .document
+            .detect_language()
+            .map(|l| l.name)
+            .unwrap_or("Text");
         let left = e.status_left(lang_name);
         assert!(left.contains("test.rs"));
         assert!(left.contains("Rust"));
@@ -5212,8 +5372,12 @@ mod tests {
     #[test]
     fn test_status_left_named_dirty() {
         let mut e = ed_named("hello", "test.rs");
-        e.doc.dirty = true;
-        let lang_name = e.doc.detect_language().map(|l| l.name).unwrap_or("Text");
+        e.document.is_dirty = true;
+        let lang_name = e
+            .document
+            .detect_language()
+            .map(|l| l.name)
+            .unwrap_or("Text");
         let left = e.status_left(lang_name);
         assert!(left.contains("test.rs*"));
     }
@@ -5251,21 +5415,21 @@ mod tests {
     #[test]
     fn test_cursor_display_col_with_tabs() {
         let mut e = ed("\thello");
-        e.set_cursor(Pos::new(0, 1));
+        e.set_cursor(TextPosition::new(0, 1));
         assert_eq!(e.cursor_display_col(), 2); // tab = 2 display cols
     }
 
     #[test]
     fn test_cursor_display_col_no_tabs() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 3));
+        e.set_cursor(TextPosition::new(0, 3));
         assert_eq!(e.cursor_display_col(), 3);
     }
 
     #[test]
     fn test_find_matching_bracket_none() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 0));
+        e.set_cursor(TextPosition::new(0, 0));
         assert!(e.find_matching_bracket().is_none());
     }
 
@@ -5278,8 +5442,8 @@ mod tests {
         let mut e = ed(&text);
         e.center_view_on_line(50);
         // Scroll should be near line 50 - half of text_rows
-        assert!(e.view.scroll_line <= 50);
-        assert!(e.view.scroll_line + e.view.text_rows() > 50);
+        assert!(e.viewport.scroll_line <= 50);
+        assert!(e.viewport.scroll_line + e.viewport.text_rows() > 50);
     }
 
     // ========================================================================
@@ -5292,11 +5456,11 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 5),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 5),
             },
         );
-        e.find.matches = vec![(Pos::new(0, 0), Pos::new(0, 5))];
+        e.find.matches = vec![(TextPosition::new(0, 0), TextPosition::new(0, 5))];
         e.find.active = true;
         let mut output = Vec::new();
         e.draw(&mut output).unwrap();
@@ -5306,8 +5470,9 @@ mod tests {
     #[test]
     fn test_draw_with_cmd_buf_active() {
         let mut e = ed("hello");
-        e.cmd_buf.open(CommandBufferMode::Find, "find: ", "test");
-        e.cmd_buf.completions = vec!["comp1".to_string()];
+        e.command_buffer
+            .open(CommandBufferMode::Find, "find: ", "test");
+        e.command_buffer.completions = vec!["comp1".to_string()];
         let mut output = Vec::new();
         e.draw(&mut output).unwrap();
         let s = String::from_utf8_lossy(&output);
@@ -5317,7 +5482,7 @@ mod tests {
     #[test]
     fn test_draw_ruler_off() {
         let mut e = ed("hello");
-        e.ruler_on = false;
+        e.line_numbers_visible = false;
         let mut output = Vec::new();
         e.draw(&mut output).unwrap();
         assert!(!output.is_empty());
@@ -5337,7 +5502,7 @@ mod tests {
     #[test]
     fn test_handle_key_backtab() {
         let mut e = ed("  hello");
-        e.set_cursor(Pos::new(0, 2));
+        e.set_cursor(TextPosition::new(0, 2));
         e.handle_key(Key::BackTab);
         assert_eq!(e.test_text(), "hello");
     }
@@ -5345,19 +5510,23 @@ mod tests {
     #[test]
     fn test_handle_key_newline() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.handle_key(Key::Char('\n'));
         assert_eq!(e.test_text(), "hello\n");
-        assert_eq!(e.cursor(), Pos::new(1, 0));
+        assert_eq!(e.cursor(), TextPosition::new(1, 0));
     }
 
     #[test]
     fn test_newline_empty_buffer() {
         let mut e = ed("");
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
         e.handle_key(Key::Char('\n'));
         assert_eq!(e.test_text(), "\n");
-        assert_eq!(e.cursor(), Pos::new(1, 0), "cursor should move to line 1");
+        assert_eq!(
+            e.cursor(),
+            TextPosition::new(1, 0),
+            "cursor should move to line 1"
+        );
     }
 
     #[test]
@@ -5386,18 +5555,18 @@ mod tests {
         let path = dir.join("test.txt");
         std::fs::write(&path, b"hello").unwrap();
         let mut e = ed_named("hello", path.to_str().unwrap());
-        e.doc.dirty = true;
+        e.document.is_dirty = true;
         e.handle_key(Key::Ctrl('s'));
-        assert!(!e.doc.dirty);
+        assert!(!e.document.is_dirty);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_keybinding_undo_redo() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.insert_char('!');
-        e.doc.seal_undo();
+        e.document.seal_undo();
         e.handle_key(Key::Ctrl('z'));
         assert_eq!(e.test_text(), "hello");
         e.handle_key(Key::Ctrl('y'));
@@ -5409,7 +5578,7 @@ mod tests {
         let mut e = ed("hello");
         e.handle_key(Key::Ctrl('a')); // select all
         e.handle_key(Key::Ctrl('c')); // copy
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.handle_key(Key::Ctrl('v')); // paste
         assert_eq!(e.test_text(), "hellohello");
     }
@@ -5432,43 +5601,43 @@ mod tests {
     #[test]
     fn test_keybinding_goto_top_end() {
         let mut e = ed("aaa\nbbb\nccc");
-        e.set_cursor(Pos::new(1, 1));
+        e.set_cursor(TextPosition::new(1, 1));
         e.handle_key(Key::Ctrl('t'));
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
         e.handle_key(Key::Ctrl('g'));
-        assert_eq!(e.cursor(), Pos::new(2, 3));
+        assert_eq!(e.cursor(), TextPosition::new(2, 3));
     }
 
     #[test]
     fn test_keybinding_toggle_ruler() {
         let mut e = ed("hello");
-        assert!(e.ruler_on);
+        assert!(e.line_numbers_visible);
         e.handle_key(Key::Ctrl('r'));
-        assert!(!e.ruler_on);
+        assert!(!e.line_numbers_visible);
     }
 
     #[test]
     fn test_keybinding_command_palette() {
         let mut e = ed("hello");
         e.handle_key(Key::Ctrl('p'));
-        assert!(e.cmd_buf.active);
-        assert_eq!(e.cmd_buf.mode, CommandBufferMode::Command);
+        assert!(e.command_buffer.active);
+        assert_eq!(e.command_buffer.mode, CommandBufferMode::Command);
     }
 
     #[test]
     fn test_keybinding_goto_line() {
         let mut e = ed("hello");
         e.handle_key(Key::Ctrl('l'));
-        assert!(e.cmd_buf.active);
-        assert_eq!(e.cmd_buf.mode, CommandBufferMode::Goto);
+        assert!(e.command_buffer.active);
+        assert_eq!(e.command_buffer.mode, CommandBufferMode::Goto);
     }
 
     #[test]
     fn test_keybinding_find() {
         let mut e = ed("hello");
         e.handle_key(Key::Ctrl('f'));
-        assert!(e.cmd_buf.active);
-        assert_eq!(e.cmd_buf.mode, CommandBufferMode::Find);
+        assert!(e.command_buffer.active);
+        assert_eq!(e.command_buffer.mode, CommandBufferMode::Find);
     }
 
     #[test]
@@ -5477,18 +5646,18 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 6),
-                cursor: Pos::new(0, 11),
+                anchor: TextPosition::new(0, 6),
+                cursor: TextPosition::new(0, 11),
             },
         );
         e.handle_key(Key::Ctrl('f'));
-        assert_eq!(e.cmd_buf.input, "world");
+        assert_eq!(e.command_buffer.input, "world");
     }
 
     #[test]
     fn test_keybinding_ctrl_backspace() {
         let mut e = ed("hello world");
-        e.set_cursor(Pos::new(0, 11));
+        e.set_cursor(TextPosition::new(0, 11));
         e.handle_key(Key::Ctrl('h'));
         assert_eq!(e.test_text(), "hello ");
     }
@@ -5510,23 +5679,23 @@ mod tests {
     #[test]
     fn test_keybinding_select_word() {
         let mut e = ed("hello world");
-        e.set_cursor(Pos::new(0, 7));
+        e.set_cursor(TextPosition::new(0, 7));
         e.handle_key(Key::Ctrl('w'));
-        assert!(!sel(&e).is_empty());
+        assert!(!selection(&e).is_empty());
     }
 
     // ========================================================================
-    // desired_col reset
+    // desired_column reset
     // ========================================================================
 
     #[test]
     fn test_desired_col_reset_on_non_vertical_movement() {
         let mut e = ed("hello\nworld");
-        e.set_cursor(Pos::new(0, 3));
-        e.handle_key(Key::Down); // sets desired_col
-        assert!(e.desired_col().is_some());
+        e.set_cursor(TextPosition::new(0, 3));
+        e.handle_key(Key::Down); // sets desired_column
+        assert!(e.desired_column().is_some());
         e.handle_key(Key::Char('x')); // non-vertical key should clear it
-        assert!(e.desired_col().is_none());
+        assert!(e.desired_column().is_none());
     }
 
     // ========================================================================
@@ -5536,16 +5705,16 @@ mod tests {
     #[test]
     fn test_select_word_at_empty_line() {
         let mut e = ed("hello\n\nworld");
-        e.select_word_at(Pos::new(1, 0));
+        e.select_word_at(TextPosition::new(1, 0));
         // Empty line should not select anything (early return)
-        assert!(sel(&e).is_empty());
+        assert!(selection(&e).is_empty());
     }
 
     #[test]
     fn test_select_line_at_out_of_bounds() {
         let mut e = ed("hello");
         e.select_line_at(999);
-        assert!(sel(&e).is_empty());
+        assert!(selection(&e).is_empty());
     }
 
     // ========================================================================
@@ -5556,7 +5725,7 @@ mod tests {
     fn test_set_status() {
         let mut e = ed("hello");
         e.set_status("test message".to_string());
-        assert_eq!(e.status_msg, "test message");
+        assert_eq!(e.status_message, "test message");
         assert!(e.status_time.is_some());
     }
 
@@ -5571,13 +5740,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut e = ed(&text);
-        e.view.scroll_line = 10;
-        e.set_cursor(Pos::new(15, 0));
+        e.viewport.scroll_line = 10;
+        e.set_cursor(TextPosition::new(15, 0));
         e.handle_mouse(
             MouseEvent::Press(MouseButton::WheelUp, 1, 1),
             MouseMods::default(),
         );
-        assert!(e.view.scroll_line < 10);
+        assert!(e.viewport.scroll_line < 10);
     }
 
     #[test]
@@ -5587,12 +5756,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut e = ed(&text);
-        e.set_cursor(Pos::new(5, 0));
+        e.set_cursor(TextPosition::new(5, 0));
         e.handle_mouse(
             MouseEvent::Press(MouseButton::WheelDown, 1, 1),
             MouseMods::default(),
         );
-        assert!(e.view.scroll_line > 0);
+        assert!(e.viewport.scroll_line > 0);
     }
 
     #[test]
@@ -5616,24 +5785,24 @@ mod tests {
     }
 
     // ========================================================================
-    // handle_event dispatches cmd_key when cmd_buf active
+    // handle_event dispatches cmd_key when command_buffer active
     // ========================================================================
 
     #[test]
     fn test_handle_event_dispatches_cmd_key() {
         let mut e = ed("hello");
-        e.cmd_buf.open(CommandBufferMode::Command, "> ", "");
+        e.command_buffer.open(CommandBufferMode::Command, "> ", "");
         e.dispatch_event(EditorEvent::Key(Key::Char('x')));
-        assert_eq!(e.cmd_buf.input, "x");
+        assert_eq!(e.command_buffer.input, "x");
     }
 
     #[test]
     fn test_unsupported_ignored_when_cmd_active() {
         let mut e = ed("hello\nworld");
-        e.cmd_buf.open(CommandBufferMode::Command, "> ", "");
+        e.command_buffer.open(CommandBufferMode::Command, "> ", "");
         e.dispatch_event(EditorEvent::Key(Key::CtrlShiftUp));
         // Should be ignored, cursor unchanged
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
     }
 
     // ========================================================================
@@ -5670,15 +5839,15 @@ mod tests {
     #[test]
     fn test_shift_arrows_dispatch() {
         let mut e = ed("hello\nworld");
-        e.set_cursor(Pos::new(0, 2));
+        e.set_cursor(TextPosition::new(0, 2));
         e.handle_key(Key::ShiftRight);
-        assert_eq!(sel(&e).cursor, Pos::new(0, 3));
+        assert_eq!(selection(&e).cursor, TextPosition::new(0, 3));
         e.handle_key(Key::ShiftLeft);
-        assert_eq!(sel(&e).cursor, Pos::new(0, 2));
+        assert_eq!(selection(&e).cursor, TextPosition::new(0, 2));
         e.handle_key(Key::ShiftDown);
-        assert_eq!(sel(&e).cursor, Pos::new(1, 2));
+        assert_eq!(selection(&e).cursor, TextPosition::new(1, 2));
         e.handle_key(Key::ShiftUp);
-        assert_eq!(sel(&e).cursor, Pos::new(0, 2));
+        assert_eq!(selection(&e).cursor, TextPosition::new(0, 2));
     }
 
     // ========================================================================
@@ -5692,7 +5861,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut e = ed(&text);
-        e.set_cursor(Pos::new(25, 0));
+        e.set_cursor(TextPosition::new(25, 0));
         e.handle_key(Key::PageUp);
         assert!(e.cursor().line < 25);
         e.handle_key(Key::PageDown);
@@ -5711,13 +5880,13 @@ mod tests {
         e.handle_key(Key::Up);
         assert_eq!(e.cursor().line, 0);
         e.handle_key(Key::Right);
-        assert_eq!(e.cursor().col, 1);
+        assert_eq!(e.cursor().column, 1);
         e.handle_key(Key::Left);
-        assert_eq!(e.cursor().col, 0);
+        assert_eq!(e.cursor().column, 0);
         e.handle_key(Key::End);
-        assert_eq!(e.cursor().col, 5);
+        assert_eq!(e.cursor().column, 5);
         e.handle_key(Key::Home);
-        assert_eq!(e.cursor().col, 0);
+        assert_eq!(e.cursor().column, 0);
     }
 
     // ========================================================================
@@ -5741,15 +5910,15 @@ mod tests {
         let long_line = "a".repeat(300);
         let text = format!("{}\nshort", long_line);
         let mut e = ed(&text);
-        e.ruler_on = false;
+        e.line_numbers_visible = false;
         // Start scrolled at line 1
-        e.view.scroll_line = 1;
-        e.view.scroll_wrap = 0;
-        e.set_cursor(Pos::new(1, 0));
+        e.viewport.scroll_line = 1;
+        e.viewport.scroll_wrap = 0;
+        e.set_cursor(TextPosition::new(1, 0));
         // Scroll up — should go into line 0's wraps
         e.scroll_up();
-        assert_eq!(e.view.scroll_line, 0);
-        assert!(e.view.scroll_wrap > 0); // should be partway through wraps
+        assert_eq!(e.viewport.scroll_line, 0);
+        assert!(e.viewport.scroll_wrap > 0); // should be partway through wraps
     }
 
     // ========================================================================
@@ -5763,14 +5932,14 @@ mod tests {
         let long_line = "a".repeat(500);
         let text = format!("{}\nend", long_line);
         let mut e = ed(&text);
-        e.ruler_on = false;
-        e.view.scroll_line = 0;
-        e.view.scroll_wrap = 0;
-        e.set_cursor(Pos::new(0, 0));
+        e.line_numbers_visible = false;
+        e.viewport.scroll_line = 0;
+        e.viewport.scroll_wrap = 0;
+        e.set_cursor(TextPosition::new(0, 0));
         e.scroll_down();
         // Should have advanced through wraps within line 0
-        assert_eq!(e.view.scroll_line, 0);
-        assert_eq!(e.view.scroll_wrap, 3); // SCROLL_LINES = 3
+        assert_eq!(e.viewport.scroll_line, 0);
+        assert_eq!(e.viewport.scroll_wrap, 3); // SCROLL_LINES = 3
     }
 
     // ========================================================================
@@ -5782,7 +5951,7 @@ mod tests {
         let mut e = ed("hello");
         e.handle_key(Key::Ctrl('s'));
         // No filename → opens save-as prompt
-        assert!(e.cmd_buf.active);
+        assert!(e.command_buffer.active);
     }
 
     // ========================================================================
@@ -5792,7 +5961,7 @@ mod tests {
     #[test]
     fn test_backspace_key_dispatch() {
         let mut e = ed("ab");
-        e.set_cursor(Pos::new(0, 2));
+        e.set_cursor(TextPosition::new(0, 2));
         e.handle_key(Key::Backspace);
         assert_eq!(e.test_text(), "a");
     }
@@ -5809,7 +5978,7 @@ mod tests {
             crate::command_buffer::CommandBufferResult::Submit("ruler".to_string()),
         );
         // ruler command toggles ruler
-        assert!(!e.ruler_on);
+        assert!(!e.line_numbers_visible);
     }
 
     // ========================================================================
@@ -5821,11 +5990,11 @@ mod tests {
         let mut e = ed("hello");
         e.execute_command("nonexistent_command");
         // Should set status message about unknown command
-        assert!(e.status_msg.contains("Unknown"));
+        assert!(e.status_message.contains("Unknown"));
     }
 
     // ========================================================================
-    // Coverage gap: kill_line on single-line doc (line 731)
+    // Coverage gap: kill_line on single-line document (line 731)
     // ========================================================================
 
     #[test]
@@ -5836,14 +6005,14 @@ mod tests {
     }
 
     // ========================================================================
-    // Coverage gap: draw with status_msg (line 280)
+    // Coverage gap: draw with status_message (line 280)
     // ========================================================================
 
     #[test]
     fn test_draw_with_status_msg() {
         let mut e = ed("hello\nworld");
         e.set_status("Test status".to_string());
-        assert!(!e.status_msg.is_empty());
+        assert!(!e.status_message.is_empty());
         let mut buf = Vec::new();
         let _ = e.draw(&mut buf);
         let output = String::from_utf8_lossy(&buf);
@@ -5858,10 +6027,10 @@ mod tests {
     fn test_center_view_ruler_off() {
         let mut e =
             ed("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\nr\ns\nt\nu\nv\nw\nx\ny\nz");
-        e.ruler_on = false;
+        e.line_numbers_visible = false;
         e.center_view_on_line(20);
         // Cursor should be somewhere near line 20
-        assert!(e.view.scroll_line > 0);
+        assert!(e.viewport.scroll_line > 0);
     }
 
     // ========================================================================
@@ -5872,11 +6041,11 @@ mod tests {
     fn test_find_matching_quote() {
         let mut e = ed("let s = \"hello\";\n");
         // Place cursor on the opening quote
-        e.set_cursor(Pos::new(0, 8));
+        e.set_cursor(TextPosition::new(0, 8));
         let pair = e.find_matching_bracket();
         assert!(pair.is_some());
         let (_, match_pos) = pair.unwrap();
-        assert_eq!(match_pos.col, 14); // closing quote
+        assert_eq!(match_pos.column, 14); // closing quote
     }
 
     // ========================================================================
@@ -5898,7 +6067,7 @@ mod tests {
     #[test]
     fn test_mouse_hold_drag() {
         let mut e = ed("hello world");
-        e.ruler_on = false;
+        e.line_numbers_visible = false;
         // Start a press first so dragging=true
         e.handle_mouse(
             MouseEvent::Press(MouseButton::Left, 1, 1),
@@ -5907,7 +6076,7 @@ mod tests {
         assert!(e.mouse.dragging);
         // Now drag
         e.handle_mouse(MouseEvent::Hold(6, 1), MouseMods::default());
-        assert!(!sel(&e).is_empty());
+        assert!(!selection(&e).is_empty());
     }
 
     // ========================================================================
@@ -5923,31 +6092,31 @@ mod tests {
     }
 
     // ========================================================================
-    // Coverage gap: screen_to_buffer_pos ruler off (line 924)
+    // Coverage gap: screen_to_buffer_position ruler off (line 924)
     // ========================================================================
 
     #[test]
-    fn test_screen_to_buffer_pos_ruler_off() {
+    fn test_screen_to_buffer_position_ruler_off() {
         let mut e = ed("hello\nworld");
-        e.ruler_on = false;
-        let pos = e.screen_to_buffer_pos(1, 1);
-        assert_eq!(pos, Pos::new(0, 0));
-        let pos2 = e.screen_to_buffer_pos(1, 2);
-        assert_eq!(pos2, Pos::new(1, 0));
+        e.line_numbers_visible = false;
+        let pos = e.screen_to_buffer_position(1, 1);
+        assert_eq!(pos, TextPosition::new(0, 0));
+        let pos2 = e.screen_to_buffer_position(1, 2);
+        assert_eq!(pos2, TextPosition::new(1, 0));
     }
 
     // ========================================================================
-    // Coverage gap: screen_to_buffer_pos text_cols=0 (line 928)
+    // Coverage gap: screen_to_buffer_position text_cols=0 (line 928)
     // ========================================================================
 
     #[test]
-    fn test_screen_to_buffer_pos_zero_cols() {
+    fn test_screen_to_buffer_position_zero_cols() {
         let mut e = ed("hello");
-        e.view = crate::view::View::new(1, 3); // very narrow
-        e.ruler_on = true;
+        e.viewport = crate::viewport::Viewport::new(1, 3); // very narrow
+        e.line_numbers_visible = true;
         // With gutter eating all columns, text_cols might be 0
-        let pos = e.screen_to_buffer_pos(1, 1);
-        assert_eq!(pos, Pos::zero());
+        let pos = e.screen_to_buffer_position(1, 1);
+        assert_eq!(pos, TextPosition::zero());
     }
 
     // ========================================================================
@@ -5957,25 +6126,25 @@ mod tests {
     #[test]
     fn test_double_click_selects_word() {
         let mut e = ed("hello world");
-        e.ruler_on = false;
+        e.line_numbers_visible = false;
         // First click
         e.mouse_press(1, 1, MouseMods::default());
         // Simulate double click by setting last_click_time/pos and calling again
         e.mouse_press(1, 1, MouseMods::default());
         // Should select word "hello"
-        assert!(!sel(&e).is_empty());
+        assert!(!selection(&e).is_empty());
     }
 
     #[test]
     fn test_triple_click_selects_line() {
         let mut e = ed("hello world\nsecond");
-        e.ruler_on = false;
+        e.line_numbers_visible = false;
         // Three clicks at the same spot
         e.mouse_press(1, 1, MouseMods::default());
         e.mouse_press(1, 1, MouseMods::default());
         e.mouse_press(1, 1, MouseMods::default());
         // Should select entire first line
-        assert!(!sel(&e).is_empty());
+        assert!(!selection(&e).is_empty());
     }
 
     // ========================================================================
@@ -6002,11 +6171,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut e = ed(&text);
-        e.ruler_on = false;
-        e.view.scroll_line = 20;
-        e.set_cursor(Pos::new(20, 0));
+        e.line_numbers_visible = false;
+        e.viewport.scroll_line = 20;
+        e.set_cursor(TextPosition::new(20, 0));
         e.scroll_up();
-        assert!(e.view.scroll_line < 20);
+        assert!(e.viewport.scroll_line < 20);
     }
 
     #[test]
@@ -6016,10 +6185,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut e = ed(&text);
-        e.ruler_on = false;
-        e.set_cursor(Pos::new(0, 0));
+        e.line_numbers_visible = false;
+        e.set_cursor(TextPosition::new(0, 0));
         e.scroll_down();
-        assert!(e.view.scroll_line > 0);
+        assert!(e.viewport.scroll_line > 0);
     }
 
     // ========================================================================
@@ -6030,12 +6199,12 @@ mod tests {
     fn test_scroll_up_with_wrap() {
         let long_line = "a".repeat(200);
         let mut e = ed(&long_line);
-        e.ruler_on = false;
+        e.line_numbers_visible = false;
         // Set scroll_wrap to simulate being partway through a wrapped line
-        e.view.scroll_wrap = 3;
-        e.set_cursor(Pos::new(0, 0));
+        e.viewport.scroll_wrap = 3;
+        e.set_cursor(TextPosition::new(0, 0));
         e.scroll_up();
-        assert!(e.view.scroll_wrap < 3);
+        assert!(e.viewport.scroll_wrap < 3);
     }
 
     // ========================================================================
@@ -6047,11 +6216,11 @@ mod tests {
         let long_line = "a".repeat(200);
         let text = format!("{}\nshort", long_line);
         let mut e = ed(&text);
-        e.ruler_on = false;
-        e.set_cursor(Pos::new(0, 0));
+        e.line_numbers_visible = false;
+        e.set_cursor(TextPosition::new(0, 0));
         // Scroll down — should advance through wraps of the long line
         e.scroll_down();
-        assert!(e.view.scroll_wrap > 0 || e.view.scroll_line > 0);
+        assert!(e.viewport.scroll_wrap > 0 || e.viewport.scroll_line > 0);
     }
 
     // ========================================================================
@@ -6061,7 +6230,7 @@ mod tests {
     #[test]
     fn test_clamp_cursor_zero_rows() {
         let mut e = ed("hello");
-        e.view = crate::view::View::new(80, 2); // only 2 rows = 0 text rows
+        e.viewport = crate::viewport::Viewport::new(80, 2); // only 2 rows = 0 text rows
         let cursor_before = e.cursor();
         e.clamp_cursor_to_viewport(0, 80);
         // Should return early without changing cursor
@@ -6079,11 +6248,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut e = ed(&text);
-        e.ruler_on = false;
+        e.line_numbers_visible = false;
         // Put cursor far below viewport
-        e.carets.primary_mut().sel.cursor = Pos::new(45, 0);
-        e.carets.primary_mut().sel.anchor = Pos::new(45, 0);
-        e.view.scroll_line = 0;
+        e.carets.primary_mut().selection.cursor = TextPosition::new(45, 0);
+        e.carets.primary_mut().selection.anchor = TextPosition::new(45, 0);
+        e.viewport.scroll_line = 0;
         // Clamp should snap cursor into viewport
         e.clamp_cursor_to_viewport(0, 80);
         assert!(e.cursor().line < 45);
@@ -6096,9 +6265,9 @@ mod tests {
     #[test]
     fn test_move_left_extend_wraps_to_prev_line() {
         let mut e = ed("hello\nworld");
-        e.set_cursor(Pos::new(1, 0));
+        e.set_cursor(TextPosition::new(1, 0));
         e.move_left_extend();
-        assert_eq!(sel(&e).cursor, Pos::new(0, 5));
+        assert_eq!(selection(&e).cursor, TextPosition::new(0, 5));
     }
 
     // ========================================================================
@@ -6108,9 +6277,9 @@ mod tests {
     #[test]
     fn test_move_right_extend_wraps_to_next_line() {
         let mut e = ed("hello\nworld");
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.move_right_extend();
-        assert_eq!(sel(&e).cursor, Pos::new(1, 0));
+        assert_eq!(selection(&e).cursor, TextPosition::new(1, 0));
     }
 
     // ========================================================================
@@ -6120,12 +6289,12 @@ mod tests {
     #[test]
     fn test_indent_selection_skips_trailing_empty_line() {
         let mut e = ed_named("aaa\nbbb\nccc\n", "test.rs");
-        // Select lines 0-2 with cursor at col 0 of line 3 (empty trailing)
+        // Select lines 0-2 with cursor at column 0 of line 3 (empty trailing)
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(3, 0),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(3, 0),
             },
         );
         e.indent_selection();
@@ -6140,16 +6309,16 @@ mod tests {
     #[test]
     fn test_toggle_comment_selection_end_adj() {
         let mut e = ed_named("aaa\nbbb\nccc\n", "test.rs");
-        // Select with cursor at col 0 of a later line
+        // Select with cursor at column 0 of a later line
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(2, 0),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(2, 0),
             },
         );
         e.toggle_comment();
-        // Lines 0-1 should be commented (not line 2 since cursor col=0)
+        // Lines 0-1 should be commented (not line 2 since cursor column=0)
         let text = e.test_text();
         assert!(text.starts_with("// aaa\n// bbb\n"));
     }
@@ -6164,8 +6333,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(2, 3),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(2, 3),
             },
         );
         e.toggle_comment();
@@ -6184,8 +6353,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(2, 3),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(2, 3),
             },
         );
         e.toggle_comment();
@@ -6222,12 +6391,12 @@ mod tests {
     #[test]
     fn test_dedent_selection_end_adj() {
         let mut e = ed_named("  aaa\n  bbb\n  ccc\n", "test.rs");
-        // Select with cursor at col 0 of line 2
+        // Select with cursor at column 0 of line 2
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(2, 0),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(2, 0),
             },
         );
         e.dedent();
@@ -6243,15 +6412,15 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 2),
-                cursor: Pos::new(2, 5),
+                anchor: TextPosition::new(0, 2),
+                cursor: TextPosition::new(2, 5),
             },
         );
         e.dedent();
         assert_eq!(e.test_text(), "aaa\nbbb\nccc");
-        assert!(!sel(&e).is_empty());
-        assert_eq!(sel(&e).anchor, Pos::new(0, 0));
-        assert_eq!(sel(&e).cursor, Pos::new(2, 3));
+        assert!(!selection(&e).is_empty());
+        assert_eq!(selection(&e).anchor, TextPosition::new(0, 0));
+        assert_eq!(selection(&e).cursor, TextPosition::new(2, 3));
     }
 
     // ========================================================================
@@ -6277,7 +6446,10 @@ mod tests {
         let mut e = ed("hello");
         let cmd = format!("save {}", path.to_str().unwrap());
         e.execute_command(&cmd);
-        assert_eq!(e.doc.filename.as_deref(), Some(path.to_str().unwrap()));
+        assert_eq!(
+            e.document.file_path.as_deref(),
+            Some(path.to_str().unwrap())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6322,9 +6494,9 @@ mod tests {
     fn test_save_file_no_name_opens_prompt() {
         let mut e = ed("hello");
         e.save_file();
-        assert!(e.cmd_buf.active);
+        assert!(e.command_buffer.active);
         assert_eq!(
-            e.cmd_buf.mode,
+            e.command_buffer.mode,
             crate::command_buffer::CommandBufferMode::Prompt
         );
     }
@@ -6339,11 +6511,11 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test.txt");
         let mut e = ed("hello world");
-        e.doc.filename = Some(path.to_str().unwrap().to_string());
-        e.doc.dirty = true;
+        e.document.file_path = Some(path.to_str().unwrap().to_string());
+        e.document.is_dirty = true;
         e.save_file();
-        assert!(!e.doc.dirty);
-        assert!(e.status_msg.contains("Saved"));
+        assert!(!e.document.is_dirty);
+        assert!(e.status_message.contains("Saved"));
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents, "hello world\n"); // trailing newline added
         let _ = std::fs::remove_dir_all(&dir);
@@ -6360,7 +6532,7 @@ mod tests {
         let path = dir.join("test.txt");
         std::fs::write(&path, b"hello").unwrap();
         let mut e = ed("hello");
-        e.doc.filename = Some(path.to_str().unwrap().to_string());
+        e.document.file_path = Some(path.to_str().unwrap().to_string());
         e.save_undo_if_named(); // should not panic
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6375,13 +6547,13 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 5),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 5),
             },
         );
         e.handle_key(Key::Ctrl('f'));
-        assert!(e.cmd_buf.active);
-        assert_eq!(e.cmd_buf.input, "hello");
+        assert!(e.command_buffer.active);
+        assert_eq!(e.command_buffer.input, "hello");
     }
 
     // ========================================================================
@@ -6391,13 +6563,13 @@ mod tests {
     #[test]
     fn test_command_completion_common_prefix() {
         let mut e = ed("hello");
-        e.cmd_buf
+        e.command_buffer
             .open(crate::command_buffer::CommandBufferMode::Command, "> ", "");
-        e.cmd_buf.input = "go".to_string();
-        e.cmd_buf.cursor = 2;
+        e.command_buffer.input = "go".to_string();
+        e.command_buffer.cursor = 2;
         // Request tab completion — should find "goto" and complete the common prefix
-        let result = e.cmd_buf.handle_key(Key::Char('\t'));
-        let mode = e.cmd_buf.mode;
+        let result = e.command_buffer.handle_key(Key::Char('\t'));
+        let mode = e.command_buffer.mode;
         e.handle_cmd_result(mode, result);
         // "goto" and "gotoline" both start with "goto"
         // Depending on commands available, this should complete to at least "goto"
@@ -6415,7 +6587,7 @@ mod tests {
         std::fs::write(&path, b"original").unwrap();
 
         let mut e = ed_named("original", path.to_str().unwrap());
-        e.file_mtime = crate::file_io::file_mtime(&path);
+        e.file_modification_time = crate::file_io::file_modification_time(&path);
         assert!(!e.reload_pending);
 
         // Modify file externally
@@ -6424,7 +6596,7 @@ mod tests {
 
         e.check_external_modification();
         assert!(e.reload_pending);
-        assert!(e.status_msg.contains("changed on disk"));
+        assert!(e.status_message.contains("changed on disk"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6437,7 +6609,7 @@ mod tests {
         std::fs::write(&path, b"original\n").unwrap();
 
         let mut e = ed_named("original\n", path.to_str().unwrap());
-        e.file_mtime = crate::file_io::file_mtime(&path);
+        e.file_modification_time = crate::file_io::file_modification_time(&path);
 
         // Modify file externally
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -6447,7 +6619,7 @@ mod tests {
         e.reload_file();
         assert!(!e.reload_pending);
         assert!(e.test_text().contains("new content"));
-        assert!(e.status_msg.contains("Reloaded"));
+        assert!(e.status_message.contains("Reloaded"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6460,19 +6632,19 @@ mod tests {
         std::fs::write(&path, b"original").unwrap();
         let mut e = ed_named("original", path.to_str().unwrap());
 
-        e.file_mtime = crate::file_io::file_mtime(&path);
+        e.file_modification_time = crate::file_io::file_modification_time(&path);
 
         // Modify file externally
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(&path, b"changed").unwrap();
-        let new_mtime = crate::file_io::file_mtime(&path);
+        let new_mtime = crate::file_io::file_modification_time(&path);
 
         e.reload_pending = true;
-        e.status_msg = "test.txt changed on disk. Reload? (y/n)".to_string();
+        e.status_message = "test.txt changed on disk. Reload? (y/n)".to_string();
         e.dismiss_reload();
         assert!(!e.reload_pending);
-        assert!(e.status_msg.is_empty());
-        assert_eq!(e.file_mtime, new_mtime);
+        assert!(e.status_message.is_empty());
+        assert_eq!(e.file_modification_time, new_mtime);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6485,9 +6657,9 @@ mod tests {
         std::fs::write(&path, b"line1\nline2\nline3\n").unwrap();
 
         let mut e = ed_named("line1\nline2\nline3\n", path.to_str().unwrap());
-        e.file_mtime = crate::file_io::file_mtime(&path);
+        e.file_modification_time = crate::file_io::file_modification_time(&path);
         // Put cursor on line 2
-        set_sel(&mut e, Selection::caret(Pos::new(2, 3)));
+        set_sel(&mut e, Selection::caret(TextPosition::new(2, 3)));
 
         // Replace with shorter file
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -6496,7 +6668,7 @@ mod tests {
         e.reload_pending = true;
         e.reload_file();
         // Cursor should be clamped to last line
-        assert!(sel(&e).cursor.line < e.doc.buf.line_count());
+        assert!(selection(&e).cursor.line < e.document.buffer.line_count());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6506,7 +6678,7 @@ mod tests {
         let mut e = ed("hello");
         e.check_external_modification();
         assert!(!e.reload_pending);
-        assert!(e.status_msg.is_empty());
+        assert!(e.status_message.is_empty());
     }
 
     #[test]
@@ -6517,7 +6689,7 @@ mod tests {
         std::fs::write(&path, b"original").unwrap();
 
         let mut e = ed_named("original", path.to_str().unwrap());
-        e.file_mtime = crate::file_io::file_mtime(&path);
+        e.file_modification_time = crate::file_io::file_modification_time(&path);
 
         // Modify file externally
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -6538,10 +6710,10 @@ mod tests {
         std::fs::write(&path, b"hello\n").unwrap();
 
         let mut e = ed_named("hello\n", path.to_str().unwrap());
-        assert!(e.file_mtime.is_none()); // ed_named doesn't set mtime
+        assert!(e.file_modification_time.is_none()); // ed_named doesn't set mtime
 
         e.save_file();
-        assert!(e.file_mtime.is_some());
+        assert!(e.file_modification_time.is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6553,40 +6725,40 @@ mod tests {
     #[test]
     fn test_word_left_middle_of_line() {
         let mut e = ed("hello world foo");
-        e.set_cursor(Pos::new(0, 15));
+        e.set_cursor(TextPosition::new(0, 15));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 12));
+        assert_eq!(e.cursor(), TextPosition::new(0, 12));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 6));
+        assert_eq!(e.cursor(), TextPosition::new(0, 6));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
     }
 
     #[test]
     fn test_word_right_middle_of_line() {
         let mut e = ed("hello world foo");
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 6));
+        assert_eq!(e.cursor(), TextPosition::new(0, 6));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 12));
+        assert_eq!(e.cursor(), TextPosition::new(0, 12));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 15));
+        assert_eq!(e.cursor(), TextPosition::new(0, 15));
     }
 
     #[test]
     fn test_word_left_wraps_to_prev_line() {
         let mut e = ed("hello\nworld");
-        e.set_cursor(Pos::new(1, 0));
+        e.set_cursor(TextPosition::new(1, 0));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 5));
+        assert_eq!(e.cursor(), TextPosition::new(0, 5));
     }
 
     #[test]
     fn test_word_right_wraps_to_next_line() {
         let mut e = ed("hello\nworld");
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(1, 0));
+        assert_eq!(e.cursor(), TextPosition::new(1, 0));
     }
 
     #[test]
@@ -6595,13 +6767,13 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 2),
-                cursor: Pos::new(0, 8),
+                anchor: TextPosition::new(0, 2),
+                cursor: TextPosition::new(0, 8),
             },
         );
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 2));
-        assert!(sel(&e).is_empty());
+        assert_eq!(e.cursor(), TextPosition::new(0, 2));
+        assert!(selection(&e).is_empty());
     }
 
     #[test]
@@ -6610,39 +6782,39 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 2),
-                cursor: Pos::new(0, 8),
+                anchor: TextPosition::new(0, 2),
+                cursor: TextPosition::new(0, 8),
             },
         );
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 8));
-        assert!(sel(&e).is_empty());
+        assert_eq!(e.cursor(), TextPosition::new(0, 8));
+        assert!(selection(&e).is_empty());
     }
 
     #[test]
     fn test_word_left_at_origin() {
         let mut e = ed("hello");
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
     }
 
     #[test]
     fn test_word_right_at_end() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 5));
+        assert_eq!(e.cursor(), TextPosition::new(0, 5));
     }
 
     #[test]
     fn test_word_left_skips_punctuation() {
         // "foo.bar" at end: skip "bar", skip ".", skip "foo" -> 0
         let mut e = ed("foo.bar");
-        e.set_cursor(Pos::new(0, 7));
+        e.set_cursor(TextPosition::new(0, 7));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 4));
+        assert_eq!(e.cursor(), TextPosition::new(0, 4));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
     }
 
     #[test]
@@ -6650,100 +6822,100 @@ mod tests {
         // "foo.bar" from 0: skip "foo" to 3, skip "." to 4
         let mut e = ed("foo.bar");
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 4));
+        assert_eq!(e.cursor(), TextPosition::new(0, 4));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 7));
+        assert_eq!(e.cursor(), TextPosition::new(0, 7));
     }
 
     #[test]
     fn test_word_left_multiple_spaces() {
         let mut e = ed("foo   bar");
-        e.set_cursor(Pos::new(0, 9));
+        e.set_cursor(TextPosition::new(0, 9));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 6));
+        assert_eq!(e.cursor(), TextPosition::new(0, 6));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
     }
 
     #[test]
     fn test_word_right_multiple_spaces() {
         let mut e = ed("foo   bar");
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 6));
+        assert_eq!(e.cursor(), TextPosition::new(0, 6));
     }
 
     #[test]
     fn test_word_left_empty_line() {
         let mut e = ed("hello\n\nworld");
-        e.set_cursor(Pos::new(2, 0));
+        e.set_cursor(TextPosition::new(2, 0));
         e.word_left();
         // wraps to end of empty line 1
-        assert_eq!(e.cursor(), Pos::new(1, 0));
+        assert_eq!(e.cursor(), TextPosition::new(1, 0));
         e.word_left();
         // wraps to end of line 0
-        assert_eq!(e.cursor(), Pos::new(0, 5));
+        assert_eq!(e.cursor(), TextPosition::new(0, 5));
     }
 
     #[test]
     fn test_word_right_empty_line() {
         let mut e = ed("hello\n\nworld");
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(1, 0));
+        assert_eq!(e.cursor(), TextPosition::new(1, 0));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(2, 0));
+        assert_eq!(e.cursor(), TextPosition::new(2, 0));
     }
 
     #[test]
     fn test_word_left_from_middle_of_word() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 3));
+        e.set_cursor(TextPosition::new(0, 3));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
     }
 
     #[test]
     fn test_word_right_from_middle_of_word() {
-        // "hello world" from col 3: skip "lo" to 5, skip " " to 6
+        // "hello world" from column 3: skip "lo" to 5, skip " " to 6
         let mut e = ed("hello world");
-        e.set_cursor(Pos::new(0, 3));
+        e.set_cursor(TextPosition::new(0, 3));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 6));
+        assert_eq!(e.cursor(), TextPosition::new(0, 6));
     }
 
     #[test]
     fn test_word_left_underscores() {
         // underscores are word chars
         let mut e = ed("foo_bar baz");
-        e.set_cursor(Pos::new(0, 11));
+        e.set_cursor(TextPosition::new(0, 11));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 8));
+        assert_eq!(e.cursor(), TextPosition::new(0, 8));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 0)); // foo_bar is one word
+        assert_eq!(e.cursor(), TextPosition::new(0, 0)); // foo_bar is one word
     }
 
     #[test]
     fn test_word_right_underscores() {
         let mut e = ed("foo_bar baz");
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 8)); // skips whole foo_bar + space
+        assert_eq!(e.cursor(), TextPosition::new(0, 8)); // skips whole foo_bar + space
     }
 
     #[test]
     fn test_word_left_at_last_line_end() {
         let mut e = ed("one\ntwo");
-        e.set_cursor(Pos::new(1, 3));
+        e.set_cursor(TextPosition::new(1, 3));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(1, 0));
+        assert_eq!(e.cursor(), TextPosition::new(1, 0));
     }
 
     #[test]
     fn test_word_right_at_last_line_end() {
         // at end of last line, no next line, stays put
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 5));
+        assert_eq!(e.cursor(), TextPosition::new(0, 5));
     }
 
     #[test]
@@ -6751,16 +6923,16 @@ mod tests {
         // word_right then word_left should return near starting region
         let mut e = ed("  fn main() {");
         e.word_right();
-        // from col 0: skip word chars (none), skip non-word ("  ") -> lands at 2
-        assert_eq!(e.cursor(), Pos::new(0, 2));
+        // from column 0: skip word chars (none), skip non-word ("  ") -> lands at 2
+        assert_eq!(e.cursor(), TextPosition::new(0, 2));
         e.word_right();
-        // from col 2: skip word chars ("fn") to 4, skip non-word (" ") to 5
-        assert_eq!(e.cursor(), Pos::new(0, 5));
+        // from column 2: skip word chars ("fn") to 4, skip non-word (" ") to 5
+        assert_eq!(e.cursor(), TextPosition::new(0, 5));
         e.word_left();
-        // from col 5: skip non-word (" ") to 4, skip word ("fn") to 2
-        assert_eq!(e.cursor(), Pos::new(0, 2));
+        // from column 5: skip non-word (" ") to 4, skip word ("fn") to 2
+        assert_eq!(e.cursor(), TextPosition::new(0, 2));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 0));
+        assert_eq!(e.cursor(), TextPosition::new(0, 0));
     }
 
     // ========================================================================
@@ -6770,80 +6942,80 @@ mod tests {
     #[test]
     fn test_word_right_jumps_to_matching_bracket() {
         let mut e = ed("fn foo() { bar }");
-        // Cursor on '(' at col 6 → should jump to ')' at col 7
-        e.set_cursor(Pos::new(0, 6));
+        // Cursor on '(' at column 6 → should jump to ')' at column 7
+        e.set_cursor(TextPosition::new(0, 6));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 7));
+        assert_eq!(e.cursor(), TextPosition::new(0, 7));
     }
 
     #[test]
     fn test_word_left_jumps_to_matching_bracket() {
         let mut e = ed("fn foo() { bar }");
-        // Cursor on ')' at col 7 → should jump to '(' at col 6
-        e.set_cursor(Pos::new(0, 7));
+        // Cursor on ')' at column 7 → should jump to '(' at column 6
+        e.set_cursor(TextPosition::new(0, 7));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 6));
+        assert_eq!(e.cursor(), TextPosition::new(0, 6));
     }
 
     #[test]
     fn test_bracket_jump_multiline() {
         let mut e = ed("if x {\n  y\n}");
-        // Cursor on '{' at line 0 col 5 → should jump to '}' at line 2 col 0
-        e.set_cursor(Pos::new(0, 5));
+        // Cursor on '{' at line 0 column 5 → should jump to '}' at line 2 column 0
+        e.set_cursor(TextPosition::new(0, 5));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(2, 0));
+        assert_eq!(e.cursor(), TextPosition::new(2, 0));
         // And back
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 5));
+        assert_eq!(e.cursor(), TextPosition::new(0, 5));
     }
 
     #[test]
     fn test_bracket_jump_nested() {
         let mut e = ed("((inner))");
-        // Cursor on outer '(' at col 0 → should jump to outer ')' at col 8
-        e.set_cursor(Pos::new(0, 0));
+        // Cursor on outer '(' at column 0 → should jump to outer ')' at column 8
+        e.set_cursor(TextPosition::new(0, 0));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 8));
-        // Cursor on inner '(' at col 1 → should jump to inner ')' at col 7
-        e.set_cursor(Pos::new(0, 1));
+        assert_eq!(e.cursor(), TextPosition::new(0, 8));
+        // Cursor on inner '(' at column 1 → should jump to inner ')' at column 7
+        e.set_cursor(TextPosition::new(0, 1));
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 7));
+        assert_eq!(e.cursor(), TextPosition::new(0, 7));
     }
 
     #[test]
     fn test_bracket_jump_square() {
         let mut e = ed("a[b[c]]");
-        e.set_cursor(Pos::new(0, 1));
+        e.set_cursor(TextPosition::new(0, 1));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 6)); // outer ]
+        assert_eq!(e.cursor(), TextPosition::new(0, 6)); // outer ]
     }
 
     #[test]
     fn test_bracket_jump_extend_selection() {
         let mut e = ed("fn foo() {}");
-        e.set_cursor(Pos::new(0, 6)); // on '('
+        e.set_cursor(TextPosition::new(0, 6)); // on '('
         e.word_right_extend();
-        assert_eq!(sel(&e).cursor, Pos::new(0, 7)); // extends to ')'
-        assert_eq!(sel(&e).anchor, Pos::new(0, 6)); // anchor stays
+        assert_eq!(selection(&e).cursor, TextPosition::new(0, 7)); // extends to ')'
+        assert_eq!(selection(&e).anchor, TextPosition::new(0, 6)); // anchor stays
     }
 
     #[test]
     fn test_non_bracket_does_normal_word_jump() {
         // When not on a bracket, normal word movement should still work
         let mut e = ed("hello world");
-        e.set_cursor(Pos::new(0, 0));
+        e.set_cursor(TextPosition::new(0, 0));
         e.word_right();
-        assert_eq!(e.cursor(), Pos::new(0, 6)); // normal word jump
+        assert_eq!(e.cursor(), TextPosition::new(0, 6)); // normal word jump
     }
 
     #[test]
     fn test_word_left_selection_collapses_before_bracket_check() {
         // With a selection, word_left should collapse the selection, not bracket-jump
         let mut e = ed("(hello)");
-        e.set_cursor(Pos::new(0, 0)); // on '('
-        e.carets.primary_mut().sel.cursor = Pos::new(0, 5); // select "hello"
+        e.set_cursor(TextPosition::new(0, 0)); // on '('
+        e.carets.primary_mut().selection.cursor = TextPosition::new(0, 5); // select "hello"
         e.word_left();
-        assert_eq!(e.cursor(), Pos::new(0, 0)); // collapsed to start
+        assert_eq!(e.cursor(), TextPosition::new(0, 0)); // collapsed to start
     }
 
     // ========================================================================
@@ -6855,7 +7027,7 @@ mod tests {
         let mut e = ed("");
         e.insert_char('(');
         assert_eq!(e.test_text(), "()");
-        assert_eq!(e.cursor(), Pos::new(0, 1)); // between parens
+        assert_eq!(e.cursor(), TextPosition::new(0, 1)); // between parens
     }
 
     #[test]
@@ -6863,7 +7035,7 @@ mod tests {
         let mut e = ed("");
         e.insert_char('[');
         assert_eq!(e.test_text(), "[]");
-        assert_eq!(e.cursor(), Pos::new(0, 1));
+        assert_eq!(e.cursor(), TextPosition::new(0, 1));
     }
 
     #[test]
@@ -6871,7 +7043,7 @@ mod tests {
         let mut e = ed("");
         e.insert_char('{');
         assert_eq!(e.test_text(), "{}");
-        assert_eq!(e.cursor(), Pos::new(0, 1));
+        assert_eq!(e.cursor(), TextPosition::new(0, 1));
     }
 
     #[test]
@@ -6879,7 +7051,7 @@ mod tests {
         let mut e = ed("");
         e.insert_char('"');
         assert_eq!(e.test_text(), "\"\"");
-        assert_eq!(e.cursor(), Pos::new(0, 1));
+        assert_eq!(e.cursor(), TextPosition::new(0, 1));
     }
 
     #[test]
@@ -6888,7 +7060,7 @@ mod tests {
         let mut e = ed("");
         e.insert_char('\'');
         assert_eq!(e.test_text(), "'");
-        assert_eq!(e.cursor(), Pos::new(0, 1));
+        assert_eq!(e.cursor(), TextPosition::new(0, 1));
     }
 
     #[test]
@@ -6897,7 +7069,7 @@ mod tests {
         let mut e = ed_named("", "/tmp/test.rs");
         e.insert_char('\'');
         assert_eq!(e.test_text(), "''");
-        assert_eq!(e.cursor(), Pos::new(0, 1));
+        assert_eq!(e.cursor(), TextPosition::new(0, 1));
     }
 
     #[test]
@@ -6905,10 +7077,10 @@ mod tests {
         let mut e = ed("");
         e.insert_char('(');
         assert_eq!(e.test_text(), "()");
-        assert_eq!(e.cursor(), Pos::new(0, 1));
+        assert_eq!(e.cursor(), TextPosition::new(0, 1));
         e.insert_char(')'); // should skip over the closing paren
         assert_eq!(e.test_text(), "()");
-        assert_eq!(e.cursor(), Pos::new(0, 2));
+        assert_eq!(e.cursor(), TextPosition::new(0, 2));
     }
 
     #[test]
@@ -6917,7 +7089,7 @@ mod tests {
         e.insert_char('[');
         e.insert_char(']');
         assert_eq!(e.test_text(), "[]");
-        assert_eq!(e.cursor(), Pos::new(0, 2));
+        assert_eq!(e.cursor(), TextPosition::new(0, 2));
     }
 
     #[test]
@@ -6926,7 +7098,7 @@ mod tests {
         e.insert_char('{');
         e.insert_char('}');
         assert_eq!(e.test_text(), "{}");
-        assert_eq!(e.cursor(), Pos::new(0, 2));
+        assert_eq!(e.cursor(), TextPosition::new(0, 2));
     }
 
     #[test]
@@ -6935,7 +7107,7 @@ mod tests {
         e.insert_char('"');
         e.insert_char('"');
         assert_eq!(e.test_text(), "\"\"");
-        assert_eq!(e.cursor(), Pos::new(0, 2));
+        assert_eq!(e.cursor(), TextPosition::new(0, 2));
     }
 
     #[test]
@@ -6944,7 +7116,7 @@ mod tests {
         e.insert_char('\'');
         e.insert_char('\'');
         assert_eq!(e.test_text(), "''");
-        assert_eq!(e.cursor(), Pos::new(0, 2));
+        assert_eq!(e.cursor(), TextPosition::new(0, 2));
     }
 
     #[test]
@@ -6959,7 +7131,7 @@ mod tests {
         let mut e = ed(" hello");
         e.insert_char('(');
         assert_eq!(e.test_text(), "() hello");
-        assert_eq!(e.cursor(), Pos::new(0, 1));
+        assert_eq!(e.cursor(), TextPosition::new(0, 1));
     }
 
     #[test]
@@ -6967,7 +7139,7 @@ mod tests {
         let mut e = ed(")");
         e.insert_char('(');
         assert_eq!(e.test_text(), "())");
-        assert_eq!(e.cursor(), Pos::new(0, 1));
+        assert_eq!(e.cursor(), TextPosition::new(0, 1));
     }
 
     #[test]
@@ -7016,7 +7188,7 @@ mod tests {
         let mut e = ed("");
         e.insert_char('`');
         assert_eq!(e.test_text(), "``");
-        assert_eq!(e.cursor(), Pos::new(0, 1));
+        assert_eq!(e.cursor(), TextPosition::new(0, 1));
     }
 
     #[test]
@@ -7025,7 +7197,7 @@ mod tests {
         e.insert_char('`');
         e.insert_char('`');
         assert_eq!(e.test_text(), "``");
-        assert_eq!(e.cursor(), Pos::new(0, 2));
+        assert_eq!(e.cursor(), TextPosition::new(0, 2));
     }
 
     #[test]
@@ -7040,7 +7212,7 @@ mod tests {
     fn test_autoclose_backspace_only_deletes_pair_when_matched() {
         // "(x" with cursor at 1 — next char is 'x' not ')', so only delete '('
         let mut e = ed("(x");
-        e.set_cursor(Pos::new(0, 1));
+        e.set_cursor(TextPosition::new(0, 1));
         e.backspace();
         assert_eq!(e.test_text(), "x");
     }
@@ -7051,16 +7223,16 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 5),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 5),
             },
         );
         e.insert_char('(');
         assert_eq!(e.test_text(), "(hello)");
         // Inner text should be selected
-        let (s, end) = sel(&e).ordered();
-        assert_eq!(s, Pos::new(0, 1));
-        assert_eq!(end, Pos::new(0, 6));
+        let (s, end) = selection(&e).ordered();
+        assert_eq!(s, TextPosition::new(0, 1));
+        assert_eq!(end, TextPosition::new(0, 6));
     }
 
     #[test]
@@ -7069,8 +7241,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 5),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 5),
             },
         );
         e.insert_char('[');
@@ -7083,8 +7255,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 3),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 3),
             },
         );
         e.insert_char('{');
@@ -7097,8 +7269,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 4),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 4),
             },
         );
         e.insert_char('"');
@@ -7112,8 +7284,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 4),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 4),
             },
         );
         e.insert_char('\'');
@@ -7127,8 +7299,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 4),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 4),
             },
         );
         e.insert_char('\'');
@@ -7141,8 +7313,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 6),
-                cursor: Pos::new(0, 11),
+                anchor: TextPosition::new(0, 6),
+                cursor: TextPosition::new(0, 11),
             },
         );
         e.insert_char('(');
@@ -7155,8 +7327,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(1, 3),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(1, 3),
             },
         );
         e.insert_char('{');
@@ -7170,8 +7342,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 0),
-                cursor: Pos::new(0, 5),
+                anchor: TextPosition::new(0, 0),
+                cursor: TextPosition::new(0, 5),
             },
         );
         e.insert_char('x');
@@ -7184,7 +7356,7 @@ mod tests {
         e.insert_char('(');
         e.insert_char('x');
         assert_eq!(e.test_text(), "(x)");
-        assert_eq!(e.cursor(), Pos::new(0, 2));
+        assert_eq!(e.cursor(), TextPosition::new(0, 2));
     }
 
     #[test]
@@ -7193,22 +7365,22 @@ mod tests {
         e.insert_char('(');
         e.insert_char('[');
         assert_eq!(e.test_text(), "([])");
-        assert_eq!(e.cursor(), Pos::new(0, 2));
+        assert_eq!(e.cursor(), TextPosition::new(0, 2));
         e.insert_char(']');
         assert_eq!(e.test_text(), "([])");
-        assert_eq!(e.cursor(), Pos::new(0, 3));
+        assert_eq!(e.cursor(), TextPosition::new(0, 3));
         e.insert_char(')');
         assert_eq!(e.test_text(), "([])");
-        assert_eq!(e.cursor(), Pos::new(0, 4));
+        assert_eq!(e.cursor(), TextPosition::new(0, 4));
     }
 
     #[test]
     fn test_autoclose_at_end_of_line() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.insert_char('(');
         assert_eq!(e.test_text(), "hello()");
-        assert_eq!(e.cursor(), Pos::new(0, 6));
+        assert_eq!(e.cursor(), TextPosition::new(0, 6));
     }
 
     #[test]
@@ -7225,8 +7397,8 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 5),
-                cursor: Pos::new(0, 0),
+                anchor: TextPosition::new(0, 5),
+                cursor: TextPosition::new(0, 0),
             },
         );
         e.insert_char('(');
@@ -7242,7 +7414,7 @@ mod tests {
         // Blank line with auto-indent is cleared before paste; pasted text's own
         // indentation is used as-is (indentation is a copy-time property).
         let mut e = ed("    fn main() {\n        ");
-        e.set_cursor(Pos::new(1, 8));
+        e.set_cursor(TextPosition::new(1, 8));
         e.paste_text("if true {\n    println!(\"hi\");\n}");
         assert_eq!(
             e.test_text(),
@@ -7253,16 +7425,16 @@ mod tests {
     #[test]
     fn test_smart_paste_single_line_no_change() {
         let mut e = ed("    ");
-        e.set_cursor(Pos::new(0, 4));
+        e.set_cursor(TextPosition::new(0, 4));
         e.paste_text("hello");
         assert_eq!(e.test_text(), "    hello");
     }
 
     #[test]
     fn test_smart_paste_blank_line_cleared() {
-        // Blank line with 2-space auto-indent is cleared; paste goes at col 0.
+        // Blank line with 2-space auto-indent is cleared; paste goes at column 0.
         let mut e = ed("  ");
-        e.set_cursor(Pos::new(0, 2));
+        e.set_cursor(TextPosition::new(0, 2));
         e.paste_text("a\n  b\n  c");
         assert_eq!(e.test_text(), "a\n  b\n  c");
     }
@@ -7271,7 +7443,7 @@ mod tests {
     fn test_smart_paste_preserves_relative_indent() {
         // Blank line cleared; pasted text's internal structure is preserved.
         let mut e = ed("    ");
-        e.set_cursor(Pos::new(0, 4));
+        e.set_cursor(TextPosition::new(0, 4));
         e.paste_text("if true {\n  nested\n}");
         assert_eq!(e.test_text(), "if true {\n  nested\n}");
     }
@@ -7279,7 +7451,7 @@ mod tests {
     #[test]
     fn test_smart_paste_empty_lines_preserved() {
         let mut e = ed("    ");
-        e.set_cursor(Pos::new(0, 4));
+        e.set_cursor(TextPosition::new(0, 4));
         e.paste_text("a\n\nb");
         // Blank line cleared; empty lines in paste preserved as-is.
         assert_eq!(e.test_text(), "a\n\nb");
@@ -7287,7 +7459,7 @@ mod tests {
 
     #[test]
     fn test_smart_paste_zero_indent_no_change() {
-        // Pasting at col 0 with text that has 0 indent — no change
+        // Pasting at column 0 with text that has 0 indent — no change
         let mut e = ed("");
         e.paste_text("a\nb\nc");
         assert_eq!(e.test_text(), "a\nb\nc");
@@ -7299,13 +7471,13 @@ mod tests {
         set_sel(
             &mut e,
             Selection {
-                anchor: Pos::new(0, 4),
-                cursor: Pos::new(0, 13),
+                anchor: TextPosition::new(0, 4),
+                cursor: TextPosition::new(0, 13),
             },
         );
         e.paste_text("new\n    thing");
         // After deleting "old stuff" the line becomes blank ("    "), which is
-        // cleared; paste goes at col 0 with its own indentation.
+        // cleared; paste goes at column 0 with its own indentation.
         assert_eq!(e.test_text(), "new\n    thing\n    more old");
     }
 
@@ -7314,23 +7486,23 @@ mod tests {
         let mut e = ed("");
         e.paste_text("hello\nworld");
         // Cursor should be at end of pasted text
-        assert_eq!(e.cursor(), Pos::new(1, 5));
+        assert_eq!(e.cursor(), TextPosition::new(1, 5));
     }
 
     #[test]
     fn test_smart_paste_empty_string() {
         let mut e = ed("hello");
-        e.set_cursor(Pos::new(0, 5));
+        e.set_cursor(TextPosition::new(0, 5));
         e.paste_text("");
         assert_eq!(e.test_text(), "hello");
-        assert_eq!(e.cursor(), Pos::new(0, 5));
+        assert_eq!(e.cursor(), TextPosition::new(0, 5));
     }
 
     #[test]
     fn test_smart_paste_all_empty_continuation_lines() {
         // Blank line cleared; trailing empty lines in paste preserved as-is.
         let mut e = ed("    ");
-        e.set_cursor(Pos::new(0, 4));
+        e.set_cursor(TextPosition::new(0, 4));
         e.paste_text("a\n\n\n");
         assert_eq!(e.test_text(), "a\n\n\n");
     }
@@ -7339,7 +7511,7 @@ mod tests {
     fn test_smart_paste_tabs_in_pasted_text() {
         // Blank line cleared; paste with tab indentation used as-is.
         let mut e = ed("  ");
-        e.set_cursor(Pos::new(0, 2));
+        e.set_cursor(TextPosition::new(0, 2));
         e.paste_text("a\n\tb");
         assert_eq!(e.test_text(), "a\n\tb");
     }
@@ -7348,7 +7520,7 @@ mod tests {
     fn test_smart_paste_yaml_structure_preserved() {
         // YAML block pasted on a blank line: auto-indent cleared, structure intact.
         let mut e = ed("  ");
-        e.set_cursor(Pos::new(0, 2));
+        e.set_cursor(TextPosition::new(0, 2));
         e.paste_text("root:\n  child:\n    grandchild: value");
         assert_eq!(e.test_text(), "root:\n  child:\n    grandchild: value");
     }
@@ -7364,11 +7536,11 @@ mod tests {
     #[test]
     fn test_smart_paste_non_blank_line_uses_cursor_col() {
         // Pasting on a non-blank line (mid-content): continuation lines are
-        // shifted to cursor.col + their original indent.
+        // shifted to cursor.column + their original indent.
         let mut e = ed("    prefix");
-        e.set_cursor(Pos::new(0, 10));
+        e.set_cursor(TextPosition::new(0, 10));
         e.paste_text("key:\n  val");
-        // cursor col = 10, "  val" has ik=2 → new_indent = 10+2 = 12
+        // cursor column = 10, "  val" has ik=2 → new_indent = 10+2 = 12
         assert_eq!(e.test_text(), "    prefixkey:\n            val");
     }
 }

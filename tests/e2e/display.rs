@@ -84,7 +84,7 @@ fn trailing_whitespace_not_highlighted() {
     // Trailing spaces on a line with content — should NOT be highlighted
     let path = create_file(dir.path(), "test.txt", "hello   \n");
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
-    // Gutter is "1 " = 2 chars. Trailing space is at col 7 (2+5)
+    // Gutter is "1 " = 2 chars. Trailing space is at column 7 (2+5)
     let bg = e.cell_bg(0, 7);
     assert_eq!(
         bg,
@@ -158,8 +158,8 @@ fn bracket_matching() {
     let dir = TempDir::new();
     let path = create_file(dir.path(), "test.txt", "(hello)\n");
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
-    // Cursor on '(' at col 2 (gutter=2)
-    // The matching ')' at col 8 should have magenta background
+    // Cursor on '(' at column 2 (gutter=2)
+    // The matching ')' at column 8 should have magenta background
     let bg_close = e.cell_bg(0, 8); // ')' position
     // Magenta = Idx(5)
     assert_eq!(
@@ -180,10 +180,10 @@ fn bracket_matching() {
 #[test]
 fn quote_match_only_highlights_match() {
     let dir = TempDir::new();
-    // Cursor starts on the opening '"' at screen col 2 (gutter=2)
+    // Cursor starts on the opening '"' at screen column 2 (gutter=2)
     let path = create_file(dir.path(), "test.txt", "\"hello\"\n");
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
-    // Closing '"' is at buffer col 6, screen col 8
+    // Closing '"' is at buffer column 6, screen column 8
     let bg_close = e.cell_bg(0, 8);
     assert_eq!(
         bg_close,
@@ -230,7 +230,7 @@ fn markdown_highlighting() {
         "should detect Markdown, got: {sb}"
     );
     // Header should be keyword-colored (yellow)
-    // Gutter for 3 lines = "1 " (2 chars), "#" at col 2
+    // Gutter for 3 lines = "1 " (2 chars), "#" at column 2
     let fg = e.cell_fg(0, 2);
     assert_eq!(
         fg,

@@ -20,8 +20,8 @@ use e::document::Document;
 use e::find::FindState;
 use e::highlight::{self, SyntaxRules};
 use e::render::Renderer;
-use e::selection::{Pos, Selection};
-use e::view::View;
+use e::selection::{Selection, TextPosition};
+use e::viewport::Viewport;
 
 #[cfg(target_os = "linux")]
 const TRACE_BEGIN: &CStr = c"BENCH_BEGIN";
@@ -85,49 +85,49 @@ impl Drop for BenchDir {
 }
 
 fn make_rust_source(n: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(n * 40);
+    let mut buffer = Vec::with_capacity(n * 40);
     for i in 0..n {
         match i % 5 {
-            0 => buf.extend_from_slice(b"    fn example_function(x: usize) -> bool {\n"),
-            1 => buf.extend_from_slice(b"        let result = x * 2 + 1; // compute\n"),
-            2 => buf.extend_from_slice(b"        if result > 100 { return false; }\n"),
-            3 => buf.extend_from_slice(b"        println!(\"value: {}\", result);\n"),
-            _ => buf.extend_from_slice(b"    }\n"),
+            0 => buffer.extend_from_slice(b"    fn example_function(x: usize) -> bool {\n"),
+            1 => buffer.extend_from_slice(b"        let result = x * 2 + 1; // compute\n"),
+            2 => buffer.extend_from_slice(b"        if result > 100 { return false; }\n"),
+            3 => buffer.extend_from_slice(b"        println!(\"value: {}\", result);\n"),
+            _ => buffer.extend_from_slice(b"    }\n"),
         }
     }
-    buf
+    buffer
 }
 
-fn append_python_line(buf: &mut Vec<u8>, index: usize) {
+fn append_python_line(buffer: &mut Vec<u8>, index: usize) {
     match index % 5 {
-        0 => buf.extend_from_slice(
+        0 => buffer.extend_from_slice(
             format!(
                 "benchmark_token_{index:05}: dict[str, int | bool] = {{\"value\": {index}, \"scaled\": {index} * 3, \"even\": {index} % 2 == 0}}\n"
             )
             .as_bytes(),
         ),
-        1 => buf.extend_from_slice(
+        1 => buffer.extend_from_slice(
             format!(
                 "benchmark_token_{index:05}_list = [value * 2 for value in range({}) if value >= 0]\n",
                 index % 7
             )
             .as_bytes(),
         ),
-        2 => buf.extend_from_slice(
+        2 => buffer.extend_from_slice(
             format!(
                 "benchmark_token_{index:05}_name = f\"item-{{{index}:05d}}-{{{}}}\"\n",
                 index % 3
             )
             .as_bytes(),
         ),
-        3 => buf.extend_from_slice(
+        3 => buffer.extend_from_slice(
             format!(
                 "benchmark_token_{index:05}_result = ({} * 2 if {} % 2 == 0 else {} + 1)\n",
                 index, index, index
             )
             .as_bytes(),
         ),
-        _ => buf.extend_from_slice(
+        _ => buffer.extend_from_slice(
             format!(
                 "benchmark_token_{index:05}_call = sorted({{value: value * value for value in range({})}}.items(), key=lambda pair: pair[1])\n",
                 index % 5
@@ -138,21 +138,21 @@ fn append_python_line(buf: &mut Vec<u8>, index: usize) {
 }
 
 fn make_python_source(lines: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(lines * 128);
+    let mut buffer = Vec::with_capacity(lines * 128);
     for index in 0..lines {
-        append_python_line(&mut buf, index);
+        append_python_line(&mut buffer, index);
     }
-    buf
+    buffer
 }
 
 fn make_python_source_bytes(target: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(target);
+    let mut buffer = Vec::with_capacity(target);
     let mut index = 0;
-    while buf.len() < target {
-        append_python_line(&mut buf, index);
+    while buffer.len() < target {
+        append_python_line(&mut buffer, index);
         index += 1;
     }
-    buf
+    buffer
 }
 
 #[divan::bench]
@@ -179,14 +179,14 @@ fn file_write_1000_lines(bencher: Bencher) {
 fn document_insert_10_seal_undo_all(b: Bencher) {
     let data = make_rust_source(500);
     bench_with_syscall_trace(b, || {
-        let mut doc = Document::new(data.clone(), None);
+        let mut document = Document::new(data.clone(), None);
         for i in 0..10 {
-            let line = i % doc.buf.line_count();
-            doc.insert(line, 0, b"// ");
-            doc.seal_undo();
+            let line = i % document.buffer.line_count();
+            document.insert(line, 0, b"// ");
+            document.seal_undo();
         }
-        while doc.undo().is_some() {}
-        black_box(&doc);
+        while document.undo().is_some() {}
+        black_box(&document);
     });
 }
 
@@ -194,15 +194,15 @@ fn document_insert_10_seal_undo_all(b: Bencher) {
 fn document_insert_delete_interleaved(b: Bencher) {
     let data = make_rust_source(500);
     bench_with_syscall_trace(b, || {
-        let mut doc = Document::new(data.clone(), None);
+        let mut document = Document::new(data.clone(), None);
         for _ in 0..5 {
-            let line = doc.buf.line_count() / 2;
-            let pos = doc.insert(line, 0, b"new line\n");
-            doc.seal_undo();
-            doc.delete_range(Pos::new(pos.line, 0), pos);
-            doc.seal_undo();
+            let line = document.buffer.line_count() / 2;
+            let pos = document.insert(line, 0, b"new line\n");
+            document.seal_undo();
+            document.delete_range(TextPosition::new(pos.line, 0), pos);
+            document.seal_undo();
         }
-        black_box(&doc);
+        black_box(&document);
     });
 }
 
@@ -210,19 +210,33 @@ fn document_insert_delete_interleaved(b: Bencher) {
 fn edit_and_render_python_10k(b: Bencher) {
     let data = make_python_source(10_000);
     let rules = highlight::rules_for_language("Python");
-    let mut doc = Document::new(data, Some("fixture.py".to_string()));
+    let mut document = Document::new(data, Some("fixture.py".to_string()));
     let mut renderer = Renderer::new();
     renderer.set_syntax(rules);
-    let mut view = View::new(120, 40);
-    let cursor = Pos::new(5_000, 12);
-    view.scroll_line = cursor.line;
+    let mut viewport = Viewport::new(120, 40);
+    let cursor = TextPosition::new(5_000, 12);
+    viewport.scroll_line = cursor.line;
     let mut sink = Vec::with_capacity(32 * 1024);
-    render_viewport(&mut renderer, &mut doc.buf, &view, cursor, None, &mut sink);
+    render_viewport(
+        &mut renderer,
+        &mut document.buffer,
+        &viewport,
+        cursor,
+        None,
+        &mut sink,
+    );
 
     bench_with_syscall_trace(b, || {
-        let after = doc.insert(cursor.line, cursor.col, b"x");
-        render_viewport(&mut renderer, &mut doc.buf, &view, after, None, &mut sink);
-        doc.undo();
+        let after = document.insert(cursor.line, cursor.column, b"x");
+        render_viewport(
+            &mut renderer,
+            &mut document.buffer,
+            &viewport,
+            after,
+            None,
+            &mut sink,
+        );
+        document.undo();
         black_box((after, sink.len()));
     });
 }
@@ -231,67 +245,81 @@ fn edit_and_render_python_10k(b: Bencher) {
 fn edit_and_render_python_short(b: Bencher) {
     let data = make_python_source(40);
     let rules = highlight::rules_for_language("Python");
-    let mut doc = Document::new(data, Some("fixture.py".to_string()));
+    let mut document = Document::new(data, Some("fixture.py".to_string()));
     let mut renderer = Renderer::new();
     renderer.set_syntax(rules);
-    let view = View::new(120, 40);
-    let cursor = Pos::new(5, 12);
+    let viewport = Viewport::new(120, 40);
+    let cursor = TextPosition::new(5, 12);
     let mut sink = Vec::with_capacity(32 * 1024);
-    render_viewport(&mut renderer, &mut doc.buf, &view, cursor, None, &mut sink);
+    render_viewport(
+        &mut renderer,
+        &mut document.buffer,
+        &viewport,
+        cursor,
+        None,
+        &mut sink,
+    );
 
     bench_with_syscall_trace(b, || {
-        let after = doc.insert(cursor.line, cursor.col, b"x");
-        render_viewport(&mut renderer, &mut doc.buf, &view, after, None, &mut sink);
-        doc.undo();
+        let after = document.insert(cursor.line, cursor.column, b"x");
+        render_viewport(
+            &mut renderer,
+            &mut document.buffer,
+            &viewport,
+            after,
+            None,
+            &mut sink,
+        );
+        document.undo();
         black_box((after, sink.len()));
     });
 }
 
 #[divan::bench]
 fn find_update_python_10k(b: Bencher) {
-    let buf = GapBuffer::from_vec(make_python_source(10_000));
-    let mut view = View::new(120, 40);
-    view.scroll_line = 5_000;
+    let buffer = GapBuffer::from_bytes(make_python_source(10_000));
+    let mut viewport = Viewport::new(120, 40);
+    viewport.scroll_line = 5_000;
     let mut find = FindState::new();
     bench_with_syscall_trace(b, || {
-        find.update_highlights_lazy(r"benchmark_token_\d+", &buf, &view);
+        find.update_highlights_lazy(r"benchmark_token_\d+", &buffer, &viewport);
         black_box((find.total_count, find.matches.len()));
     });
 }
 
 #[divan::bench]
 fn find_refresh_viewport_cached_python_10k(b: Bencher) {
-    let buf = GapBuffer::from_vec(make_python_source(10_000));
-    let view = View::new(120, 40);
+    let buffer = GapBuffer::from_bytes(make_python_source(10_000));
+    let viewport = Viewport::new(120, 40);
     let mut find = FindState::new();
-    find.update_highlights_lazy(r"benchmark_token_\d+", &buf, &view);
+    find.update_highlights_lazy(r"benchmark_token_\d+", &buffer, &viewport);
     bench_with_syscall_trace(b, || {
-        find.refresh_viewport_matches(&buf, &view);
+        find.refresh_viewport_matches(&buffer, &viewport);
         black_box(find.matches.len());
     });
 }
 
 #[divan::bench]
 fn find_refresh_viewport_invalidated_python_10k(b: Bencher) {
-    let buf = GapBuffer::from_vec(make_python_source(10_000));
-    let mut view = View::new(120, 40);
+    let buffer = GapBuffer::from_bytes(make_python_source(10_000));
+    let mut viewport = Viewport::new(120, 40);
     let mut find = FindState::new();
-    find.update_highlights_lazy(r"benchmark_token_\d+", &buf, &view);
+    find.update_highlights_lazy(r"benchmark_token_\d+", &buffer, &viewport);
     bench_with_syscall_trace(b, || {
-        view.scroll_line = if view.scroll_line == 0 { 1 } else { 0 };
-        find.refresh_viewport_matches(&buf, &view);
+        viewport.scroll_line = if viewport.scroll_line == 0 { 1 } else { 0 };
+        find.refresh_viewport_matches(&buffer, &viewport);
         black_box(find.matches.len());
     });
 }
 
 #[divan::bench]
 fn paste_multiline_python_100k_into_10k(b: Bencher) {
-    let mut doc = Document::new(make_python_source(10_000), Some("fixture.py".to_string()));
+    let mut document = Document::new(make_python_source(10_000), Some("fixture.py".to_string()));
     let paste = make_python_source_bytes(100 * 1024);
-    let cursor = Pos::new(5_000, 12);
+    let cursor = TextPosition::new(5_000, 12);
     bench_with_syscall_trace(b, || {
-        let after = doc.insert(cursor.line, cursor.col, &paste);
-        doc.undo();
+        let after = document.insert(cursor.line, cursor.column, &paste);
+        document.undo();
         black_box(after);
     });
 }
@@ -301,17 +329,22 @@ fn replace_all_python_10k(b: Bencher) {
     let data = make_python_source(10_000);
     let pattern = regex_lite::Regex::new(r"benchmark_token_\d+").unwrap();
     bench_with_syscall_trace(b, || {
-        let mut doc = Document::new(data.clone(), Some("fixture.py".to_string()));
-        let last_line = doc.buf.line_count().saturating_sub(1);
-        let end = Pos::new(last_line, doc.buf.line_char_len(last_line));
-        let text_bytes = doc.text_in_range(Pos::zero(), end);
+        let mut document = Document::new(data.clone(), Some("fixture.py".to_string()));
+        let last_line = document.buffer.line_count().saturating_sub(1);
+        let end = TextPosition::new(last_line, document.buffer.line_character_count(last_line));
+        let text_bytes = document.text_in_range(TextPosition::zero(), end);
         let text = String::from_utf8_lossy(&text_bytes);
         let count = pattern.find_iter(&text).count();
         let replacement = pattern.replace_all(&text, "replacement_token").into_owned();
-        doc.seal_undo();
-        doc.replace_range_with_deleted(Pos::zero(), end, replacement.as_bytes(), text_bytes);
-        doc.seal_undo();
-        black_box((count, doc.buf.len()));
+        document.seal_undo();
+        document.replace_range_with_deleted(
+            TextPosition::zero(),
+            end,
+            replacement.as_bytes(),
+            text_bytes,
+        );
+        document.seal_undo();
+        black_box((count, document.buffer.len()));
     });
 }
 
@@ -320,20 +353,26 @@ macro_rules! search_benchmarks {
         #[divan::bench]
         fn $forward(b: Bencher) {
             let data = make_rust_source($size);
-            let buf = GapBuffer::from_vec(data.clone());
+            let buffer = GapBuffer::from_bytes(data.clone());
             let re = regex_lite::Regex::new("ZZNOTFOUND").unwrap();
             bench_with_syscall_trace(b, || {
-                black_box(FindState::search_forward(&buf, &re, Pos::zero()))
+                black_box(FindState::search_forward(
+                    &buffer,
+                    &re,
+                    TextPosition::zero(),
+                ))
             });
         }
 
         #[divan::bench]
         fn $backward(b: Bencher) {
             let data = make_rust_source($size);
-            let buf = GapBuffer::from_vec(data.clone());
+            let buffer = GapBuffer::from_bytes(data.clone());
             let re = regex_lite::Regex::new("ZZNOTFOUND").unwrap();
-            let last = Pos::new(buf.line_count().saturating_sub(1), 0);
-            bench_with_syscall_trace(b, || black_box(FindState::search_backward(&buf, &re, last)));
+            let last = TextPosition::new(buffer.line_count().saturating_sub(1), 0);
+            bench_with_syscall_trace(b, || {
+                black_box(FindState::search_backward(&buffer, &re, last))
+            });
         }
     };
 }
@@ -342,43 +381,43 @@ search_benchmarks!(search_forward_miss_1000, search_backward_miss_1000, 1000);
 
 #[divan::bench]
 fn viewport_ensure_cursor_visible_jump(b: Bencher) {
-    let buf = GapBuffer::from_vec(make_rust_source(1_000));
+    let buffer = GapBuffer::from_bytes(make_rust_source(1_000));
     bench_with_syscall_trace(b, || {
-        let mut view = View::new(120, 40);
-        let mut widths = |line: usize| buf.display_col_at(line, usize::MAX);
-        for line in (0..buf.line_count()).step_by(10) {
-            view.ensure_cursor_visible(line, 0, 5, &mut widths);
+        let mut viewport = Viewport::new(120, 40);
+        let mut widths = |line: usize| buffer.display_column_at(line, usize::MAX);
+        for line in (0..buffer.line_count()).step_by(10) {
+            viewport.ensure_cursor_visible(line, 0, 5, &mut widths);
         }
-        black_box(&view);
+        black_box(&viewport);
     });
 }
 
 #[divan::bench]
 fn viewport_resize_unanchored_100k(b: Bencher) {
-    let mut view = View::new(120, 40);
-    view.scroll_line = 50_000;
+    let mut viewport = Viewport::new(120, 40);
+    viewport.scroll_line = 50_000;
     bench_with_syscall_trace(b, || {
-        view.width = if view.width == 120 { 80 } else { 120 };
-        view.height = if view.height == 40 { 30 } else { 40 };
-        black_box((view.scroll_line, view.scroll_wrap));
+        viewport.width = if viewport.width == 120 { 80 } else { 120 };
+        viewport.height = if viewport.height == 40 { 30 } else { 40 };
+        black_box((viewport.scroll_line, viewport.scroll_wrap));
     });
 }
 
 #[divan::bench]
 fn viewport_resize_anchored_100k(b: Bencher) {
-    let mut view = View::new(120, 40);
-    view.scroll_line = 50_000;
+    let mut viewport = Viewport::new(120, 40);
+    viewport.scroll_line = 50_000;
     let line_count = 100_000;
     let gutter = 6;
     let mut widths = |_line: usize| 240;
     bench_with_syscall_trace(b, || {
-        let anchor = view.center_anchor(line_count, gutter, &mut widths);
-        view.width = if view.width == 120 { 80 } else { 120 };
-        view.height = if view.height == 40 { 30 } else { 40 };
+        let anchor = viewport.center_anchor(line_count, gutter, &mut widths);
+        viewport.width = if viewport.width == 120 { 80 } else { 120 };
+        viewport.height = if viewport.height == 40 { 30 } else { 40 };
         if let Some(anchor) = anchor {
-            view.center_on_anchor(anchor, line_count, gutter, &mut widths);
+            viewport.center_on_anchor(anchor, line_count, gutter, &mut widths);
         }
-        black_box((view.scroll_line, view.scroll_wrap));
+        black_box((viewport.scroll_line, viewport.scroll_wrap));
     });
 }
 
@@ -387,25 +426,25 @@ fn render_setup(
     width: u16,
     height: u16,
     syntax: Option<&'static SyntaxRules>,
-) -> (Renderer, GapBuffer, View) {
+) -> (Renderer, GapBuffer, Viewport) {
     let mut renderer = Renderer::new();
     renderer.set_syntax(syntax);
-    let buffer = GapBuffer::from_vec(data.to_vec());
-    let mut view = View::new(width, height);
-    view.scroll_line = buffer.line_count() / 2;
-    (renderer, buffer, view)
+    let buffer = GapBuffer::from_bytes(data.to_vec());
+    let mut viewport = Viewport::new(width, height);
+    viewport.scroll_line = buffer.line_count() / 2;
+    (renderer, buffer, viewport)
 }
 
 fn render_viewport(
     renderer: &mut Renderer,
     buffer: &mut GapBuffer,
-    view: &View,
-    cursor: Pos,
+    viewport: &Viewport,
+    cursor: TextPosition,
     selection: Option<Selection>,
     sink: &mut Vec<u8>,
 ) {
     render_editor_frame(
-        renderer, buffer, view, cursor, selection, None, None, None, false, sink,
+        renderer, buffer, viewport, cursor, selection, None, None, None, false, sink,
     );
 }
 
@@ -413,12 +452,12 @@ fn render_viewport(
 fn render_editor_frame(
     renderer: &mut Renderer,
     buffer: &mut GapBuffer,
-    view: &View,
-    cursor: Pos,
+    viewport: &Viewport,
+    cursor: TextPosition,
     selection: Option<Selection>,
     command_line: Option<&str>,
-    find_matches: Option<&[(Pos, Pos)]>,
-    find_current: Option<(Pos, Pos)>,
+    find_matches: Option<&[(TextPosition, TextPosition)]>,
+    find_current: Option<(TextPosition, TextPosition)>,
     find_active: bool,
     sink: &mut Vec<u8>,
 ) {
@@ -427,9 +466,9 @@ fn render_editor_frame(
         .render(
             sink,
             buffer,
-            view,
+            viewport,
             cursor.line,
-            cursor.col,
+            cursor.column,
             true,
             " fixture.py",
             " e v0.1.13 ",
@@ -450,11 +489,11 @@ fn render_editor_frame(
 #[divan::bench]
 fn command_palette_trace_python_10k(b: Bencher) {
     let data = make_python_source(10_000);
-    let mut doc = Document::new(data, Some("fixture.py".to_string()));
+    let mut document = Document::new(data, Some("fixture.py".to_string()));
     let mut renderer = Renderer::new();
     renderer.set_syntax(highlight::rules_for_language("Python"));
-    let view = View::new(120, 40);
-    let cursor = Pos::new(5_000, 12);
+    let viewport = Viewport::new(120, 40);
+    let cursor = TextPosition::new(5_000, 12);
     let mut command = CommandBuffer::new();
     let registry = CommandRegistry::new();
     let mut sink = Vec::with_capacity(32 * 1024);
@@ -467,8 +506,8 @@ fn command_palette_trace_python_10k(b: Bencher) {
                 let line = command.display_line();
                 render_editor_frame(
                     &mut renderer,
-                    &mut doc.buf,
-                    &view,
+                    &mut document.buffer,
+                    &viewport,
                     cursor,
                     None,
                     Some(&line),
@@ -485,8 +524,8 @@ fn command_palette_trace_python_10k(b: Bencher) {
             command.close();
             render_editor_frame(
                 &mut renderer,
-                &mut doc.buf,
-                &view,
+                &mut document.buffer,
+                &viewport,
                 cursor,
                 None,
                 None,
@@ -504,11 +543,11 @@ fn command_palette_trace_python_10k(b: Bencher) {
 #[divan::bench]
 fn find_command_trace_python_10k(b: Bencher) {
     let data = make_python_source(10_000);
-    let mut doc = Document::new(data, Some("fixture.py".to_string()));
+    let mut document = Document::new(data, Some("fixture.py".to_string()));
     let mut renderer = Renderer::new();
     renderer.set_syntax(highlight::rules_for_language("Python"));
-    let view = View::new(120, 40);
-    let cursor = Pos::new(5_000, 12);
+    let viewport = Viewport::new(120, 40);
+    let cursor = TextPosition::new(5_000, 12);
     let mut command = CommandBuffer::new();
     let mut find = FindState::new();
     let mut sink = Vec::with_capacity(32 * 1024);
@@ -519,12 +558,12 @@ fn find_command_trace_python_10k(b: Bencher) {
         for ch in "benchmark_token_123".chars() {
             let result = command.handle_key(e::input::Key::Char(ch));
             if let CommandBufferResult::Changed(pattern) = result {
-                find.update_highlights_lazy(&pattern, &doc.buf, &view);
+                find.update_highlights_lazy(&pattern, &document.buffer, &viewport);
                 let line = command.display_line();
                 render_editor_frame(
                     &mut renderer,
-                    &mut doc.buf,
-                    &view,
+                    &mut document.buffer,
+                    &viewport,
                     cursor,
                     None,
                     Some(&line),
@@ -535,12 +574,12 @@ fn find_command_trace_python_10k(b: Bencher) {
                 );
             }
         }
-        find.update_highlights(command.input.as_str(), &doc.buf, &view);
+        find.update_highlights(command.input.as_str(), &document.buffer, &viewport);
         command.close();
         render_editor_frame(
             &mut renderer,
-            &mut doc.buf,
-            &view,
+            &mut document.buffer,
+            &viewport,
             cursor,
             None,
             None,
@@ -561,16 +600,16 @@ fn render_frame(
     selection: Option<Selection>,
     syntax: Option<&'static SyntaxRules>,
 ) {
-    let (mut renderer, mut buffer, view) = render_setup(data, width, height, syntax);
-    let cursor_line = view.scroll_line;
+    let (mut renderer, mut buffer, viewport) = render_setup(data, width, height, syntax);
+    let cursor_line = viewport.scroll_line;
     let mut sink = Vec::with_capacity(32 * 1024);
     bench_with_syscall_trace(b, || {
         renderer.needs_full_redraw = true;
         render_viewport(
             &mut renderer,
             &mut buffer,
-            &view,
-            Pos::new(cursor_line, 0),
+            &viewport,
+            TextPosition::new(cursor_line, 0),
             selection,
             &mut sink,
         );
@@ -585,14 +624,21 @@ fn open_and_render_python(b: Bencher, data: &[u8], label: &str) {
     let rules = highlight::rules_for_language("Python");
     bench_with_syscall_trace(b, || {
         let loaded = e::file_io::read_file(&path).unwrap();
-        let mut buffer = GapBuffer::from_vec(loaded);
+        let mut buffer = GapBuffer::from_bytes(loaded);
         let mut renderer = Renderer::new();
         renderer.set_syntax(rules);
-        let mut view = View::new(120, 40);
-        view.scroll_line = buffer.line_count() / 2;
-        let cursor = Pos::new(view.scroll_line, 0);
+        let mut viewport = Viewport::new(120, 40);
+        viewport.scroll_line = buffer.line_count() / 2;
+        let cursor = TextPosition::new(viewport.scroll_line, 0);
         let mut sink = Vec::with_capacity(32 * 1024);
-        render_viewport(&mut renderer, &mut buffer, &view, cursor, None, &mut sink);
+        render_viewport(
+            &mut renderer,
+            &mut buffer,
+            &viewport,
+            cursor,
+            None,
+            &mut sink,
+        );
         black_box(sink.len());
     });
 }
@@ -622,8 +668,8 @@ fn render_frame_120x40_viewport_selection(b: Bencher) {
     let rules = highlight::rules_for_language("Rust");
     let line = 1_000 / 2;
     let selection = Selection {
-        anchor: Pos::new(line, 0),
-        cursor: Pos::new(line + 5, 10),
+        anchor: TextPosition::new(line, 0),
+        cursor: TextPosition::new(line + 5, 10),
     };
     render_frame(b, &data, 120, 40, Some(selection), rules);
 }
@@ -636,19 +682,19 @@ fn render_frame_120x40_viewport_plain(b: Bencher) {
 
 fn render_incremental(
     b: Bencher,
-    mut movement: impl FnMut(&mut Renderer, &mut GapBuffer, &mut Vec<u8>, &View, usize),
+    mut movement: impl FnMut(&mut Renderer, &mut GapBuffer, &mut Vec<u8>, &Viewport, usize),
 ) {
     let data = make_rust_source(1_000);
     let rules = highlight::rules_for_language("Rust");
-    let (mut renderer, mut buffer, view) = render_setup(&data, 120, 40, rules);
-    let cursor_line = view.scroll_line;
+    let (mut renderer, mut buffer, viewport) = render_setup(&data, 120, 40, rules);
+    let cursor_line = viewport.scroll_line;
     let mut sink = Vec::with_capacity(32 * 1024);
     renderer.needs_full_redraw = true;
     renderer
         .render(
             &mut sink,
             &mut buffer,
-            &view,
+            &viewport,
             cursor_line,
             0,
             true,
@@ -667,19 +713,25 @@ fn render_incremental(
         )
         .unwrap();
     bench_with_syscall_trace(b, || {
-        movement(&mut renderer, &mut buffer, &mut sink, &view, cursor_line)
+        movement(
+            &mut renderer,
+            &mut buffer,
+            &mut sink,
+            &viewport,
+            cursor_line,
+        )
     });
 }
 
 #[divan::bench]
 fn render_incr_noop_120x40(b: Bencher) {
-    render_incremental(b, |renderer, buffer, sink, view, cursor_line| {
+    render_incremental(b, |renderer, buffer, sink, viewport, cursor_line| {
         sink.clear();
         renderer
             .render(
                 sink,
                 buffer,
-                view,
+                viewport,
                 cursor_line,
                 0,
                 true,
@@ -704,7 +756,7 @@ fn render_incr_noop_120x40(b: Bencher) {
 #[divan::bench]
 fn render_incr_cursor_move_120x40(b: Bencher) {
     let mut current = None;
-    render_incremental(b, |renderer, buffer, sink, view, cursor_line| {
+    render_incremental(b, |renderer, buffer, sink, viewport, cursor_line| {
         let line = current.take().unwrap_or(cursor_line + 1);
         current = Some(if line == cursor_line {
             cursor_line + 1
@@ -716,7 +768,7 @@ fn render_incr_cursor_move_120x40(b: Bencher) {
             .render(
                 sink,
                 buffer,
-                view,
+                viewport,
                 line,
                 0,
                 true,
@@ -741,8 +793,8 @@ fn render_incr_cursor_move_120x40(b: Bencher) {
 #[divan::bench]
 fn render_incr_scroll_120x40(b: Bencher) {
     let mut down = true;
-    render_incremental(b, |renderer, buffer, sink, view, cursor_line| {
-        let mut shifted = view.clone();
+    render_incremental(b, |renderer, buffer, sink, viewport, cursor_line| {
+        let mut shifted = viewport.clone();
         if down {
             shifted.scroll_line += 3;
         }
@@ -753,7 +805,7 @@ fn render_incr_scroll_120x40(b: Bencher) {
                 sink,
                 buffer,
                 &shifted,
-                if shifted.scroll_line == view.scroll_line {
+                if shifted.scroll_line == viewport.scroll_line {
                     cursor_line
                 } else {
                     cursor_line + 3

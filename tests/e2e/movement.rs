@@ -50,10 +50,13 @@ fn home_goes_to_start() {
     e.key(Key::Right);
     // Home should go to beginning of content (after gutter)
     e.key(Key::Home);
-    let (_, col) = e.cursor();
+    let (_, column) = e.cursor();
     // Should be at the gutter column (start of text area)
     // For a 1-line file, gutter is "1 " = 2 chars
-    assert_eq!(col, 2, "Home should go to col 0 of text (gutter offset 2)");
+    assert_eq!(
+        column, 2,
+        "Home should go to column 0 of text (gutter offset 2)"
+    );
 }
 
 #[test]
@@ -62,9 +65,9 @@ fn end_goes_to_end_of_line() {
     let path = create_file(dir.path(), "test.txt", "abcdef\n");
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
     e.key(Key::End);
-    let (_, col) = e.cursor();
-    // For "abcdef" with gutter "1 " (2 chars), end should be at col 2+6=8
-    assert_eq!(col, 2 + 6, "End should go to end of line content");
+    let (_, column) = e.cursor();
+    // For "abcdef" with gutter "1 " (2 chars), end should be at column 2+6=8
+    assert_eq!(column, 2 + 6, "End should go to end of line content");
 }
 
 #[test]
@@ -141,10 +144,10 @@ fn desired_column_preserved() {
         "long line here\nab\nlong line here\n",
     );
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
-    // Move to end of first line (col 14 in text)
+    // Move to end of first line (column 14 in text)
     e.key(Key::End);
     let (_, col_end) = e.cursor();
-    // Move down to short line — cursor clamps to end of "ab" (col 2)
+    // Move down to short line — cursor clamps to end of "ab" (column 2)
     e.key(Key::Down);
     let (r1, c1) = e.cursor();
     assert_eq!(r1, 1, "should be on line 2");
@@ -170,7 +173,7 @@ fn left_wraps_to_previous_line() {
     // Left should wrap to end of line 1
     e.key(Key::Left);
     let (row, _) = e.cursor();
-    assert_eq!(row, 0, "Left at col 0 should wrap to previous line");
+    assert_eq!(row, 0, "Left at column 0 should wrap to previous line");
 }
 
 #[test]
@@ -224,7 +227,7 @@ fn indent_stop_snapping_in_leading_whitespace() {
     let dir = TempDir::new();
     let path = create_file(dir.path(), "test.txt", "      hello\n");
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
-    // With 6 leading spaces: cursor starts at col 0 (gutter offset)
+    // With 6 leading spaces: cursor starts at column 0 (gutter offset)
     // Move right — should snap to indent stops (every 2 spaces)
     e.key(Key::Right);
     let (_, c1) = e.cursor();

@@ -2,8 +2,8 @@ use std::time::Instant;
 
 use crate::buffer::GapBuffer;
 use crate::render::gutter_width;
-use crate::selection::Pos;
-use crate::view::{self, View};
+use crate::selection::TextPosition;
+use crate::viewport::{self, Viewport};
 
 pub struct MouseState {
     pub last_click_time: Option<Instant>,
@@ -52,30 +52,36 @@ impl MouseState {
 }
 
 /// Map terminal screen coordinates (1-indexed) to buffer position.
-pub fn screen_to_buffer_pos(x: u16, y: u16, buf: &GapBuffer, view: &View, ruler_on: bool) -> Pos {
-    let line_count = buf.line_count();
-    let gw = if ruler_on {
+pub fn screen_to_buffer_position(
+    x: u16,
+    y: u16,
+    buffer: &GapBuffer,
+    viewport: &Viewport,
+    line_numbers_visible: bool,
+) -> TextPosition {
+    let line_count = buffer.line_count();
+    let gw = if line_numbers_visible {
         gutter_width(line_count)
     } else {
         0
     };
-    let text_cols = view.text_cols(gw);
+    let text_cols = viewport.text_cols(gw);
     if text_cols == 0 {
-        return Pos::zero();
+        return TextPosition::zero();
     }
 
     let target_row = (y as usize).saturating_sub(1);
     let click_col = (x as usize).saturating_sub(1).saturating_sub(gw);
 
     let mut screen_row: usize = 0;
-    let mut line_idx = view.scroll_line;
-    let first_wrap = view.scroll_wrap;
+    let mut line_idx = viewport.scroll_line;
+    let first_wrap = viewport.scroll_wrap;
 
     while line_idx < line_count {
-        let display_width = buf.display_col_at(line_idx, usize::MAX);
-        let char_len = buf.line_char_len(line_idx);
-        let total_wraps = view::wrapped_rows(display_width, text_cols);
-        let start_wrap = if line_idx == view.scroll_line {
+        let display_width = buffer.display_column_at(line_idx, usize::MAX);
+        let char_len = buffer.line_character_count(line_idx);
+        let total_wraps = viewport::wrapped_rows(display_width, text_cols);
+        let start_wrap = if line_idx == viewport.scroll_line {
             first_wrap
         } else {
             0
@@ -84,8 +90,8 @@ pub fn screen_to_buffer_pos(x: u16, y: u16, buf: &GapBuffer, view: &View, ruler_
         for wrap in start_wrap..total_wraps {
             if screen_row == target_row {
                 let display_col = wrap * text_cols + click_col;
-                let char_col = buf.char_col_from_display(line_idx, display_col);
-                return Pos::new(line_idx, char_col.min(char_len));
+                let character_column = buffer.character_column_from_display(line_idx, display_col);
+                return TextPosition::new(line_idx, character_column.min(char_len));
             }
             screen_row += 1;
         }
@@ -94,6 +100,6 @@ pub fn screen_to_buffer_pos(x: u16, y: u16, buf: &GapBuffer, view: &View, ruler_
     }
 
     let last_line = line_count.saturating_sub(1);
-    let last_col = buf.line_char_len(last_line);
-    Pos::new(last_line, last_col)
+    let last_col = buffer.line_character_count(last_line);
+    TextPosition::new(last_line, last_col)
 }

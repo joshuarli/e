@@ -93,7 +93,7 @@ fn ruler_toggle() {
     // Without ruler, should not start with a digit
     assert!(
         without_ruler.starts_with('h'),
-        "ruler off: content should start at col 0, got: {without_ruler}"
+        "ruler off: content should start at column 0, got: {without_ruler}"
     );
     // Toggle back on
     e.ctrl('r');

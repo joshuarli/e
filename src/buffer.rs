@@ -3,14 +3,14 @@
 /// Text is stored as UTF-8 bytes. The gap sits between `gap_start` and `gap_end`
 /// inside `data`. Insertions at the cursor just fill the gap; deletions widen it.
 pub struct GapBuffer {
-    data: Vec<u8>,
+    storage: Vec<u8>,
     gap_start: usize,
     gap_end: usize,
     /// Byte offsets of line starts (entry 0 is always 0). Always valid — updated
     /// incrementally on every insert/delete.
     line_starts: Vec<usize>,
     /// Per-line ASCII flag (parallel to `line_starts`). When true, every byte on
-    /// that line is < 0x80, so char_count == byte_len and char/byte offsets are
+    /// that line is < 0x80, so character_count == byte_len and char/byte offsets are
     /// identical — all UTF-8 walking can be skipped.
     line_ascii: Vec<bool>,
     /// Min line touched since the last `take_dirty_line()` call.
@@ -31,7 +31,7 @@ impl GapBuffer {
     pub fn new() -> Self {
         let gap = MIN_GAP;
         Self {
-            data: vec![0; gap],
+            storage: vec![0; gap],
             gap_start: 0,
             gap_end: gap,
             line_starts: vec![0],
@@ -47,18 +47,18 @@ impl GapBuffer {
     /// returned by `read_file` and we extend it in-place for the gap, so the
     /// whole startup path needs only one allocation (the fs::read itself).
     /// Pre-allocates `line_starts` with a heuristic to avoid reallocs.
-    pub fn from_vec(mut data: Vec<u8>) -> Self {
+    pub fn from_bytes(mut bytes: Vec<u8>) -> Self {
         let gap = MIN_GAP;
         // Reserve the gap space now so the resize at the end doesn't reallocate.
-        data.reserve(gap);
-        let content_len = data.len();
+        bytes.reserve(gap);
+        let content_len = bytes.len();
         // Heuristic: typical source lines are ~20 bytes; pre-allocate to avoid
         // the ~20 doublings that Vec would otherwise do for 1M-line files.
         let mut starts = Vec::with_capacity(content_len / 20 + 16);
         let mut ascii = Vec::with_capacity(content_len / 20 + 16);
         starts.push(0usize);
         let mut line_is_ascii = true;
-        for (i, &b) in data.iter().enumerate() {
+        for (i, &b) in bytes.iter().enumerate() {
             if b >= 0x80 {
                 line_is_ascii = false;
             }
@@ -69,9 +69,9 @@ impl GapBuffer {
             }
         }
         ascii.push(line_is_ascii); // last line
-        data.resize(content_len + gap, 0);
+        bytes.resize(content_len + gap, 0);
         Self {
-            data,
+            storage: bytes,
             gap_start: content_len,
             gap_end: content_len + gap,
             line_starts: starts,
@@ -82,10 +82,10 @@ impl GapBuffer {
     }
 
     /// Build a `GapBuffer` from a byte slice. Allocates a new `Vec` internally.
-    /// Used in tests; production code should prefer `from_vec`.
+    /// Used in tests; production code should prefer `from_bytes`.
     #[cfg(test)]
     pub fn from_text(text: &[u8]) -> Self {
-        Self::from_vec(text.to_vec())
+        Self::from_bytes(text.to_vec())
     }
 
     pub fn version(&self) -> u64 {
@@ -95,7 +95,7 @@ impl GapBuffer {
     // -- low level helpers --------------------------------------------------
 
     fn len_logical(&self) -> usize {
-        self.data.len() - self.gap_len()
+        self.storage.len() - self.gap_len()
     }
 
     fn gap_len(&self) -> usize {
@@ -117,13 +117,13 @@ impl GapBuffer {
         }
         if pos < self.gap_start {
             let count = self.gap_start - pos;
-            self.data
+            self.storage
                 .copy_within(pos..self.gap_start, self.gap_end - count);
             self.gap_start = pos;
             self.gap_end -= count;
         } else {
             let count = pos - self.gap_start;
-            self.data
+            self.storage
                 .copy_within(self.gap_end..self.gap_end + count, self.gap_start);
             self.gap_start += count;
             self.gap_end += count;
@@ -136,10 +136,10 @@ impl GapBuffer {
         }
         let extra = needed.max(MIN_GAP);
         let old_gap_end = self.gap_end;
-        let tail = self.data.len() - old_gap_end;
-        self.data.resize(self.data.len() + extra, 0);
+        let tail = self.storage.len() - old_gap_end;
+        self.storage.resize(self.storage.len() + extra, 0);
         // shift tail right
-        self.data
+        self.storage
             .copy_within(old_gap_end..old_gap_end + tail, old_gap_end + extra);
         self.gap_end += extra;
     }
@@ -151,7 +151,7 @@ impl GapBuffer {
         assert!(pos <= self.len_logical());
         self.move_gap_to(pos);
         self.ensure_gap(bytes.len());
-        self.data[self.gap_start..self.gap_start + bytes.len()].copy_from_slice(bytes);
+        self.storage[self.gap_start..self.gap_start + bytes.len()].copy_from_slice(bytes);
         self.gap_start += bytes.len();
         self.update_line_index_insert(pos, bytes);
         self.version += 1;
@@ -180,7 +180,7 @@ impl GapBuffer {
 
     /// Get the byte at logical offset `pos`.
     pub fn byte_at(&self, pos: usize) -> u8 {
-        self.data[self.logical_to_physical(pos)]
+        self.storage[self.logical_to_physical(pos)]
     }
 
     /// Copy a logical byte range into `dst`.
@@ -189,12 +189,12 @@ impl GapBuffer {
         let mut out = Vec::with_capacity(end - start);
         if start < self.gap_start {
             let chunk_end = end.min(self.gap_start);
-            out.extend_from_slice(&self.data[start..chunk_end]);
+            out.extend_from_slice(&self.storage[start..chunk_end]);
         }
         if end > self.gap_start {
             let phys_start = start.max(self.gap_start) + self.gap_len();
             let phys_end = end + self.gap_len();
-            out.extend_from_slice(&self.data[phys_start..phys_end]);
+            out.extend_from_slice(&self.storage[phys_start..phys_end]);
         }
         out
     }
@@ -349,25 +349,25 @@ impl GapBuffer {
         // Copy in (at most) two chunks, avoiding the gap
         if start < self.gap_start {
             let chunk_end = end.min(self.gap_start);
-            buf.extend_from_slice(&self.data[start..chunk_end]);
+            buf.extend_from_slice(&self.storage[start..chunk_end]);
         }
         if end > self.gap_start {
             let phys_start = start.max(self.gap_start) + self.gap_len();
             let phys_end = end + self.gap_len();
-            buf.extend_from_slice(&self.data[phys_start..phys_end]);
+            buf.extend_from_slice(&self.storage[phys_start..phys_end]);
         }
     }
 
-    /// Compute the display column at char position `char_col` on `line`.
+    /// Compute the display column at char position `character_column` on `line`.
     /// Tabs count as 2 display columns; every other character counts as 1.
-    /// Pass `char_col = usize::MAX` to get the total display width of the line.
+    /// Pass `character_column = usize::MAX` to get the total display width of the line.
     /// Does not allocate.
-    pub fn display_col_at(&self, line: usize, char_col: usize) -> usize {
+    pub fn display_column_at(&self, line: usize, character_column: usize) -> usize {
         let ls = self.line_start(line);
         let le = self.line_end(line);
         let mut display = 0usize;
         if self.line_ascii[line] {
-            let end = ls.saturating_add(char_col).min(le);
+            let end = ls.saturating_add(character_column).min(le);
             for bi in ls..end {
                 let b = self.byte_at(bi);
                 if b == b'\n' {
@@ -378,7 +378,7 @@ impl GapBuffer {
         } else {
             let mut ci = 0usize;
             let mut bi = ls;
-            while ci < char_col && bi < le {
+            while ci < character_column && bi < le {
                 let b = self.byte_at(bi);
                 if b == b'\n' {
                     break;
@@ -392,9 +392,9 @@ impl GapBuffer {
     }
 
     /// Map a display column back to a char column on `line`.
-    /// Inverse of `display_col_at`; reads the gap buffer directly.
+    /// Inverse of `display_column_at`; reads the gap buffer directly.
     /// Does not allocate.
-    pub fn char_col_from_display(&self, line: usize, target_display: usize) -> usize {
+    pub fn character_column_from_display(&self, line: usize, target_display: usize) -> usize {
         let ls = self.line_start(line);
         let le = self.line_end(line);
         let mut display = 0usize;
@@ -431,8 +431,8 @@ impl GapBuffer {
         ci
     }
 
-    /// Convert a (line, col) to a byte offset. Col is clamped to line length.
-    pub fn pos_to_offset(&self, line: usize, col: usize) -> usize {
+    /// Convert a (line, column) to a byte offset. Col is clamped to line length.
+    pub fn position_to_byte_offset(&self, line: usize, column: usize) -> usize {
         let start = self.line_start(line);
         let end = self.line_end(line);
         // Exclude trailing newline from the clamping boundary (mirrors line_text behaviour).
@@ -442,11 +442,11 @@ impl GapBuffer {
             end
         };
         if self.line_ascii[line] {
-            start + col.min(limit - start)
+            start + column.min(limit - start)
         } else {
             let mut byte_off = 0;
             let mut char_idx = 0;
-            while char_idx < col && start + byte_off < limit {
+            while char_idx < column && start + byte_off < limit {
                 let advance =
                     utf8_char_len(self.byte_at(start + byte_off)).min(limit - (start + byte_off));
                 byte_off += advance;
@@ -456,8 +456,8 @@ impl GapBuffer {
         }
     }
 
-    /// Convert a byte offset to (line, col). Col is character count.
-    pub fn offset_to_pos(&self, offset: usize) -> (usize, usize) {
+    /// Convert a byte offset to (line, column). Col is character count.
+    pub fn byte_offset_to_position(&self, offset: usize) -> (usize, usize) {
         let starts = &self.line_starts;
         // binary search for the line
         let line = match starts.binary_search(&offset) {
@@ -468,12 +468,12 @@ impl GapBuffer {
         if self.line_ascii[line] {
             (line, offset - line_start)
         } else {
-            let col = self.char_count_in_range(line_start, offset);
-            (line, col)
+            let column = self.character_count_in_range(line_start, offset);
+            (line, column)
         }
     }
 
-    fn char_count_in_range(&self, from: usize, to: usize) -> usize {
+    fn character_count_in_range(&self, from: usize, to: usize) -> usize {
         let mut count = 0;
         let mut i = from;
         while i < to {
@@ -485,7 +485,7 @@ impl GapBuffer {
     }
 
     /// Return the character count of a line (0-indexed), not counting the newline.
-    pub fn line_char_len(&self, line: usize) -> usize {
+    pub fn line_character_count(&self, line: usize) -> usize {
         let start = self.line_start(line);
         let end = self.line_end(line);
         let end = if end > start && self.byte_at(end - 1) == b'\n' {
@@ -496,7 +496,7 @@ impl GapBuffer {
         if self.line_ascii[line] {
             end - start
         } else {
-            self.char_count_in_range(start, end)
+            self.character_count_in_range(start, end)
         }
     }
 }
@@ -515,7 +515,7 @@ pub fn utf8_char_len(first_byte: u8) -> usize {
     }
 }
 
-pub fn char_count(bytes: &[u8]) -> usize {
+pub fn character_count(bytes: &[u8]) -> usize {
     if bytes.is_ascii() {
         return bytes.len();
     }
@@ -529,14 +529,14 @@ pub fn char_count(bytes: &[u8]) -> usize {
 }
 
 /// Convert a char column index to a byte offset in a UTF-8 byte slice.
-/// Returns `bytes.len()` if `char_col` is past the end.
-pub fn char_to_byte(bytes: &[u8], char_col: usize) -> usize {
+/// Returns `bytes.len()` if `character_column` is past the end.
+pub fn character_column_to_byte_offset(bytes: &[u8], character_column: usize) -> usize {
     if bytes.is_ascii() {
-        return char_col.min(bytes.len());
+        return character_column.min(bytes.len());
     }
     let mut bi = 0;
     let mut ci = 0;
-    while ci < char_col && bi < bytes.len() {
+    while ci < character_column && bi < bytes.len() {
         bi += utf8_char_len(bytes[bi]);
         ci += 1;
     }
@@ -729,11 +729,11 @@ mod tests {
     }
 
     #[test]
-    fn test_line_char_len() {
+    fn test_line_character_count() {
         let buf = GapBuffer::from_text(b"abc\nde\nfghij");
-        assert_eq!(buf.line_char_len(0), 3);
-        assert_eq!(buf.line_char_len(1), 2);
-        assert_eq!(buf.line_char_len(2), 5);
+        assert_eq!(buf.line_character_count(0), 3);
+        assert_eq!(buf.line_character_count(1), 2);
+        assert_eq!(buf.line_character_count(2), 5);
     }
 
     #[test]
@@ -759,37 +759,37 @@ mod tests {
         assert_eq!(buf.line_text(1), b"ef");
     }
 
-    // -- pos_to_offset / offset_to_pos --------------------------------------
+    // -- position_to_byte_offset / byte_offset_to_position --------------------------------------
 
     #[test]
-    fn test_pos_to_offset() {
+    fn test_position_to_byte_offset() {
         let buf = GapBuffer::from_text(b"abc\ndef\nghi");
-        assert_eq!(buf.pos_to_offset(0, 0), 0);
-        assert_eq!(buf.pos_to_offset(1, 0), 4);
-        assert_eq!(buf.pos_to_offset(1, 2), 6);
-        assert_eq!(buf.pos_to_offset(2, 3), 11);
+        assert_eq!(buf.position_to_byte_offset(0, 0), 0);
+        assert_eq!(buf.position_to_byte_offset(1, 0), 4);
+        assert_eq!(buf.position_to_byte_offset(1, 2), 6);
+        assert_eq!(buf.position_to_byte_offset(2, 3), 11);
     }
 
     #[test]
-    fn test_offset_to_pos() {
+    fn test_byte_offset_to_position() {
         let buf = GapBuffer::from_text(b"abc\ndef\nghi");
-        assert_eq!(buf.offset_to_pos(0), (0, 0));
-        assert_eq!(buf.offset_to_pos(4), (1, 0));
-        assert_eq!(buf.offset_to_pos(6), (1, 2));
+        assert_eq!(buf.byte_offset_to_position(0), (0, 0));
+        assert_eq!(buf.byte_offset_to_position(4), (1, 0));
+        assert_eq!(buf.byte_offset_to_position(6), (1, 2));
     }
 
     #[test]
-    fn test_pos_to_offset_col_clamped() {
+    fn test_position_to_byte_offset_col_clamped() {
         let buf = GapBuffer::from_text(b"ab\ncd");
-        // col 10 on a 2-char line should clamp to end
-        assert_eq!(buf.pos_to_offset(0, 10), 2);
+        // column 10 on a 2-char line should clamp to end
+        assert_eq!(buf.position_to_byte_offset(0, 10), 2);
     }
 
     #[test]
-    fn test_offset_to_pos_at_newline() {
+    fn test_byte_offset_to_position_at_newline() {
         let buf = GapBuffer::from_text(b"abc\ndef");
-        // Offset 3 is the newline itself, which is col 3 of line 0
-        assert_eq!(buf.offset_to_pos(3), (0, 3));
+        // Offset 3 is the newline itself, which is column 3 of line 0
+        assert_eq!(buf.byte_offset_to_position(3), (0, 3));
     }
 
     // -- UTF-8 handling -----------------------------------------------------
@@ -803,41 +803,41 @@ mod tests {
     }
 
     #[test]
-    fn test_char_count_ascii() {
-        assert_eq!(char_count(b"hello"), 5);
-        assert_eq!(char_count(b""), 0);
+    fn test_character_count_ascii() {
+        assert_eq!(character_count(b"hello"), 5);
+        assert_eq!(character_count(b""), 0);
     }
 
     #[test]
-    fn test_char_count_utf8() {
+    fn test_character_count_utf8() {
         // "café" = 63 61 66 c3 a9 = 5 bytes, 4 chars
-        assert_eq!(char_count("café".as_bytes()), 4);
+        assert_eq!(character_count("café".as_bytes()), 4);
         // "日本" = 3 bytes each = 6 bytes, 2 chars
-        assert_eq!(char_count("日本".as_bytes()), 2);
+        assert_eq!(character_count("日本".as_bytes()), 2);
     }
 
     #[test]
-    fn test_utf8_insert_and_line_char_len() {
+    fn test_utf8_insert_and_line_character_count() {
         let buf = GapBuffer::from_text("café".as_bytes());
-        assert_eq!(buf.line_char_len(0), 4);
+        assert_eq!(buf.line_character_count(0), 4);
         assert_eq!(buf.line_count(), 1);
     }
 
     #[test]
-    fn test_utf8_pos_to_offset() {
+    fn test_utf8_position_to_byte_offset() {
         // "aé" = 61 c3 a9 = 3 bytes
         let buf = GapBuffer::from_text("aé".as_bytes());
-        assert_eq!(buf.pos_to_offset(0, 0), 0); // 'a' at byte 0
-        assert_eq!(buf.pos_to_offset(0, 1), 1); // 'é' at byte 1
-        assert_eq!(buf.pos_to_offset(0, 2), 3); // end
+        assert_eq!(buf.position_to_byte_offset(0, 0), 0); // 'a' at byte 0
+        assert_eq!(buf.position_to_byte_offset(0, 1), 1); // 'é' at byte 1
+        assert_eq!(buf.position_to_byte_offset(0, 2), 3); // end
     }
 
     #[test]
-    fn test_utf8_offset_to_pos() {
+    fn test_utf8_byte_offset_to_position() {
         let buf = GapBuffer::from_text("aé".as_bytes());
-        assert_eq!(buf.offset_to_pos(0), (0, 0)); // 'a'
-        assert_eq!(buf.offset_to_pos(1), (0, 1)); // 'é'
-        assert_eq!(buf.offset_to_pos(3), (0, 2)); // end
+        assert_eq!(buf.byte_offset_to_position(0), (0, 0)); // 'a'
+        assert_eq!(buf.byte_offset_to_position(1), (0, 1)); // 'é'
+        assert_eq!(buf.byte_offset_to_position(3), (0, 2)); // end
     }
 
     // -- gap buffer stress --------------------------------------------------
@@ -879,7 +879,7 @@ mod tests {
         let buf = GapBuffer::new();
         assert_eq!(buf.line_count(), 1);
         assert_eq!(buf.line_text(0), b"");
-        assert_eq!(buf.line_char_len(0), 0);
+        assert_eq!(buf.line_character_count(0), 0);
     }
 
     #[test]
@@ -1034,19 +1034,19 @@ mod tests {
     }
 
     #[test]
-    fn test_ascii_fast_path_line_char_len() {
+    fn test_ascii_fast_path_line_character_count() {
         let buf = GapBuffer::from_text("hello\ncaf\u{e9}".as_bytes());
-        assert_eq!(buf.line_char_len(0), 5); // ASCII: fast path
-        assert_eq!(buf.line_char_len(1), 4); // "café" = 4 chars, 5 bytes
+        assert_eq!(buf.line_character_count(0), 5); // ASCII: fast path
+        assert_eq!(buf.line_character_count(1), 4); // "café" = 4 chars, 5 bytes
     }
 
     #[test]
-    fn test_ascii_fast_path_pos_to_offset() {
+    fn test_ascii_fast_path_position_to_byte_offset() {
         let buf = GapBuffer::from_text("hello\ncaf\u{e9}".as_bytes());
-        // ASCII line: col == byte offset from line start
-        assert_eq!(buf.pos_to_offset(0, 3), 3);
-        // UTF-8 line: col 3 → byte offset for 'é' (byte 9)
-        assert_eq!(buf.pos_to_offset(1, 3), 9);
+        // ASCII line: column == byte offset from line start
+        assert_eq!(buf.position_to_byte_offset(0, 3), 3);
+        // UTF-8 line: column 3 → byte offset for 'é' (byte 9)
+        assert_eq!(buf.position_to_byte_offset(1, 3), 9);
     }
 }
 
@@ -1113,7 +1113,7 @@ mod proptests {
             initial in prop::collection::vec(any::<u8>(), 0..256),
             ops in prop::collection::vec(arb_edit_op(), 0..50),
         ) {
-            let mut buf = GapBuffer::from_vec(initial.clone());
+            let mut buf = GapBuffer::from_bytes(initial.clone());
             let mut reference = initial;
             for op in &ops {
                 apply_op(&mut buf, &mut reference, op);
@@ -1129,7 +1129,7 @@ mod proptests {
             initial in prop::collection::vec(any::<u8>(), 0..256),
             ops in prop::collection::vec(arb_edit_op(), 0..50),
         ) {
-            let mut buf = GapBuffer::from_vec(initial.clone());
+            let mut buf = GapBuffer::from_bytes(initial.clone());
             let mut reference = initial;
             for op in &ops {
                 apply_op(&mut buf, &mut reference, op);
@@ -1152,20 +1152,20 @@ mod proptests {
             prop_assert_eq!(reconstructed, contents);
         }
 
-        /// pos_to_offset and offset_to_pos are inverses for valid positions.
+        /// position_to_byte_offset and byte_offset_to_position are inverses for valid positions.
         #[test]
         fn pos_offset_roundtrip(
             text in prop::collection::vec(any::<u8>(), 0..256),
         ) {
-            let buf = GapBuffer::from_vec(text);
+            let buf = GapBuffer::from_bytes(text);
             for line in 0..buf.line_count() {
-                let char_len = buf.line_char_len(line);
-                for col in 0..=char_len {
-                    let offset = buf.pos_to_offset(line, col);
-                    let (rt_line, rt_col) = buf.offset_to_pos(offset);
-                    prop_assert_eq!((rt_line, rt_col), (line, col),
+                let char_len = buf.line_character_count(line);
+                for column in 0..=char_len {
+                    let offset = buf.position_to_byte_offset(line, column);
+                    let (rt_line, rt_col) = buf.byte_offset_to_position(offset);
+                    prop_assert_eq!((rt_line, rt_col), (line, column),
                         "roundtrip failed for ({}, {}): offset={}, got ({}, {})",
-                        line, col, offset, rt_line, rt_col);
+                        line, column, offset, rt_line, rt_col);
                 }
             }
         }
@@ -1175,7 +1175,7 @@ mod proptests {
         fn line_boundaries_contiguous(
             text in prop::collection::vec(any::<u8>(), 1..256),
         ) {
-            let buf = GapBuffer::from_vec(text);
+            let buf = GapBuffer::from_bytes(text);
             let lc = buf.line_count();
             for line in 0..lc.saturating_sub(1) {
                 prop_assert_eq!(
@@ -1192,7 +1192,7 @@ mod proptests {
             initial in prop::collection::vec(any::<u8>(), 0..256),
             ops in prop::collection::vec(arb_edit_op(), 0..50),
         ) {
-            let mut buf = GapBuffer::from_vec(initial.clone());
+            let mut buf = GapBuffer::from_bytes(initial.clone());
             let mut reference = initial;
             for op in &ops {
                 apply_op(&mut buf, &mut reference, op);
@@ -1208,7 +1208,7 @@ mod proptests {
             insert_data in prop::collection::vec(any::<u8>(), 1..32),
             pos_frac in 0.0f64..1.0,
         ) {
-            let mut buf = GapBuffer::from_vec(initial.clone());
+            let mut buf = GapBuffer::from_bytes(initial.clone());
             let pos = if initial.is_empty() {
                 0
             } else {
@@ -1219,20 +1219,20 @@ mod proptests {
             prop_assert_eq!(buf.contents(), initial);
         }
 
-        /// display_col_at round-trips through char_col_from_display for ASCII.
+        /// display_column_at round-trips through character_column_from_display for ASCII.
         #[test]
         fn display_col_roundtrip_ascii(
             text in "[a-z\t ]{0,80}\n[a-z\t ]{0,80}",
         ) {
-            let buf = GapBuffer::from_vec(text.into_bytes());
+            let buf = GapBuffer::from_bytes(text.into_bytes());
             for line in 0..buf.line_count() {
-                let char_len = buf.line_char_len(line);
-                for col in 0..=char_len {
-                    let dcol = buf.display_col_at(line, col);
-                    let rt_col = buf.char_col_from_display(line, dcol);
-                    prop_assert_eq!(rt_col, col,
-                        "display roundtrip failed on line {} col {}: dcol={} rt={}",
-                        line, col, dcol, rt_col);
+                let char_len = buf.line_character_count(line);
+                for column in 0..=char_len {
+                    let dcol = buf.display_column_at(line, column);
+                    let rt_col = buf.character_column_from_display(line, dcol);
+                    prop_assert_eq!(rt_col, column,
+                        "display roundtrip failed on line {} column {}: dcol={} rt={}",
+                        line, column, dcol, rt_col);
                 }
             }
         }

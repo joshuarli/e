@@ -445,10 +445,7 @@ impl InputParser {
                     _ => base,
                 }
             }
-            b'u'
-                if p0 == 127 && p1 == 5 => {
-                    Key::Ctrl('h')
-                }
+            b'u' if p0 == 127 && p1 == 5 => Key::Ctrl('h'),
             _ => return None,
         }))
     }
