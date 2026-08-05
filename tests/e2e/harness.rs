@@ -243,6 +243,34 @@ impl TestEditor {
 
     /// Spawn the editor with a custom terminal size.
     pub fn with_size(args: &[&str], rows: u16, cols: u16) -> Self {
+        Self::spawn(args, rows, cols, None)
+    }
+
+    /// Spawn the explicitly selected instrumented release binary and direct
+    /// its LLVM profile output to the directory owned by the profile driver.
+    /// Keeping this opt-in prevents ordinary end-to-end tests from collecting
+    /// profiles or silently exercising a fallback binary.
+    pub fn with_profile_size(args: &[&str], rows: u16, cols: u16) -> Self {
+        let binary = std::env::var_os("E_PGO_BINARY")
+            .map(PathBuf::from)
+            .expect("E_PGO_BINARY must select the instrumented application binary");
+        assert!(
+            binary.is_file(),
+            "E_PGO_BINARY is not an executable file: {}",
+            binary.display()
+        );
+        let profile_dir = std::env::var_os("E_PGO_PROFILE_DIR")
+            .map(PathBuf::from)
+            .expect("E_PGO_PROFILE_DIR must select the profile output directory");
+        assert!(
+            profile_dir.is_dir(),
+            "E_PGO_PROFILE_DIR is not a directory: {}",
+            profile_dir.display()
+        );
+        Self::spawn(args, rows, cols, Some(profile_dir))
+    }
+
+    fn spawn(args: &[&str], rows: u16, cols: u16, profile_dir: Option<PathBuf>) -> Self {
         let home = TempDir::new();
 
         // Open a PTY pair.
@@ -280,7 +308,9 @@ impl TestEditor {
         }
 
         // Spawn the editor.
-        let binary = if let Some(path) = std::env::var_os("E_TEST_BINARY") {
+        let binary = if let Some(path) = std::env::var_os("E_PGO_BINARY") {
+            PathBuf::from(path)
+        } else if let Some(path) = std::env::var_os("E_TEST_BINARY") {
             PathBuf::from(path)
         } else {
             let mut path = std::env::current_exe().expect("test executable path unavailable");
@@ -289,18 +319,24 @@ impl TestEditor {
             path.push("e");
             path
         };
+        let mut command = Command::new(&binary);
+        command
+            .args(args)
+            .env("TERM", "xterm-256color")
+            .env("HOME", home.path())
+            .env("LC_ALL", "en_US.UTF-8")
+            .current_dir(home.path())
+            // Use HOME as PATH so `which` can't find pbcopy/xclip/etc.
+            // This forces internal-only clipboard, avoiding races between
+            // parallel tests that share the system clipboard.
+            .env("PATH", home.path())
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("DISPLAY");
+        if let Some(profile_dir) = profile_dir {
+            command.env("LLVM_PROFILE_FILE", profile_dir.join("e-%p.profraw"));
+        }
         let child = unsafe {
-            Command::new(&binary)
-                .args(args)
-                .env("TERM", "xterm-256color")
-                .env("HOME", home.path())
-                .env("LC_ALL", "en_US.UTF-8")
-                // Use HOME as PATH so `which` can't find pbcopy/xclip/etc.
-                // This forces internal-only clipboard, avoiding races between
-                // parallel tests that share the system clipboard.
-                .env("PATH", home.path())
-                .env_remove("WAYLAND_DISPLAY")
-                .env_remove("DISPLAY")
+            command
                 .stdin(Stdio::from_raw_fd(dup(slave_fd)))
                 .stdout(Stdio::from_raw_fd(dup(slave_fd)))
                 .stderr(Stdio::from_raw_fd(dup(slave_fd)))
@@ -378,13 +414,34 @@ impl TestEditor {
         }
     }
 
-    /// Wait for the very first frame after launch.
+    /// Wait for non-empty status-bar content, which is the editor's semantic
+    /// readiness signal after the initial frame has rendered. A filename may
+    /// truncate the language and version markers at narrow terminal widths.
     fn wait_for_startup(&mut self) {
-        match self.rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(data) => self.process_output(&data),
-            Err(_) => panic!("Editor produced no output during startup"),
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if self.startup_ready() {
+                self.drain_available();
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                panic!("Editor did not become ready during startup");
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(data) => self.process_output(&data),
+                Err(_) => panic!("Editor did not become ready during startup"),
+            }
         }
-        self.drain_timeout(Duration::from_millis(30));
+    }
+
+    fn startup_ready(&self) -> bool {
+        let row = self.parser.screen().size().0.saturating_sub(2);
+        let text = (0..self.parser.screen().size().1)
+            .filter_map(|column| self.parser.screen().cell(row, column))
+            .map(|cell| cell.contents().chars().next().unwrap_or(' '))
+            .collect::<String>();
+        !text.trim().is_empty()
     }
 
     // --- sending input ------------------------------------------------------

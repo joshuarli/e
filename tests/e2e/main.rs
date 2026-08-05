@@ -7,6 +7,8 @@ mod find_replace;
 mod harness;
 mod mouse;
 mod movement;
+#[allow(dead_code)]
+mod pgo;
 mod save_quit;
 mod selection;
 mod startup;
