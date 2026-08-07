@@ -1,4 +1,5 @@
 NAME       := e
+RUSTYBENCH  ?= cargo run --quiet --manifest-path ../rustybench/Cargo.toml --
 TEST_BINARY_ENV := E_TEST_BINARY
 TEST_TARGETS := --tests
 HOST       := $(shell rustc -vV | awk '/^host:/ {print $$2}')
@@ -90,10 +91,10 @@ lint:
 	cargo clippy --fix --allow-dirty --all-targets --all-features -- --deny warnings
 
 bench:
-	@scripts/bench-baseline.py
+	@$(RUSTYBENCH) baseline --root "$(CURDIR)" --baseline "$(CURDIR)/benches/baseline.json" -- cargo bench --bench bench
 
 bench-syscalls:
-	@scripts/bench-syscalls.py
+	@$(RUSTYBENCH) syscalls --root "$(CURDIR)"
 
 # Build the release-shaped application used by the PTY profile driver. The
 # target-scoped flags keep host build scripts, proc macros, and the profile
@@ -185,7 +186,7 @@ pgo-merge:
 	$(LLVM_BIN)/llvm-profdata merge -o "$(PGO_MERGED)" "$(PGO_DIR)"/*.profraw
 	@echo "Merged application profile: $(PGO_MERGED)"
 	@$(LLVM_BIN)/llvm-profdata show --counts --all-functions "$(PGO_MERGED)" | sed -n '1,24p'
-	@if $(LLVM_BIN)/llvm-profdata show --all-functions "$(PGO_MERGED)" | grep -Eiq 'divan|bench'; then \
+	@if $(LLVM_BIN)/llvm-profdata show --all-functions "$(PGO_MERGED)" | grep -Eiq 'rustybench|benchmark'; then \
 		echo 'profile contains benchmark/tooling symbols; refusing to use it' >&2; \
 		exit 1; \
 	fi
@@ -260,12 +261,11 @@ release-pgo-linux-static: ensure-musl-target pgo-profile
 
 # Benchmark regular release vs PGO and compare persisted baselines.
 bench-pgo: pgo-profile
-	@BASELINE=$$(scripts/bench-baseline.py --print-path); \
-	PGO_BASELINE=$$(scripts/bench-baseline.py --variant pgo --print-path); \
-	scripts/bench-baseline.py --baseline "$$BASELINE" --quiet; \
-	RUSTFLAGS="-Cprofile-use=$(PGO_MERGED)" \
-	scripts/bench-baseline.py --baseline "$$PGO_BASELINE" --quiet --variant pgo; \
-	scripts/diff-baselines.py "$$BASELINE" "$$PGO_BASELINE"
+	@BASELINE="$(CURDIR)/benches/baseline.json"; \
+	PGO_BASELINE="$(CURDIR)/benches/pgo-baseline.json"; \
+	$(RUSTYBENCH) baseline --root "$(CURDIR)" --baseline "$$BASELINE" --quiet -- cargo bench --bench bench; \
+	RUSTYBENCH_BENCH_RUSTFLAGS="-Cprofile-use=$(PGO_MERGED)" $(RUSTYBENCH) baseline --root "$(CURDIR)" --baseline "$$PGO_BASELINE" --quiet -- cargo bench --bench bench; \
+	$(RUSTYBENCH) diff "$$BASELINE" "$$PGO_BASELINE"
 
 install: release-pgo
 	cp target/$(TARGET)/release/$(NAME) ~/usr/bin/$(NAME)

@@ -1,12 +1,12 @@
 # Profile-guided release builds
 
-The Divan suite in `benches/bench.rs` remains a measurement suite. It covers file I/O,
+The Rustybench suite in `benches/bench.rs` remains a measurement suite. It covers file I/O,
 document mutations, syntax rendering, find, viewport movement, command traces, and large-file
 rendering with benchmark-owned fixtures and an allocation profiler. `make bench` and the
-baseline scripts continue to measure those operations independently.
+Rustybench baseline command continue to measure those operations independently.
 
 Previously, `make pgo-profile` put an unscoped `-Cprofile-generate` in `RUSTFLAGS` and ran the
-Divan binary with `--sample-size 1`. That could profile benchmark setup, Divan, the benchmark
+Rustybench binary with `--sample-size 1`. That could profile benchmark setup, Rustybench, the benchmark
 allocator, and equally weighted synthetic fixtures alongside editor code. It also did not cross
 the application process boundary.
 
@@ -53,12 +53,12 @@ The application library and binary receive instrumentation through separate `car
 invocations. Target-scoped Cargo flags keep host build scripts, proc macros, tests, and benchmark
 targets outside that boundary. Profile use is likewise passed only to the application library
 and binary, so the final release does not retain the profile runtime. `pgo-merge` prints the
-merged profile's first functions and rejects obvious `divan` or benchmark symbols.
+merged profile's first functions and rejects obvious Rustybench or benchmark symbols.
 
 ## Validation status
 
 The same ignored PTY scenario is the intended baseline-versus-PGO comparison driver. This
 refactor does not claim a performance win: measurements still need repeated baseline and PGO
 runs on the release target, with startup/readiness and interaction latency reported separately
-from Divan results. Profile provenance, missing-function warnings from LLVM, binary section
+from Rustybench results. Profile provenance, missing-function warnings from LLVM, binary section
 checks, and the scenario's coverage gaps should be reviewed after each target build.

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use divan::{AllocProfiler, Bencher, black_box};
+use rustybench::{AllocProfiler, Bencher, black_box};
 
 #[global_allocator]
 static ALLOC: AllocProfiler = AllocProfiler::system();
@@ -155,7 +155,7 @@ fn make_python_source_bytes(target: usize) -> Vec<u8> {
     buffer
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn file_read_1000_lines(bencher: Bencher) {
     let dir = BenchDir::new("read");
     let path = dir.0.join("fixture.rs");
@@ -164,7 +164,7 @@ fn file_read_1000_lines(bencher: Bencher) {
     bench_with_syscall_trace(bencher, || black_box(e::file_io::read_file(&path).unwrap()));
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn file_write_1000_lines(bencher: Bencher) {
     let dir = BenchDir::new("write");
     let path = dir.0.join("fixture.rs");
@@ -175,7 +175,7 @@ fn file_write_1000_lines(bencher: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn document_insert_10_seal_undo_all(b: Bencher) {
     let data = make_rust_source(500);
     bench_with_syscall_trace(b, || {
@@ -190,7 +190,7 @@ fn document_insert_10_seal_undo_all(b: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn document_insert_delete_interleaved(b: Bencher) {
     let data = make_rust_source(500);
     bench_with_syscall_trace(b, || {
@@ -206,7 +206,7 @@ fn document_insert_delete_interleaved(b: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn edit_and_render_python_10k(b: Bencher) {
     let data = make_python_source(10_000);
     let rules = highlight::rules_for_language("Python");
@@ -241,7 +241,7 @@ fn edit_and_render_python_10k(b: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn edit_and_render_python_short(b: Bencher) {
     let data = make_python_source(40);
     let rules = highlight::rules_for_language("Python");
@@ -275,7 +275,7 @@ fn edit_and_render_python_short(b: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn find_update_python_10k(b: Bencher) {
     let buffer = GapBuffer::from_bytes(make_python_source(10_000));
     let mut viewport = Viewport::new(120, 40);
@@ -287,7 +287,7 @@ fn find_update_python_10k(b: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn find_refresh_viewport_cached_python_10k(b: Bencher) {
     let buffer = GapBuffer::from_bytes(make_python_source(10_000));
     let viewport = Viewport::new(120, 40);
@@ -299,7 +299,7 @@ fn find_refresh_viewport_cached_python_10k(b: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn find_refresh_viewport_invalidated_python_10k(b: Bencher) {
     let buffer = GapBuffer::from_bytes(make_python_source(10_000));
     let mut viewport = Viewport::new(120, 40);
@@ -312,7 +312,7 @@ fn find_refresh_viewport_invalidated_python_10k(b: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn paste_multiline_python_100k_into_10k(b: Bencher) {
     let mut document = Document::new(make_python_source(10_000), Some("fixture.py".to_string()));
     let paste = make_python_source_bytes(100 * 1024);
@@ -324,7 +324,7 @@ fn paste_multiline_python_100k_into_10k(b: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn replace_all_python_10k(b: Bencher) {
     let data = make_python_source(10_000);
     let pattern = regex_lite::Regex::new(r"benchmark_token_\d+").unwrap();
@@ -350,7 +350,7 @@ fn replace_all_python_10k(b: Bencher) {
 
 macro_rules! search_benchmarks {
     ($forward:ident, $backward:ident, $size:literal) => {
-        #[divan::bench]
+        #[rustybench::bench]
         fn $forward(b: Bencher) {
             let data = make_rust_source($size);
             let buffer = GapBuffer::from_bytes(data.clone());
@@ -364,7 +364,7 @@ macro_rules! search_benchmarks {
             });
         }
 
-        #[divan::bench]
+        #[rustybench::bench]
         fn $backward(b: Bencher) {
             let data = make_rust_source($size);
             let buffer = GapBuffer::from_bytes(data.clone());
@@ -379,7 +379,7 @@ macro_rules! search_benchmarks {
 
 search_benchmarks!(search_forward_miss_1000, search_backward_miss_1000, 1000);
 
-#[divan::bench]
+#[rustybench::bench]
 fn viewport_ensure_cursor_visible_jump(b: Bencher) {
     let buffer = GapBuffer::from_bytes(make_rust_source(1_000));
     bench_with_syscall_trace(b, || {
@@ -392,7 +392,7 @@ fn viewport_ensure_cursor_visible_jump(b: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn viewport_resize_unanchored_100k(b: Bencher) {
     let mut viewport = Viewport::new(120, 40);
     viewport.scroll_line = 50_000;
@@ -403,7 +403,7 @@ fn viewport_resize_unanchored_100k(b: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn viewport_resize_anchored_100k(b: Bencher) {
     let mut viewport = Viewport::new(120, 40);
     viewport.scroll_line = 50_000;
@@ -486,7 +486,7 @@ fn render_editor_frame(
         .unwrap();
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn command_palette_trace_python_10k(b: Bencher) {
     let data = make_python_source(10_000);
     let mut document = Document::new(data, Some("fixture.py".to_string()));
@@ -540,7 +540,7 @@ fn command_palette_trace_python_10k(b: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn find_command_trace_python_10k(b: Bencher) {
     let data = make_python_source(10_000);
     let mut document = Document::new(data, Some("fixture.py".to_string()));
@@ -643,26 +643,26 @@ fn open_and_render_python(b: Bencher, data: &[u8], label: &str) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn open_and_render_python_1mb(b: Bencher) {
     let data = make_python_source_bytes(1024 * 1024);
     open_and_render_python(b, &data, "open-1mb");
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn open_and_render_python_10mb(b: Bencher) {
     let data = make_python_source_bytes(10 * 1024 * 1024);
     open_and_render_python(b, &data, "open-10mb");
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn render_frame_120x40_viewport_syntax(b: Bencher) {
     let data = make_rust_source(1_000);
     let rules = highlight::rules_for_language("Rust");
     render_frame(b, &data, 120, 40, None, rules);
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn render_frame_120x40_viewport_selection(b: Bencher) {
     let data = make_rust_source(1_000);
     let rules = highlight::rules_for_language("Rust");
@@ -674,7 +674,7 @@ fn render_frame_120x40_viewport_selection(b: Bencher) {
     render_frame(b, &data, 120, 40, Some(selection), rules);
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn render_frame_120x40_viewport_plain(b: Bencher) {
     let data = make_rust_source(1_000);
     render_frame(b, &data, 120, 40, None, None);
@@ -723,7 +723,7 @@ fn render_incremental(
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn render_incr_noop_120x40(b: Bencher) {
     render_incremental(b, |renderer, buffer, sink, viewport, cursor_line| {
         sink.clear();
@@ -753,7 +753,7 @@ fn render_incr_noop_120x40(b: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn render_incr_cursor_move_120x40(b: Bencher) {
     let mut current = None;
     render_incremental(b, |renderer, buffer, sink, viewport, cursor_line| {
@@ -790,7 +790,7 @@ fn render_incr_cursor_move_120x40(b: Bencher) {
     });
 }
 
-#[divan::bench]
+#[rustybench::bench]
 fn render_incr_scroll_120x40(b: Bencher) {
     let mut down = true;
     render_incremental(b, |renderer, buffer, sink, viewport, cursor_line| {
@@ -831,5 +831,5 @@ fn render_incr_scroll_120x40(b: Bencher) {
 }
 
 fn main() {
-    divan::main();
+    rustybench::main();
 }
