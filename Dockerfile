@@ -35,6 +35,19 @@ RUN case "$TARGETARCH" in \
     && test -f /opt/llvm-musl/lib/libclang.so \
     && rm /tmp/llvm-x86_64.tar.xz /tmp/llvm-aarch64.tar.xz
 
+# Rust's static musl profiler link asks lld for -lgcc. Keep the linker
+# interface while resolving it to the LLVM compiler-rt builtins shipped in
+# the prebuilt toolchain; this image must not depend on GCC.
+RUN case "$TARGETARCH" in \
+        amd64) llvm_arch=x86_64 ;; \
+        arm64) llvm_arch=aarch64 ;; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && clang_major="${LLVM_VERSION%%.*}" \
+    && builtins="/opt/llvm-musl/lib/clang/$clang_major/lib/linux/libclang_rt.builtins-$llvm_arch.a" \
+    && test -f "$builtins" \
+    && ln -sf "$builtins" /usr/lib/libcompiler-rt-builtins.a
+
 RUN for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do \
         stub_dir="/usr/lib/e-crt/$target"; \
         mkdir -p "$stub_dir"; \
@@ -59,6 +72,7 @@ ENV PATH="/opt/llvm-musl/bin:/root/.cargo/bin:$PATH" \
     CC="/opt/llvm-musl/bin/clang" \
     AR="/opt/llvm-musl/bin/llvm-ar" \
     RANLIB="/opt/llvm-musl/bin/llvm-ranlib" \
+    LIBRARY_PATH="/opt/llvm-musl/lib" \
     LIBCLANG_PATH="/opt/llvm-musl/lib" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="/opt/llvm-musl/bin/clang" \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="/opt/llvm-musl/bin/clang"
