@@ -1,11 +1,12 @@
-//! Guard `src/xsh_lang.rs` against drift from the XSH registry.
+//! Guard the generated vocabulary region of `src/languages/xsh.rs` against
+//! drift from the XSH registry.
 //!
-//! Re-runs the same `syn`-based vocabulary extraction as
-//! `examples/gen_xsh.rs` and compares it against the committed file.  The
-//! comparison ignores the `// Generated from <path>` header line so it works
-//! regardless of where the registry checkout lives.  When the registry is not
-//! present (no `XSH_REPO`, no default checkout), the test skips instead of
-//! failing so the editor still tests clean on machines without the registry.
+//! Re-runs the same `syn`-based vocabulary extraction as `examples/gen_xsh.rs`
+//! and re-splices it into the committed file.  The comparison ignores the
+//! `// Generated from <path>` header line so it works regardless of where the
+//! registry checkout lives.  When the registry is not present (no `XSH_REPO`,
+//! no default checkout), the test skips instead of failing so the editor still
+//! tests clean on machines without the registry.
 
 // The generator is only executed through `default_repo()`/`regenerate()` here;
 // the CLI entry points it also defines are dead code in this crate.
@@ -39,13 +40,16 @@ fn xsh_lang_matches_registry() {
     let committed = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
-            .join("xsh_lang.rs"),
+            .join("languages")
+            .join("xsh.rs"),
     )
-    .expect("reading src/xsh_lang.rs");
+    .expect("reading src/languages/xsh.rs");
+    let spliced = gen_xsh::splice_into(&committed, &vocab.content)
+        .expect("committed xsh.rs has the generation markers");
     assert_eq!(
-        strip_generated_from(&vocab.content),
         strip_generated_from(&committed),
-        "src/xsh_lang.rs is out of date with the registry at {}; run `make gen-xsh`",
+        strip_generated_from(&spliced),
+        "src/languages/xsh.rs is out of date with the registry at {}; run `make gen-xsh`",
         repo.display()
     );
 }

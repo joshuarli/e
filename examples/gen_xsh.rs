@@ -1,5 +1,6 @@
-//! Regenerate `src/xsh_lang.rs`, the XSH syntax-highlighting vocabulary used by
-//! the editor's byte-oriented highlighter.
+//! Regenerate the XSH vocabulary region inside `src/languages/xsh.rs`, the
+//! syntax-highlighting vocabulary used by the editor's byte-oriented
+//! highlighter.
 //!
 //! The XSH language keeps its public surface in the registry at `$XSH_REPO`
 //! (default `~/d/laputa-systems/xsh`).  The vocabulary is read from the
@@ -14,8 +15,10 @@
 //!   * `crates/xsh-registry/src/reference.rs` -- effect names and stream
 //!     stages.
 //!
-//! It emits a sorted Rust source file that `src/highlight.rs` includes
-//! verbatim.  Regenerate after the XSH language changes keywords, types,
+//! It emits the sorted `XSH_KEYWORDS`, `XSH_TYPES`, and `XSH_MACROS` arrays
+//! and splices them in place between the `BEGIN/END GENERATED XSH VOCABULARY`
+//! markers in `xsh.rs`, so the hand-maintained rules and scanner around them
+//! are untouched.  Regenerate after the XSH language changes keywords, types,
 //! modules, or stage names:
 //!
 //!     make gen-xsh
@@ -23,7 +26,7 @@
 //! Exit status is non-zero on any parse failure so CI can treat a stale or
 //! broken registry as an error.
 //!
-//! `tests/xsh_lang.rs` includes this file and rewrites the same vocabulary
+//! `tests/xsh_lang.rs` includes this file and re-splices the same vocabulary
 //! during `cargo test` to catch drift when the registry is present.
 
 use std::collections::BTreeSet;
@@ -416,16 +419,19 @@ fn build_types(builtin: BTreeSet<String>, records: BTreeSet<String>) -> Vec<Stri
 
 // -- output ---------------------------------------------------------------------
 
+const START_MARKER: &str = "// BEGIN GENERATED XSH VOCABULARY";
+const END_MARKER: &str = "// END GENERATED XSH VOCABULARY";
+
 fn emit_array(name: &str, items: &[String]) -> String {
     if items.is_empty() {
-        return format!("pub static {name}: &[&str] = &[];\n");
+        return format!("#[rustfmt::skip]\npub static {name}: &[&str] = &[];\n");
     }
     let body = items
         .iter()
         .map(|item| format!("\"{item}\""))
         .collect::<Vec<_>>()
         .join(",\n    ");
-    format!("pub static {name}: &[&str] = &[\n    {body},\n];\n")
+    format!("#[rustfmt::skip]\npub static {name}: &[&str] = &[\n    {body},\n];\n")
 }
 
 /// Regenerated vocabulary: content plus a per-array line count for the log
@@ -435,6 +441,35 @@ pub struct Vocab {
     pub keywords: usize,
     pub types: usize,
     pub macros: usize,
+}
+
+/// Replace the generated region in `xsh.rs` with a freshly generated block.
+///
+/// `block` is a complete region including its `BEGIN`/`END` marker lines.
+/// Both markers must already be present in `source`, which keeps this from
+/// silently rewriting a file the generator does not own.
+pub fn splice_into(source: &str, block: &str) -> Result<String, Box<dyn Error>> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .position(|line| line.trim_end() == START_MARKER);
+    let end = lines.iter().rposition(|line| line.trim_end() == END_MARKER);
+    match (start, end) {
+        (Some(s), Some(e)) if s <= e => {
+            let block_lines = block.lines().collect::<Vec<_>>();
+            let mut out = lines[..s].to_vec();
+            out.extend_from_slice(&block_lines);
+            out.extend_from_slice(&lines[e + 1..]);
+            let mut joined = out.join("\n");
+            if source.ends_with('\n') {
+                joined.push('\n');
+            }
+            Ok(joined)
+        }
+        _ => err(format!(
+            "{START_MARKER}/{END_MARKER} markers not found; refusing to rewrite the file"
+        )),
+    }
 }
 
 /// Recompute the vocabulary from the registry source at `repo`.
@@ -448,28 +483,27 @@ pub fn regenerate(repo: &Path) -> Result<Vocab, Box<dyn Error>> {
     let macros = build_macros(modules, effects, stages, &keywords);
     let keyword_list: Vec<String> = keywords.into_iter().collect();
 
-    let header = format!(
-        "// XSH syntax-highlighting vocabulary, generated from the XSH registry.\n\
-         //\n\
-         // DO NOT EDIT BY HAND.  Regenerate after the XSH language or standard\n\
-         // library changes keywords, types, modules, or stream stages:\n\
-         //\n\
-         //     make gen-xsh\n\
-         //\n\
-         // Generated from {}\n",
-        repo.display()
-    );
     let body = emit_array("XSH_KEYWORDS", &keyword_list)
         + "\n"
         + &emit_array("XSH_TYPES", &types)
         + "\n"
         + &emit_array("XSH_MACROS", &macros);
+    let block = format!(
+        "{START_MARKER}\n\
+         // Generated from {}\n\
+         // XSH syntax-highlighting vocabulary, generated from the XSH registry source.\n\
+         // DO NOT EDIT BY HAND.  Regenerate after the XSH language or standard library\n\
+         // changes keywords, types, modules, or stream stages: `make gen-xsh`.\n\
+         {body}\
+         {END_MARKER}\n",
+        repo.display()
+    );
 
     Ok(Vocab {
         keywords: keyword_list.len(),
         types: types.len(),
         macros: macros.len(),
-        content: header + &body,
+        content: block,
     })
 }
 
@@ -492,7 +526,8 @@ fn run() -> Result<bool, Box<dyn Error>> {
     let mut repo: PathBuf = default_repo();
     let mut out: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src")
-        .join("xsh_lang.rs");
+        .join("languages")
+        .join("xsh.rs");
     let mut check = false;
 
     let mut iter = env::args_os().skip(1);
@@ -509,7 +544,7 @@ fn run() -> Result<bool, Box<dyn Error>> {
                 println!(
                     "usage: gen-xsh [--repo PATH] [--out PATH] [--check]\n\
                      reads the vocabulary from the XSH registry source with `syn`\n\
-                     and writes (or checks) src/xsh_lang.rs."
+                     and rewrites (or checks) the generated region of src/languages/xsh.rs."
                 );
                 process::exit(0);
             }
@@ -524,18 +559,19 @@ fn run() -> Result<bool, Box<dyn Error>> {
     }
 
     let vocab = regenerate(&repo)?;
+    let existing = std::fs::read_to_string(&out).unwrap_or_default();
+    let spliced = splice_into(&existing, &vocab.content)?;
 
     if check {
-        let existing = std::fs::read_to_string(&out).unwrap_or_default();
-        if existing == vocab.content {
-            println!("src/xsh_lang.rs is up to date");
+        if spliced == existing {
+            println!("src/languages/xsh.rs is up to date");
             return Ok(true);
         }
-        eprintln!("src/xsh_lang.rs is out of date; run `make gen-xsh`");
+        eprintln!("src/languages/xsh.rs is out of date; run `make gen-xsh`");
         return Ok(false);
     }
 
-    std::fs::write(&out, &vocab.content)?;
+    std::fs::write(&out, &spliced)?;
     println!(
         "wrote {} ({} keywords, {} types, {} macros)",
         out.display(),

@@ -595,7 +595,7 @@ impl Editor {
                 .refresh_viewport_matches(&self.document.buffer, &self.viewport);
         }
 
-        let rules = lang.and_then(|l| highlight::rules_for_language(l.name));
+        let rules = lang.and_then(|l| crate::languages::rules_for_language(l.name));
         self.renderer.set_syntax(rules);
         if self.carets.is_multicursor() {
             self.renderer.force_full_redraw();
@@ -4828,8 +4828,8 @@ mod tests {
     fn test_multicursor_vertical_movement_preserves_all_carets() {
         let mut e = ed("abc\n123456\nz");
         e.carets.carets = vec![
-            Caret::caret(TextPosition::new(1, 5)),
-            Caret::caret(TextPosition::new(1, 2)),
+            Caret::new(TextPosition::new(1, 5)),
+            Caret::new(TextPosition::new(1, 2)),
         ];
         e.carets.primary = 0;
         e.carets.normalize();
@@ -4861,8 +4861,8 @@ mod tests {
     fn test_multicursor_word_right_moves_all_carets() {
         let mut e = ed("hello world\nfoo bar");
         e.carets.carets = vec![
-            Caret::caret(TextPosition::new(0, 0)),
-            Caret::caret(TextPosition::new(1, 0)),
+            Caret::new(TextPosition::new(0, 0)),
+            Caret::new(TextPosition::new(1, 0)),
         ];
         e.carets.primary = 1;
         e.carets.normalize();
@@ -5013,8 +5013,8 @@ mod tests {
         e.copy();
 
         e.carets.carets = vec![
-            Caret::caret(TextPosition::new(0, 5)),
-            Caret::caret(TextPosition::new(1, 5)),
+            Caret::new(TextPosition::new(0, 5)),
+            Caret::new(TextPosition::new(1, 5)),
         ];
         e.carets.primary = 1;
         e.carets.normalize();
@@ -5099,8 +5099,8 @@ mod tests {
     fn test_multicursor_dedent_comment_undo_redo_preserve_carets() {
         let mut e = ed_named("  aaa\n  bbb\nccc", "test.rs");
         e.carets.carets = vec![
-            Caret::caret(TextPosition::new(0, 2)),
-            Caret::caret(TextPosition::new(1, 2)),
+            Caret::new(TextPosition::new(0, 2)),
+            Caret::new(TextPosition::new(1, 2)),
         ];
         e.carets.primary = 1;
         e.carets.normalize();

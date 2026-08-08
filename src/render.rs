@@ -1,7 +1,8 @@
 use std::io::{self, Write};
 
 use crate::buffer::{self, GapBuffer};
-use crate::highlight::{self, HighlightKind, HighlightState, SyntaxRules};
+use crate::highlight::{self, HighlightKind, HighlightState};
+use crate::languages::SyntaxRules;
 use crate::selection::{Selection, TextPosition};
 use crate::viewport::Viewport;
 
@@ -212,7 +213,8 @@ impl Renderer {
         let mut in_continuation = false;
         for line_idx in 0..line_count {
             buffer.line_text_into(line_idx, &mut self.line_buf);
-            let (names, continues) = highlight::scan_type_line(&self.line_buf, in_continuation);
+            let (names, continues) =
+                crate::languages::xsh::scan_type_line(&self.line_buf, in_continuation);
             for name in names {
                 if seen.insert(name.clone()) {
                     self.user_types.push(name);
@@ -1063,6 +1065,9 @@ pub(crate) fn display_col_for_character_column(raw_text: &[u8], character_column
 mod tests {
     use super::*;
 
+    // Mirrors `Renderer::render`'s full signature so every render path is
+    // exercised; clippy's arity cap does not apply to this thin adapter.
+    #[allow(clippy::too_many_arguments)]
     fn render_test(
         r: &mut Renderer,
         output: &mut Vec<u8>,
@@ -1599,7 +1604,7 @@ mod tests {
     #[test]
     fn test_render_syntax_cache_invalidation() {
         let mut r = Renderer::new();
-        let rules = crate::highlight::rules_for_language("Rust");
+        let rules = crate::languages::rules_for_language("Rust");
         r.set_syntax(rules);
 
         let mut buffer = GapBuffer::from_text(b"fn main() {}");
@@ -1660,7 +1665,7 @@ mod tests {
     fn test_set_syntax_changes_rules() {
         let mut r = Renderer::new();
         assert!(r.syntax.is_none());
-        let rules = crate::highlight::rules_for_language("Rust");
+        let rules = crate::languages::rules_for_language("Rust");
         r.set_syntax(rules);
         assert!(r.syntax.is_some());
         r.set_syntax(None);

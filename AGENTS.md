@@ -27,7 +27,8 @@ main.rs → Editor → Document → GapBuffer
 - `src/viewport.rs` — `Viewport`, soft-wrap scrolling, screen mapping, and resize anchors.
 - `src/render.rs` — ANSI rendering, syntax-state caching, dirty rows, and reusable scratch buffers.
 - `src/find.rs` — `FindState`, regex compilation, viewport match caching, and navigation.
-- `src/highlight.rs` — `HighlightKind`, `HighlightState`, syntax rules, and bracket matching.
+- `src/highlight.rs` — `HighlightKind`, `HighlightState`, the highlighting engine, and bracket matching.
+- `src/languages/` — per-language `SyntaxRules` tables (one file per language); the XSH vocabulary is a generated region inside `xsh.rs`.
 - `src/operation.rs` — `UndoOperation`, `UndoGroup`, and `UndoStack`.
 - `src/file_io.rs` — file reads/writes, modification times, persistent undo, and cursor state.
 - `benches/bench.rs` — executable performance and allocation benchmarks.

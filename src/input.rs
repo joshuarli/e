@@ -225,8 +225,9 @@ impl InputParser {
 
         // Mismatch: flush any accumulated terminator bytes as content
         if self.paste_term_match > 0 {
-            for i in 0..self.paste_term_match as usize {
-                self.emit_paste_byte(PASTE_END_MARKER[i]);
+            let end = self.paste_term_match as usize;
+            for &byte in &PASTE_END_MARKER[..end] {
+                self.emit_paste_byte(byte);
             }
             self.paste_term_match = 0;
         }

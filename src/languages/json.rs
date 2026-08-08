@@ -1,0 +1,24 @@
+//! JSON syntax rules.
+
+use super::{StringDelim, SyntaxRules, string_delim};
+
+static STRINGS: &[StringDelim] = &[string_delim!("\"", "\"", false)];
+
+pub static RULES: SyntaxRules = SyntaxRules {
+    line_comment: "",
+    block_comment: ("", ""),
+    string_delims: STRINGS,
+    keywords: &[],
+    types: &["false", "null", "true"],
+    constants: &[],
+    macros: &[],
+    operators: &[],
+    highlight_numbers: true,
+    highlight_upper_constants: false,
+    highlight_fn_calls: false,
+    highlight_bang_macros: false,
+    is_markdown: false,
+    is_json: true,
+    is_yaml: false,
+    is_ini: false,
+};

@@ -10,6 +10,7 @@ pub mod highlight;
 pub mod input;
 pub mod keybind;
 pub mod language;
+pub mod languages;
 pub mod mouse;
 pub mod operation;
 pub mod render;

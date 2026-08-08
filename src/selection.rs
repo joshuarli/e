@@ -66,7 +66,7 @@ pub struct Caret {
 }
 
 impl Caret {
-    pub fn caret(pos: TextPosition) -> Self {
+    pub fn new(pos: TextPosition) -> Self {
         Self {
             selection: Selection::caret(pos),
             desired_column: None,
@@ -112,7 +112,7 @@ pub struct CaretSet {
 impl CaretSet {
     pub fn new(pos: TextPosition) -> Self {
         Self {
-            carets: vec![Caret::caret(pos)],
+            carets: vec![Caret::new(pos)],
             primary: 0,
         }
     }
@@ -147,6 +147,10 @@ impl CaretSet {
         self.carets.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.carets.is_empty()
+    }
+
     pub fn is_multicursor(&self) -> bool {
         self.carets.len() > 1
     }
@@ -172,7 +176,7 @@ impl CaretSet {
     }
 
     pub fn add_caret(&mut self, pos: TextPosition) {
-        self.carets.push(Caret::caret(pos));
+        self.carets.push(Caret::new(pos));
         self.primary = self.carets.len() - 1;
         self.normalize();
     }
@@ -194,7 +198,7 @@ impl CaretSet {
             })
             .collect();
         if self.carets.is_empty() {
-            self.carets.push(Caret::caret(TextPosition::zero()));
+            self.carets.push(Caret::new(TextPosition::zero()));
             self.primary = 0;
         } else {
             self.primary = snapshot.primary.min(self.carets.len().saturating_sub(1));
@@ -204,7 +208,7 @@ impl CaretSet {
 
     pub fn normalize(&mut self) {
         if self.carets.is_empty() {
-            self.carets.push(Caret::caret(TextPosition::zero()));
+            self.carets.push(Caret::new(TextPosition::zero()));
             self.primary = 0;
             return;
         }
@@ -387,7 +391,7 @@ mod tests {
     fn test_caretset_normalize_merges_overlapping_ranges() {
         let mut carets = CaretSet {
             carets: vec![
-                Caret::caret(TextPosition::new(0, 8)),
+                Caret::new(TextPosition::new(0, 8)),
                 Caret {
                     selection: Selection {
                         anchor: TextPosition::new(0, 2),
@@ -430,7 +434,7 @@ mod tests {
                     },
                     desired_column: None,
                 },
-                Caret::caret(TextPosition::new(0, 3)),
+                Caret::new(TextPosition::new(0, 3)),
             ],
             primary: 1,
         };
