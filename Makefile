@@ -30,7 +30,11 @@ RELEASE_RUSTFLAGS := $(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-
 LINUX_DYNAMIC_RUSTFLAGS := $(RELEASE_RUSTFLAGS) -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER)
 PGO_USE_FLAGS := -Cprofile-use=$(PGO_MERGED) -Cllvm-args=-pgo-warn-missing-function
 
-.PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-instrument pgo-instrument-linux pgo-profile pgo-profile-linux pgo-merge bench-pgo install record gifs ensure-musl-target
+.PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-instrument pgo-instrument-linux pgo-profile pgo-profile-linux pgo-merge bench-pgo install record gifs ensure-musl-target gen-xsh
+
+# Regenerate src/xsh_lang.rs from the XSH registry (XSH_REPO overrides the path)
+gen-xsh:
+	cargo run --quiet --example gen_xsh
 
 build:
 	cargo build

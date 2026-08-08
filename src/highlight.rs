@@ -2139,9 +2139,16 @@ static INI_RULES: SyntaxRules = SyntaxRules {
 // right delimiter.  Triple-quoted forms are multiline.
 static XSH_STRINGS: &[StringDelim] = &[
     string_delim!("fp\"\"\"", "\"\"\"", true),
+    string_delim!("fr\"\"\"", "\"\"\"", true),
+    string_delim!("rf\"\"\"", "\"\"\"", true),
     string_delim!("f\"\"\"", "\"\"\"", true),
+    string_delim!("g\"\"\"", "\"\"\"", true),
+    string_delim!("p\"\"\"", "\"\"\"", true),
+    string_delim!("b\"\"\"", "\"\"\"", true),
     string_delim!("r\"\"\"", "\"\"\"", true),
     string_delim!("\"\"\"", "\"\"\"", true),
+    string_delim!("fr\"", "\"", false),
+    string_delim!("rf\"", "\"", false),
     string_delim!("fp\"", "\"", false),
     string_delim!("b\"", "\"", false),
     string_delim!("p\"", "\"", false),
@@ -2151,55 +2158,17 @@ static XSH_STRINGS: &[StringDelim] = &[
     string_delim!("\"", "\"", false),
 ];
 
+include!("xsh_lang.rs");
+
 static XSH_RULES: SyntaxRules = SyntaxRules {
     line_comment: "#",
     block_comment: ("", ""),
     string_delims: XSH_STRINGS,
-    keywords: &[
-        "and", "break", "continue", "defer", "else", "false", "for", "if", "in", "let", "match",
-        "not", "null", "or", "proc", "pure", "retry", "return", "run", "spawn", "true", "type",
-        "use", "var", "wait", "while",
-    ],
-    types: &[
-        "Any",
-        "Bool",
-        "Bytes",
-        "Command",
-        "Digest",
-        "Duration",
-        "Err",
-        "Error",
-        "Float",
-        "Int",
-        "List",
-        "Map",
-        "Module",
-        "Null",
-        "Ok",
-        "Path",
-        "Proc",
-        "ProcessError",
-        "ProcessHandle",
-        "Pure",
-        "Record",
-        "Regex",
-        "Result",
-        "Status",
-        "Str",
-        "Stream",
-        "UInt",
-        "Unit",
-    ],
+    keywords: XSH_KEYWORDS,
+    types: XSH_TYPES,
     constants: &[],
-    macros: &[
-        "abort", "archive", "args", "bytes", "cli", "cpu", "diff", "dns", "env", "eprint", "fs",
-        "group", "hash", "io", "json", "linux", "list", "map", "module", "net", "patch", "path",
-        "print", "process", "range", "record", "regex", "system", "test", "text", "time", "tui",
-        "unix", "user",
-    ],
-    operators: &[
-        "!=", "%=", "*=", "+=", "-=", "->", "/=", "<=", "==", "=>", ">=", "|>", "?.", "??",
-    ],
+    macros: XSH_MACROS,
+    operators: &["!=", "->", "==", "=>", "<=", ">=", ">>", "|>", "??"],
     highlight_numbers: true,
     highlight_upper_constants: true,
     highlight_fn_calls: true,
@@ -3766,9 +3735,121 @@ mod tests {
         assert_eq!(hl[2], HighlightKind::Operator);
         assert_eq!(hl[3], HighlightKind::Operator);
 
-        let hl = hl_types(b"x?.y", &XSH_RULES);
+        let hl = hl_types(b"=>", &XSH_RULES);
+        assert_eq!(hl[0], HighlightKind::Operator);
         assert_eq!(hl[1], HighlightKind::Operator);
+
+        let hl = hl_types(b"x != y", &XSH_RULES);
         assert_eq!(hl[2], HighlightKind::Operator);
+        assert_eq!(hl[3], HighlightKind::Operator);
+    }
+
+    #[test]
+    fn test_xsh_stdlib_macro() {
+        // module names, stream stages, and builtins are Macro (bold magenta)
+        let hl = hl_types(b"print total", &XSH_RULES);
+        assert_eq!(hl[0], HighlightKind::Macro); // p
+        assert_eq!(hl[5], HighlightKind::Normal); // total is ordinary
+
+        let hl = hl_types(b"|> where .kind", &XSH_RULES);
+        assert_eq!(hl[3], HighlightKind::Macro); // where
+        assert_eq!(hl[4], HighlightKind::Macro); // all of 'where'
+        let hl = hl_types(b"|> sort-by .name", &XSH_RULES);
+        assert_eq!(hl[3], HighlightKind::Macro); // 'sort' of sort-by
+        let hl = hl_types(b"|> count {key}", &XSH_RULES);
+        assert_eq!(hl[3], HighlightKind::Macro); // count
+
+        let hl = hl_types(b"fs.files(root)?", &XSH_RULES);
+        assert_eq!(hl[0], HighlightKind::Macro); // fs module
+        assert_eq!(hl[2], HighlightKind::Normal); // .files is a call, not a static word
+        let hl = hl_types(b"net.download(url)?", &XSH_RULES);
+        assert_eq!(hl[0], HighlightKind::Macro); // net module
+    }
+
+    #[test]
+    fn test_xsh_new_keywords() {
+        // Keywords added since the registry was introduced.
+        for kw in [
+            "export", "guard", "loop", "unless", "when", "with", "yield", "stream",
+        ] {
+            let line = format!("{} x", kw);
+            let hl = hl_types(line.as_bytes(), &XSH_RULES);
+            assert_eq!(hl[0], HighlightKind::Keyword, "{kw} should be a keyword");
+        }
+    }
+
+    #[test]
+    fn test_xsh_record_types() {
+        // Record names from the registry are types (cyan).
+        for ty in [
+            "FsEntry",
+            "LinuxBlockDevice",
+            "NetResponse",
+            "User",
+            "Spawn",
+        ] {
+            let line = format!("{} value", ty);
+            let hl = hl_types(line.as_bytes(), &XSH_RULES);
+            assert_eq!(hl[0], HighlightKind::Type, "{ty} should be a type");
+            assert_eq!(hl[0], hl[ty.len() - 1], "whole {ty} identifier");
+        }
+    }
+
+    #[test]
+    fn test_xsh_realistic_program() {
+        // A realistic XSH pipeline drawn from examples/streams.xsh.
+        let lines: &[&[u8]] = &[
+            b"let root_handle = fs.tempdir()?",
+            b"defer fs.close_root(root_handle)?",
+            b"let root = fs.root_path(root_handle)?",
+            b"let src = fp\"${root}/src\"",
+            b"src.mkdir()",
+            b"let reports = fs.files(root)",
+            b"  |> where .kind == \"file\"",
+            b"  |> map { |entry|",
+            b"    {name: entry.name, size: entry.size, parent: entry.path.parent().name}",
+            b"  }",
+            b"  |> sort-by .name",
+            b"pure id(value: Str) -> Str { value }",
+        ];
+        let hls = hl_multiline(lines, &XSH_RULES);
+
+        // line 0: `let` keyword, `fs` module, `tempdir` is a function call
+        assert_eq!(hls[0][0], HighlightKind::Keyword); // let
+        assert_eq!(hls[0][18], HighlightKind::Macro); // fs
+        assert_eq!(hls[0][21], HighlightKind::Function); // tempdir
+        assert_eq!(hls[0][28], HighlightKind::Bracket); // (
+        // line 1: `defer` keyword
+        assert_eq!(hls[1][0], HighlightKind::Keyword); // defer
+        assert_eq!(hls[1][6], HighlightKind::Macro); // fs
+        // line 3: fp"..." string
+        assert!(hls[3][10..].iter().all(|&h| h == HighlightKind::String));
+        // line 5: `let`, `fs`, `files` function
+        assert_eq!(hls[5][0], HighlightKind::Keyword); // let
+        assert_eq!(hls[5][14], HighlightKind::Macro); // fs
+        assert_eq!(hls[5][17], HighlightKind::Function); // files
+        // line 6: `|>` operator, `where` stage
+        assert_eq!(hls[6][2], HighlightKind::Operator); // |
+        assert_eq!(hls[6][3], HighlightKind::Operator); // >
+        assert_eq!(hls[6][5], HighlightKind::Macro); // where
+        // line 7: `map` stage, `|entry|` is plain
+        assert_eq!(hls[7][5], HighlightKind::Macro); // map
+        assert_eq!(hls[7][10], HighlightKind::Normal); // entry
+        // line 10: `sort` of `sort-by` is a stage
+        assert_eq!(hls[10][5], HighlightKind::Macro); // sort
+        // line 11: `pure` keyword, `Str` type, `->` operator
+        assert_eq!(hls[11][0], HighlightKind::Keyword); // pure
+        assert_eq!(hls[11][17], HighlightKind::Type); // Str
+        assert_eq!(hls[11][20], HighlightKind::Operator); // ->
+    }
+
+    #[test]
+    fn test_xsh_type_schema_declaration() {
+        let hl = hl_types(b"type Config = { name: Str, retries: Int }", &XSH_RULES);
+        assert_eq!(hl[0], HighlightKind::Keyword); // type
+        assert_eq!(hl[24], HighlightKind::Type); // Str
+        assert_eq!(hl[37], HighlightKind::Type); // Int
+        assert_eq!(hl[16], HighlightKind::Normal); // name (field)
     }
 
     #[test]

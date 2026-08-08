@@ -58,10 +58,12 @@ name = "e"
 version = "0.1.13"
 dependencies = [
  "fxhash",
+ "proc-macro2",
  "proptest",
  "regex-lite",
  "rustix",
  "rustybench",
+ "syn 2.0.117",
  "vt100",
 ]
 
