@@ -2,6 +2,7 @@ FROM alpine:3.24.1
 
 ARG TARGETARCH
 ARG LLVM_VERSION=22.1.8
+ARG LLVM_RELEASE_SHA=e6297bf
 
 RUN apk add --no-cache \
     binutils \
@@ -20,8 +21,8 @@ RUN ar rcs /usr/lib/libutil.a
 
 # Use the same prebuilt LLVM family as the Linux CI image. The archive is
 # musl-linked so clang, lld, and the LLVM tools run inside Alpine.
-ADD https://github.com/laputa-systems/llvm-prebuilt-musl/releases/download/llvm-musl-${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-x86_64-linux-musl.tar.xz /tmp/llvm-x86_64.tar.xz
-ADD https://github.com/laputa-systems/llvm-prebuilt-musl/releases/download/llvm-musl-${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-aarch64-linux-musl.tar.xz /tmp/llvm-aarch64.tar.xz
+ADD https://github.com/laputa-systems/llvm-prebuilt-musl/releases/download/llvm-musl-${LLVM_VERSION}-${LLVM_RELEASE_SHA}/clang+llvm-${LLVM_VERSION}-x86_64-linux-musl.tar.xz /tmp/llvm-x86_64.tar.xz
+ADD https://github.com/laputa-systems/llvm-prebuilt-musl/releases/download/llvm-musl-${LLVM_VERSION}-${LLVM_RELEASE_SHA}/clang+llvm-${LLVM_VERSION}-aarch64-linux-musl.tar.xz /tmp/llvm-aarch64.tar.xz
 RUN case "$TARGETARCH" in \
         amd64) archive=/tmp/llvm-x86_64.tar.xz ;; \
         arm64) archive=/tmp/llvm-aarch64.tar.xz ;; \
@@ -55,11 +56,8 @@ ENV PATH="/opt/llvm-musl/bin:/root/.cargo/bin:$PATH" \
     CC="/opt/llvm-musl/bin/clang" \
     AR="/opt/llvm-musl/bin/llvm-ar" \
     RANLIB="/opt/llvm-musl/bin/llvm-ranlib" \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="rust-lld" \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="rust-lld"
-
-RUN llvm-strip --strip-debug /usr/lib/libc.a
-RUN llvm-strip --strip-debug /usr/lib/crt*.o /usr/lib/[S]*.o 2>/dev/null || true
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="/opt/llvm-musl/bin/clang" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="/opt/llvm-musl/bin/clang"
 
 RUN rustup toolchain install nightly-2026-07-24 \
     --target x86_64-unknown-linux-musl \
