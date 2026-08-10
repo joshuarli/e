@@ -123,8 +123,9 @@ pub struct InputParser {
 
     /// True when inside a bracketed paste.
     in_paste: bool,
-    /// Accumulated paste text.
-    paste_buf: String,
+    /// Accumulated paste bytes. Decode only after the paste terminator so
+    /// multibyte UTF-8 characters are not treated as separate characters.
+    paste_buf: Vec<u8>,
     /// True when the previous paste byte was CR (for CRLF → LF).
     paste_saw_cr: bool,
     /// Number of consecutive bytes matched against PASTE_END_MARKER.
@@ -143,7 +144,7 @@ impl InputParser {
             buf: [0; MAX_ESC_BUF],
             buf_len: 0,
             in_paste: false,
-            paste_buf: String::new(),
+            paste_buf: Vec::new(),
             paste_saw_cr: false,
             paste_term_match: 0,
         }
@@ -216,7 +217,8 @@ impl InputParser {
             if self.paste_term_match as usize == PASTE_END_MARKER.len() {
                 self.in_paste = false;
                 self.paste_term_match = 0;
-                let text = std::mem::take(&mut self.paste_buf);
+                let bytes = std::mem::take(&mut self.paste_buf);
+                let text = String::from_utf8_lossy(&bytes).into_owned();
                 self.paste_saw_cr = false;
                 return Some(EditorEvent::Paste(text));
             }
@@ -239,22 +241,22 @@ impl InputParser {
     fn emit_paste_byte(&mut self, byte: u8) {
         match byte {
             0x0D => {
-                self.paste_buf.push('\n');
+                self.paste_buf.push(b'\n');
                 self.paste_saw_cr = true;
             }
             0x0A => {
                 if !self.paste_saw_cr {
-                    self.paste_buf.push('\n');
+                    self.paste_buf.push(b'\n');
                 }
                 self.paste_saw_cr = false;
             }
             0x7F => {
                 self.paste_saw_cr = false;
-                self.paste_buf.push('\x7f');
+                self.paste_buf.push(0x7f);
             }
             b => {
                 self.paste_saw_cr = false;
-                self.paste_buf.push(b as char);
+                self.paste_buf.push(b);
             }
         }
     }
@@ -839,6 +841,28 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             EditorEvent::Paste(text) => assert_eq!(text, "line1\nline2"),
+            _ => panic!("expected Paste"),
+        }
+    }
+
+    #[test]
+    fn test_paste_decodes_utf8_as_text() {
+        let mut events = Vec::new();
+        let mut parser = InputParser::new();
+        let text = "— “ café 日本";
+        let mut input = b"\x1b[200~".to_vec();
+        input.extend_from_slice(text.as_bytes());
+        input.extend_from_slice(b"\x1b[201~");
+
+        for byte in input {
+            if let Some(event) = parser.advance(byte) {
+                events.push(event);
+            }
+        }
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            EditorEvent::Paste(pasted) => assert_eq!(pasted, text),
             _ => panic!("expected Paste"),
         }
     }
