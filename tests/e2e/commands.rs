@@ -120,7 +120,7 @@ fn quit_command() {
     e.ctrl('p');
     e.type_text("quit");
     e.enter();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    e.wait_until(std::time::Duration::from_secs(2), |e| e.has_exited());
     assert!(e.has_exited(), "quit command should exit the editor");
 }
 
@@ -132,7 +132,7 @@ fn q_alias_for_quit() {
     e.ctrl('p');
     e.type_text("q");
     e.enter();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    e.wait_until(std::time::Duration::from_secs(2), |e| e.has_exited());
     assert!(e.has_exited(), "q command should exit the editor");
 }
 
@@ -146,7 +146,9 @@ fn trim_command() {
     e.enter();
     // Save and check file content
     e.ctrl('s');
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    e.wait_until(std::time::Duration::from_secs(2), |_| {
+        std::fs::read_to_string(&path).is_ok_and(|content| content == "hello\nworld\n")
+    });
     let content = std::fs::read_to_string(&path).unwrap();
     assert_eq!(
         content, "hello\nworld\n",

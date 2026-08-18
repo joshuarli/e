@@ -1,10 +1,11 @@
 use std::fmt::Write as FmtWrite;
 use std::io::{Read, Write};
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,8 +31,17 @@ unsafe extern "C" {
     fn ioctl(fd: CInt, request: usize, ...) -> CInt;
     fn dup(fd: CInt) -> CInt;
     fn fcntl(fd: CInt, command: CInt, argument: CInt) -> CInt;
+    fn poll(fds: *mut PollFd, count: usize, timeout_ms: CInt) -> CInt;
     fn setsid() -> CInt;
     fn close(fd: CInt) -> CInt;
+    fn kill(pid: CInt, signal: CInt) -> CInt;
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: CInt,
+    events: i16,
+    revents: i16,
 }
 
 #[cfg(target_os = "linux")]
@@ -44,6 +54,17 @@ const TIOCSCTTY: usize = 0x540e;
 const TIOCSCTTY: usize = 0x2000_7461;
 const F_SETFD: CInt = 2;
 const FD_CLOEXEC: CInt = 1;
+const F_GETFD: CInt = 1;
+const F_GETFL: CInt = 3;
+const F_SETFL: CInt = 4;
+const O_NONBLOCK: CInt = 0x4;
+const POLLIN: i16 = 0x001;
+const POLLOUT: i16 = 0x004;
+const POLLERR: i16 = 0x008;
+const POLLHUP: i16 = 0x010;
+const POLLNVAL: i16 = 0x020;
+const SIGTERM: CInt = 15;
+const SIGKILL: CInt = 9;
 
 // ---------------------------------------------------------------------------
 // Key — escape sequences for special keys
@@ -108,10 +129,15 @@ pub struct TempDir(PathBuf);
 impl TempDir {
     pub fn new() -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("e_test_{}_{}", std::process::id(), id));
-        std::fs::create_dir_all(&path).unwrap();
-        TempDir(path)
+        loop {
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("e_test_{}_{}", std::process::id(), id));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return TempDir(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create temporary e2e directory: {error}"),
+            }
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -228,6 +254,7 @@ pub struct TestEditor {
     child: Child,
     parser: vt100::Parser,
     rx: mpsc::Receiver<Vec<u8>>,
+    reader_stop: Arc<AtomicBool>,
     _reader: Option<thread::JoinHandle<()>>,
     pub home: TempDir,
     pub rows: u16,
@@ -295,17 +322,24 @@ impl TestEditor {
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             };
-            ioctl(m, TIOCSWINSZ, &ws);
+            assert_eq!(ioctl(m, TIOCSWINSZ, &ws), 0, "setting PTY size failed");
             (m, s)
         };
 
-        // Dup master for the reader thread; set CLOEXEC on both.
+        // Dup master for the reader thread; keep every PTY descriptor out of
+        // unrelated child processes and use bounded, nonblocking I/O below.
         let reader_fd = unsafe { dup(master_fd) };
         assert!(reader_fd >= 0, "dup master failed");
-        unsafe {
-            fcntl(master_fd, F_SETFD, FD_CLOEXEC);
-            fcntl(reader_fd, F_SETFD, FD_CLOEXEC);
+        for fd in [master_fd, reader_fd, slave_fd] {
+            let flags = unsafe { fcntl(fd, F_GETFD, 0) };
+            assert!(flags >= 0, "fcntl(F_GETFD) failed");
+            let result = unsafe { fcntl(fd, F_SETFD, flags | FD_CLOEXEC) };
+            assert_eq!(result, 0, "fcntl(FD_CLOEXEC) failed");
         }
+        let flags = unsafe { fcntl(master_fd, F_GETFL, 0) };
+        assert!(flags >= 0, "fcntl(F_GETFL) failed");
+        let result = unsafe { fcntl(master_fd, F_SETFL, flags | O_NONBLOCK) };
+        assert_eq!(result, 0, "fcntl(O_NONBLOCK) failed");
 
         // Spawn the editor.
         let binary = if let Some(path) = std::env::var_os("E_PGO_BINARY") {
@@ -335,15 +369,27 @@ impl TestEditor {
         if let Some(profile_dir) = profile_dir {
             command.env("LLVM_PROFILE_FILE", profile_dir.join("e-%p.profraw"));
         }
+        let stdin_fd = unsafe { dup(slave_fd) };
+        let stdout_fd = unsafe { dup(slave_fd) };
+        let stderr_fd = unsafe { dup(slave_fd) };
+        assert!(stdin_fd >= 0, "dup slave for stdin failed");
+        assert!(stdout_fd >= 0, "dup slave for stdout failed");
+        assert!(stderr_fd >= 0, "dup slave for stderr failed");
         let child = unsafe {
             command
-                .stdin(Stdio::from_raw_fd(dup(slave_fd)))
-                .stdout(Stdio::from_raw_fd(dup(slave_fd)))
-                .stderr(Stdio::from_raw_fd(dup(slave_fd)))
+                .stdin(Stdio::from_raw_fd(stdin_fd))
+                .stdout(Stdio::from_raw_fd(stdout_fd))
+                .stderr(Stdio::from_raw_fd(stderr_fd))
                 .pre_exec(move || {
-                    setsid();
-                    ioctl(0, TIOCSCTTY, 0);
-                    close(slave_fd);
+                    if setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if ioctl(0, TIOCSCTTY, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if close(slave_fd) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                     Ok(())
                 })
                 .spawn()
@@ -358,17 +404,52 @@ impl TestEditor {
 
         // --- reader thread: PTY output → channel ---
         let (tx, rx) = mpsc::channel();
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let reader_stop_for_thread = Arc::clone(&reader_stop);
         let reader = thread::spawn(move || {
             let mut r = unsafe { std::fs::File::from_raw_fd(reader_fd) };
             let mut buf = [0u8; 4096];
             loop {
-                match r.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            break;
+                if reader_stop_for_thread.load(Ordering::Acquire) {
+                    break;
+                }
+
+                let mut poll_fd = PollFd {
+                    fd: r.as_raw_fd(),
+                    events: POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe { poll(&mut poll_fd, 1, 50) };
+                if ready < 0 {
+                    if std::io::Error::last_os_error().kind()
+                        == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    break;
+                }
+                if ready == 0 {
+                    continue;
+                }
+
+                if poll_fd.revents & POLLIN != 0 {
+                    loop {
+                        match r.read(&mut buf) {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                if tx.send(buf[..n].to_vec()).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => return,
                         }
                     }
+                }
+
+                if poll_fd.revents & (POLLHUP | POLLERR | POLLNVAL) != 0 {
+                    break;
                 }
             }
         });
@@ -380,6 +461,7 @@ impl TestEditor {
             child,
             parser,
             rx,
+            reader_stop,
             _reader: Some(reader),
             home,
             rows,
@@ -409,8 +491,35 @@ impl TestEditor {
 
     /// Block until output quiesces for `quiet`.
     fn drain_timeout(&mut self, quiet: Duration) {
-        while let Ok(data) = self.rx.recv_timeout(quiet) {
-            self.process_output(&data);
+        // A quiet period is useful for coalescing redraw chunks, but it must
+        // not turn into an unbounded wait if the child keeps producing data.
+        // Give the first frame a little more time under a loaded test runner;
+        // otherwise a quiet PTY before the reader thread's first wakeup can
+        // make an input action appear to have been ignored.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let first_output_deadline = Instant::now() + Duration::from_millis(100);
+        let mut saw_output = false;
+        loop {
+            let end = if saw_output {
+                deadline
+            } else {
+                first_output_deadline.min(deadline)
+            };
+            let remaining = end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let wait = quiet.min(remaining);
+            match self.rx.recv_timeout(wait) {
+                Ok(data) => {
+                    saw_output = true;
+                    self.process_output(&data);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) if !saw_output => continue,
+                Err(
+                    mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected,
+                ) => break,
+            }
         }
     }
 
@@ -451,13 +560,84 @@ impl TestEditor {
         self.drain_timeout(Duration::from_millis(15));
     }
 
+    /// Wait until a semantic editor state is visible, with a bounded timeout.
+    ///
+    /// PTY output is chunked independently of editor frames. Callers should
+    /// use this for state transitions instead of sleeping for a guessed
+    /// redraw duration.
+    pub fn wait_until<F>(&mut self, timeout: Duration, mut ready: F)
+    where
+        F: FnMut(&mut Self) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain_available();
+            if ready(self) {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                panic!("editor did not reach the expected state within {timeout:?}");
+            }
+            self.drain_timeout(Duration::from_millis(5).min(remaining));
+        }
+    }
+
+    fn write_all_timeout(&mut self, bytes: &[u8], timeout: Duration) -> std::io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut written = 0;
+        while written < bytes.len() {
+            match self.master.write(&bytes[written..]) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "PTY write made no progress",
+                    ));
+                }
+                Ok(n) => written += n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "PTY write timed out",
+                        ));
+                    }
+                    let timeout_ms = remaining.as_millis().clamp(1, 100) as CInt;
+                    let mut poll_fd = PollFd {
+                        fd: self.master.as_raw_fd(),
+                        events: POLLOUT,
+                        revents: 0,
+                    };
+                    let ready = unsafe { poll(&mut poll_fd, 1, timeout_ms) };
+                    if ready < 0 {
+                        let poll_error = std::io::Error::last_os_error();
+                        if poll_error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(poll_error);
+                    }
+                    if poll_fd.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "PTY master closed",
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     /// Send raw bytes to the editor's stdin.
     pub fn send_raw(&mut self, bytes: &[u8]) {
         if let Some(rec) = &mut self.recording {
             rec.push('i', bytes);
         }
-        self.master.write_all(bytes).unwrap();
-        self.master.flush().unwrap();
+        self.write_all_timeout(bytes, Duration::from_secs(5))
+            .unwrap_or_else(|error| panic!("PTY write failed: {error}"));
     }
 
     /// Type printable text.
@@ -673,15 +853,68 @@ impl Drop for TestEditor {
         {
             rec.save(&path);
         }
-        // Try to quit gracefully.
-        let _ = self.master.write_all(&[0x11]); // Ctrl+Q
-        let _ = self.master.flush();
-        thread::sleep(Duration::from_millis(30));
-        let _ = self.master.write_all(b"n");
-        let _ = self.master.flush();
-        thread::sleep(Duration::from_millis(30));
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+
+        // Try to quit gracefully, but never block teardown on a PTY that has
+        // already closed. The editor is a session leader, so the negative PID
+        // targets its process group and also cleans up descendants.
+        let child_pid = self.child.id() as CInt;
+        let mut exited = self.child.try_wait().ok().flatten().is_some();
+        if !exited {
+            let _ = self.write_all_timeout(b"\x11n", Duration::from_millis(100));
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    exited = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        if !exited {
+            unsafe {
+                kill(-child_pid, SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    exited = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        if !exited {
+            unsafe {
+                kill(-child_pid, SIGKILL);
+            }
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    exited = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            if !exited {
+                // The group kill should make this return promptly. Keep a
+                // final direct kill for platforms where setsid was rejected.
+                let _ = self.child.kill();
+                let deadline = Instant::now() + Duration::from_millis(250);
+                while Instant::now() < deadline {
+                    if self.child.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+
+        self.reader_stop.store(true, Ordering::Release);
+        if let Some(reader) = self._reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -697,4 +930,33 @@ pub fn create_file(dir: &Path, name: &str, content: &str) -> PathBuf {
     }
     std::fs::write(&path, content).unwrap();
     path
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn vt100_parser_retains_split_escape_sequences() {
+        let mut parser = vt100::Parser::new(3, 12, 0);
+        parser.process(b"before\x1b[");
+        parser.process(b"2J\x1b[Hafter");
+
+        let screen = parser.screen();
+        assert_eq!(screen.cell(0, 0).unwrap().contents(), "a");
+        assert_eq!(screen.cell(0, 4).unwrap().contents(), "r");
+    }
+
+    #[test]
+    fn vt100_parser_tracks_utf8_display_width_and_erase() {
+        let mut parser = vt100::Parser::new(3, 12, 0);
+        parser.process("日本語".as_bytes());
+
+        assert_eq!(parser.screen().cursor_position(), (0, 6));
+        assert_eq!(parser.screen().cell(0, 2).unwrap().contents(), "本");
+
+        parser.process(b"\x1b[1;1H\x1b[31mred\x1b[K");
+        let screen = parser.screen();
+        assert_eq!(screen.cell(0, 0).unwrap().contents(), "r");
+        assert_eq!(screen.cell(0, 0).unwrap().fgcolor(), vt100::Color::Idx(1));
+        assert!(screen.cell(0, 5).unwrap().contents().is_empty());
+    }
 }

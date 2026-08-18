@@ -14,7 +14,10 @@ fn save_writes_file() {
     e.key(Key::End);
     e.type_text(" modified");
     e.ctrl('s');
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    e.wait_until(std::time::Duration::from_secs(2), |_| {
+        std::fs::read_to_string(&path)
+            .is_ok_and(|content| content.contains("original modified"))
+    });
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(
         content.contains("original modified"),
@@ -30,7 +33,9 @@ fn save_strips_trailing_whitespace() {
     e.key(Key::End);
     e.type_text("   "); // add trailing spaces
     e.ctrl('s');
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    e.wait_until(std::time::Duration::from_secs(2), |_| {
+        std::fs::read_to_string(&path).is_ok_and(|content| content == "hello\n")
+    });
     let content = std::fs::read_to_string(&path).unwrap();
     assert_eq!(
         content, "hello\n",
@@ -45,7 +50,9 @@ fn save_ensures_trailing_newline() {
     let path = create_file(dir.path(), "test.txt", "no newline");
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
     e.ctrl('s');
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    e.wait_until(std::time::Duration::from_secs(2), |_| {
+        std::fs::read_to_string(&path).is_ok_and(|content| content.ends_with('\n'))
+    });
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(
         content.ends_with('\n'),
@@ -60,7 +67,9 @@ fn save_creates_parent_dirs() {
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
     e.type_text("hello");
     e.ctrl('s');
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    e.wait_until(std::time::Duration::from_secs(2), |_| {
+        std::fs::read_to_string(&path).is_ok_and(|content| content.contains("hello"))
+    });
     assert!(path.exists(), "save should create parent directories");
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(content.contains("hello"), "saved content: {content}");
@@ -90,7 +99,7 @@ fn save_as_with_filename() {
     // Type the filename in the prompt
     e.type_text(path.to_str().unwrap());
     e.enter();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    e.wait_until(std::time::Duration::from_secs(2), |_| path.exists());
     assert!(path.exists(), "file should be created by save-as");
 }
 
@@ -100,7 +109,7 @@ fn quit_clean_exits() {
     let path = create_file(dir.path(), "test.txt", "hello\n");
     let mut e = TestEditor::new(&[path.to_str().unwrap()]);
     e.ctrl('q');
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    e.wait_until(std::time::Duration::from_secs(2), |e| e.has_exited());
     assert!(e.has_exited(), "Ctrl+Q on clean buffer should exit");
 }
 
@@ -119,8 +128,7 @@ fn quit_dirty_prompts() {
     );
     // Answer 'n' to not save
     e.send_raw(b"n");
-    e.wait();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    e.wait_until(std::time::Duration::from_secs(2), |e| e.has_exited());
     assert!(e.has_exited(), "should exit after answering 'n'");
 }
 
@@ -133,8 +141,10 @@ fn quit_dirty_save_and_exit() {
     e.type_text(" modified");
     e.ctrl('q');
     e.send_raw(b"y"); // save
-    e.wait();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    e.wait_until(std::time::Duration::from_secs(2), |_| {
+        std::fs::read_to_string(&path)
+            .is_ok_and(|content| content.contains("hello modified"))
+    });
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(
         content.contains("hello modified"),
@@ -151,7 +161,7 @@ fn quit_dirty_cancel() {
     e.ctrl('q');
     // Press some other key to cancel
     e.escape();
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    e.wait();
     assert!(
         !e.has_exited(),
         "Esc should cancel quit and keep editor running"
