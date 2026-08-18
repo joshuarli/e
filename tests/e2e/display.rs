@@ -38,7 +38,7 @@ fn status_bar_has_grey_background() {
     // \x1b[100m = bright black (dark grey) background
     assert_eq!(
         bg,
-        vt100::Color::Idx(8),
+        ptytest::Color::Indexed(8),
         "status bar should have dark grey background"
     );
 }
@@ -88,7 +88,7 @@ fn trailing_whitespace_not_highlighted() {
     let bg = e.cell_bg(0, 7);
     assert_eq!(
         bg,
-        vt100::Color::Default,
+        ptytest::Color::Default,
         "trailing whitespace should not be highlighted"
     );
 }
@@ -118,7 +118,7 @@ fn syntax_highlight_rust_keyword() {
     // Keywords should be yellow (Idx(3))
     assert_eq!(
         fg_f,
-        vt100::Color::Idx(3),
+        ptytest::Color::Indexed(3),
         "Rust keyword 'fn' should be yellow"
     );
 }
@@ -133,7 +133,7 @@ fn syntax_highlight_string() {
     if let Some(pos) = r.find('"') {
         let fg = e.cell_fg(0, pos as u16 + 1); // character after opening quote
         // Strings should be green (Idx(2))
-        assert_eq!(fg, vt100::Color::Idx(2), "string content should be green");
+        assert_eq!(fg, ptytest::Color::Indexed(2), "string content should be green");
     }
 }
 
@@ -148,7 +148,7 @@ fn syntax_highlight_comment() {
     // Comments should be grey (Idx(8) or similar dark color)
     assert_ne!(
         fg,
-        vt100::Color::Default,
+        ptytest::Color::Default,
         "comment should have a non-default color"
     );
 }
@@ -164,7 +164,7 @@ fn bracket_matching() {
     // Magenta = Idx(5)
     assert_eq!(
         bg_close,
-        vt100::Color::Idx(5),
+        ptytest::Color::Indexed(5),
         "matching bracket should have magenta background"
     );
     // The cursor's own '(' should NOT be highlighted — the terminal cursor
@@ -172,7 +172,7 @@ fn bracket_matching() {
     let bg_open = e.cell_bg(0, 2); // '(' position
     assert_ne!(
         bg_open,
-        vt100::Color::Idx(5),
+        ptytest::Color::Indexed(5),
         "cursor's own bracket should not have magenta background"
     );
 }
@@ -187,14 +187,14 @@ fn quote_match_only_highlights_match() {
     let bg_close = e.cell_bg(0, 8);
     assert_eq!(
         bg_close,
-        vt100::Color::Idx(5),
+        ptytest::Color::Indexed(5),
         "matching quote should have magenta background"
     );
     // The cursor's own '"' should NOT be highlighted
     let bg_open = e.cell_bg(0, 2);
     assert_ne!(
         bg_open,
-        vt100::Color::Idx(5),
+        ptytest::Color::Indexed(5),
         "cursor's own quote should not have magenta background"
     );
 }
@@ -234,7 +234,7 @@ fn markdown_highlighting() {
     let fg = e.cell_fg(0, 2);
     assert_eq!(
         fg,
-        vt100::Color::Idx(3),
+        ptytest::Color::Indexed(3),
         "Markdown header '#' should be yellow"
     );
 }

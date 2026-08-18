@@ -10,7 +10,7 @@ rustix = { version = "1.1.4", features = ["runtime", "termios"] }
 
 [dev-dependencies]
 rustybench = "0.1"
-vt100 = "0.15"
+ptytest = { path = "../ptytest" }
 proptest = "1"
 # Dev-only tooling: `examples/gen_xsh.rs` parses the XSH registry source with
 # `syn` to regenerate src/xsh_lang.rs; `tests/xsh_lang.rs` verifies freshness.

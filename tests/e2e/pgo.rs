@@ -44,8 +44,9 @@ fn profile_editor_startup_find_edit() {
 
     editor.quit_no_save();
     let exit_status = editor.wait_for_exit();
-    assert!(
-        exit_status.success(),
-        "profile workload child failed: {exit_status}"
+    assert_eq!(
+        exit_status,
+        ptytest::ExitStatus::Code(0),
+        "profile workload child failed: {exit_status:?}"
     );
 }
