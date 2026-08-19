@@ -47,4 +47,6 @@ cargo bench --bench hi_lite
 
 The crate benchmark is intentionally weighted toward small, syntax-complete
 snippets. The warm aggregate is the steady-state target; cold runs expose
-allocation costs for callers that do not retain their scratch buffer.
+allocation costs for callers that do not retain their scratch buffer. The
+`hi_lite_highlight_single_lines_{warm,cold}` pair isolates one representative
+line from each fixture for latency-sensitive editor use.

@@ -502,20 +502,7 @@ fn highlight_line_code(
             }
             let id = &line[id_start..i];
 
-            // Binary search each sorted keyword list.
-            let matched = if keyword_search(id, rules.keywords) {
-                Some(Kind::Keyword)
-            } else if keyword_search(id, rules.types) {
-                Some(Kind::Type)
-            } else if keyword_search(id, rules.constants) {
-                Some(Kind::Constant)
-            } else if keyword_search(id, rules.macros) {
-                Some(Kind::Macro)
-            } else {
-                None
-            };
-
-            if let Some(hl_type) = matched {
+            if let Some(hl_type) = identifier_kind(id, rules) {
                 for b in &mut hl[id_start..i] {
                     *b = hl_type;
                 }
@@ -1298,10 +1285,17 @@ fn scan_number_end(line: &[u8], start: usize) -> usize {
 
 /// Match the longest operator, regardless of static table order.
 fn try_operator(line: &[u8], pos: usize, ops: &[&str], hl: &mut [Kind]) -> Option<usize> {
+    // Operators in the rule tables always begin with punctuation. Avoid
+    // walking every operator candidate for the common identifier/whitespace
+    // bytes that reach this fallback path after the specialized scanners.
+    let first = line[pos];
+    if first.is_ascii_alphanumeric() || first == b'_' || first.is_ascii_whitespace() {
+        return None;
+    }
+
     let mut best_len = 0;
     // Operator tables are shared by generic lexers; reject different first
     // bytes before doing a longer slice comparison at each source position.
-    let first = line[pos];
     for &op in ops {
         let ob = op.as_bytes();
         if ob.len() > best_len
@@ -1321,8 +1315,29 @@ fn try_operator(line: &[u8], pos: usize, ops: &[&str], hl: &mut [Kind]) -> Optio
 }
 
 /// Binary search a **sorted** keyword list for an exact match.
+#[inline]
 fn keyword_search(id: &[u8], words: &[&str]) -> bool {
-    words.binary_search_by(|w| w.as_bytes().cmp(id)).is_ok()
+    !words.is_empty() && words.binary_search_by(|w| w.as_bytes().cmp(id)).is_ok()
+}
+
+/// Classify an identifier using the shared rule-table precedence.
+///
+/// Empty categories are skipped before entering their binary search. Most
+/// languages do not define constants or macros, so this keeps the common
+/// identifier path to the categories that can actually match.
+#[inline]
+fn identifier_kind(id: &[u8], rules: &RuleSet) -> Option<Kind> {
+    if keyword_search(id, rules.keywords) {
+        Some(Kind::Keyword)
+    } else if keyword_search(id, rules.types) {
+        Some(Kind::Type)
+    } else if keyword_search(id, rules.constants) {
+        Some(Kind::Constant)
+    } else if keyword_search(id, rules.macros) {
+        Some(Kind::Macro)
+    } else {
+        None
+    }
 }
 
 // -- Semver highlighting ----------------------------------------------------
@@ -2501,6 +2516,9 @@ impl Highlighter {
     }
 
     /// Highlight one line, reusing the caller's scratch allocation.
+    ///
+    /// Once `scratch` has capacity for the largest line, repeated calls do not
+    /// allocate; callers can reserve that capacity once when opening a file.
     pub fn highlight_into<'a>(&mut self, line: &[u8], scratch: &'a mut Vec<Kind>) -> &'a [Kind] {
         scratch.resize(line.len(), Kind::Normal);
         // `Vec::resize` preserves existing elements when the next line has

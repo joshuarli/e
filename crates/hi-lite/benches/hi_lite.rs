@@ -199,6 +199,76 @@ fn configure_corpus_bench<'a, 'b>(
         .counter(ItemsCount::new(lines * CORPUS_REPETITIONS))
 }
 
+// Keep one representative non-empty line per language so the small-input
+// benchmark measures call latency without making fixture setup part of it.
+fn single_lines(fixtures: &[Fixture]) -> Vec<&'static [u8]> {
+    fixtures
+        .iter()
+        .map(|fixture| {
+            fixture
+                .lines
+                .iter()
+                .copied()
+                .find(|line| !line.is_empty())
+                .unwrap_or(&[])
+        })
+        .collect()
+}
+
+fn single_line_totals(lines: &[&[u8]]) -> (usize, usize) {
+    (
+        lines.iter().map(|line| line.len()).sum(),
+        lines.len(),
+    )
+}
+
+fn scratch_for_lines(lines: &[&[u8]]) -> Vec<Kind> {
+    let capacity = lines.iter().map(|line| line.len()).max().unwrap_or(0);
+    Vec::with_capacity(capacity)
+}
+
+fn warm_single_line_corpus(
+    lines: &[&'static [u8]],
+    highlighters: &mut [Highlighter],
+    repetitions: usize,
+    scratch: &mut Vec<Kind>,
+) -> u64 {
+    let mut checksum = 0;
+    for _ in 0..repetitions {
+        for (highlighter, line) in highlighters.iter_mut().zip(lines) {
+            highlighter.reset();
+            checksum ^= highlight_once(highlighter, std::slice::from_ref(line), scratch);
+        }
+    }
+    checksum
+}
+
+fn cold_single_line_corpus(
+    fixtures: &[Fixture],
+    lines: &[&'static [u8]],
+    repetitions: usize,
+) -> u64 {
+    let mut checksum = 0;
+    for _ in 0..repetitions {
+        for (fixture, line) in fixtures.iter().zip(lines) {
+            let mut highlighter = Highlighter::new(fixture.language);
+            let mut scratch = Vec::new();
+            checksum ^= highlight_once(&mut highlighter, std::slice::from_ref(line), &mut scratch);
+        }
+    }
+    checksum
+}
+
+fn configure_single_line_bench<'a, 'b>(
+    bencher: Bencher<'a, 'b>,
+    lines: &[&[u8]],
+) -> Bencher<'a, 'b> {
+    let (bytes, line_count) = single_line_totals(lines);
+    bencher
+        .counter(BytesCount::new(bytes * CORPUS_REPETITIONS))
+        .counter(ItemsCount::new(line_count * CORPUS_REPETITIONS))
+}
+
 #[rustybench::bench]
 fn hi_lite_highlight_all_goldens_warm(bencher: Bencher) {
     let fixtures = load_fixtures();
@@ -222,6 +292,34 @@ fn hi_lite_highlight_all_goldens_cold(bencher: Bencher) {
     let fixtures = load_fixtures();
     configure_corpus_bench(bencher, &fixtures).bench_local(|| {
         black_box(cold_corpus(&fixtures, CORPUS_REPETITIONS));
+    });
+}
+
+#[rustybench::bench]
+fn hi_lite_highlight_single_lines_warm(bencher: Bencher) {
+    let fixtures = load_fixtures();
+    let lines = single_lines(&fixtures);
+    let mut highlighters: Vec<_> = fixtures
+        .iter()
+        .map(|fixture| Highlighter::new(fixture.language))
+        .collect();
+    let mut scratch = scratch_for_lines(&lines);
+    configure_single_line_bench(bencher, &lines).bench_local(|| {
+        black_box(warm_single_line_corpus(
+            &lines,
+            &mut highlighters,
+            CORPUS_REPETITIONS,
+            &mut scratch,
+        ));
+    });
+}
+
+#[rustybench::bench]
+fn hi_lite_highlight_single_lines_cold(bencher: Bencher) {
+    let fixtures = load_fixtures();
+    let lines = single_lines(&fixtures);
+    configure_single_line_bench(bencher, &lines).bench_local(|| {
+        black_box(cold_single_line_corpus(&fixtures, &lines, CORPUS_REPETITIONS));
     });
 }
 
