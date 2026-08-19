@@ -1,8 +1,0 @@
-# hi-lite-golden-v1
-# fallback semantic runs for languages without a syntect default grammar
-
-line 1: 0..27=comment
-line 2: 0..8=keyword
-line 3: 0..5=keyword 5..7=normal 7..18=string
-line 4: 0..5=keyword 5..7=normal 7..11=number
-line 5: 0..8=keyword 8..10=normal 10..13=type 13..14=normal 14..30=comment

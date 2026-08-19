@@ -1,4 +1,4 @@
-//! Regenerate the XSH vocabulary region inside `crates/hi-lite/src/languages/xsh.rs`, the
+//! Regenerate the XSH vocabulary region inside `../hi-lite/src/languages/xsh.rs`, the
 //! syntax-highlighting vocabulary used by the editor's byte-oriented
 //! highlighter.
 //!
@@ -525,7 +525,7 @@ pub fn default_repo() -> PathBuf {
 fn run() -> Result<bool, Box<dyn Error>> {
     let mut repo: PathBuf = default_repo();
     let mut out: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("crates")
+        .join("..")
         .join("hi-lite")
         .join("src")
         .join("languages")
@@ -546,7 +546,7 @@ fn run() -> Result<bool, Box<dyn Error>> {
                 println!(
                     "usage: gen-xsh [--repo PATH] [--out PATH] [--check]\n\
                      reads the vocabulary from the XSH registry source with `syn`\n\
-                     and rewrites (or checks) the generated region of crates/hi-lite/src/languages/xsh.rs."
+                     and rewrites (or checks) the generated region of ../hi-lite/src/languages/xsh.rs."
                 );
                 process::exit(0);
             }
@@ -566,10 +566,10 @@ fn run() -> Result<bool, Box<dyn Error>> {
 
     if check {
         if spliced == existing {
-            println!("crates/hi-lite/src/languages/xsh.rs is up to date");
+            println!("../hi-lite/src/languages/xsh.rs is up to date");
             return Ok(true);
         }
-        eprintln!("crates/hi-lite/src/languages/xsh.rs is out of date; run `make gen-xsh`");
+        eprintln!("../hi-lite/src/languages/xsh.rs is out of date; run `make gen-xsh`");
         return Ok(false);
     }
 

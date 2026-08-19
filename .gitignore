@@ -1,6 +1,4 @@
 /target
-crates/hi-lite/target
-tools/hi-lite-syntect/target
 .roam/
 tests/e2e/recordings
 .DS_Store

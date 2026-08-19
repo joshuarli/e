@@ -1,8 +1,0 @@
-[package]
-name = "hi-lite-syntect"
-version = "0.1.0"
-edition = "2021"
-publish = false
-
-[dependencies]
-syntect = "5.3.0"
