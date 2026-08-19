@@ -397,7 +397,51 @@ pub fn detect(filename: &str) -> Option<DetectedLanguage> {
             }
         }
     }
+    // Keep the editor's policy table small while allowing every syntax known
+    // by hi-lite to participate in filename detection. Plain text remains an
+    // intentional absence of syntax, so ordinary `.txt` files still return
+    // `None` here.
+    let mut suffix = basename;
+    while let Some((_, remainder)) = suffix.split_once('.') {
+        suffix = remainder;
+        if let Some(syntax) = hi_lite::Language::from_extension(suffix) {
+            if syntax == hi_lite::Language::PlainText {
+                return None;
+            }
+            return Some(DetectedLanguage {
+                name: syntax.name(),
+                comment: comment_for_syntax(syntax),
+            });
+        }
+    }
     None
+}
+
+fn comment_for_syntax(language: hi_lite::Language) -> &'static str {
+    match language {
+        hi_lite::Language::Html | hi_lite::Language::Xml => "<!--",
+        hi_lite::Language::Css | hi_lite::Language::Scss | hi_lite::Language::Less => "/*",
+        hi_lite::Language::Bash
+        | hi_lite::Language::Python
+        | hi_lite::Language::Ini
+        | hi_lite::Language::Yaml
+        | hi_lite::Language::Makefile
+        | hi_lite::Language::Dockerfile
+        | hi_lite::Language::Perl
+        | hi_lite::Language::R
+        | hi_lite::Language::Ruby
+        | hi_lite::Language::Tcl
+        | hi_lite::Language::Markdown
+        | hi_lite::Language::Batch => "#",
+        hi_lite::Language::Erlang => "%",
+        hi_lite::Language::Haskell
+        | hi_lite::Language::Lua
+        | hi_lite::Language::Sql => "--",
+        hi_lite::Language::LaTeX | hi_lite::Language::Matlab => "%",
+        hi_lite::Language::Lisp | hi_lite::Language::Clojure => ";",
+        hi_lite::Language::PlainText | hi_lite::Language::Json | hi_lite::Language::Regex => "",
+        _ => "//",
+    }
 }
 
 /// Map interpreter names (from shebangs) to languages.
@@ -504,6 +548,15 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_falls_back_to_hi_lite_extension_registry() {
+        assert_eq!(detect("lib/example.groovy").unwrap().syntax(), Some(hi_lite::Language::Groovy));
+        assert_eq!(detect("web/page.jsp").unwrap().syntax(), Some(hi_lite::Language::Html));
+        assert_eq!(detect("README.rst").unwrap().syntax(), Some(hi_lite::Language::Markdown));
+        assert_eq!(detect("views/page.css.erb").unwrap().syntax(), Some(hi_lite::Language::Css));
+        assert!(detect("notes.txt").is_none());
+    }
+
+    #[test]
     fn test_detected_language_delegates_syntax_selection() {
         assert_eq!(
             detect("main.rs").unwrap().syntax(),
@@ -511,8 +564,8 @@ mod tests {
         );
         assert_eq!(
             detect("main.cpp").unwrap().syntax(),
-            None,
-            "detection can retain comment support without claiming a hi-lite lexer"
+            Some(hi_lite::Language::Cpp),
+            "syntect-supported languages delegate to a reusable hi-lite lexer"
         );
     }
 

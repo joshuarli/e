@@ -4,6 +4,7 @@ pub(crate) mod bash;
 pub(crate) mod c;
 pub(crate) mod css;
 pub(crate) mod dockerfile;
+pub(crate) mod generic;
 pub(crate) mod go;
 pub(crate) mod html;
 pub(crate) mod ini;
@@ -22,6 +23,10 @@ pub(crate) use bash::RULES as BASH_RULES;
 pub(crate) use c::RULES as C_RULES;
 pub(crate) use css::RULES as CSS_RULES;
 pub(crate) use dockerfile::RULES as DOCKERFILE_RULES;
+pub(crate) use generic::{
+    C_LIKE_RULES, DASH_RULES, ERLANG_RULES, HASH_SCRIPT_RULES, LISP_RULES, SQL_RULES,
+    PLAIN_RULES, TEX_RULES,
+};
 pub(crate) use go::RULES as GO_RULES;
 pub(crate) use html::RULES as HTML_RULES;
 pub(crate) use ini::RULES as INI_RULES;

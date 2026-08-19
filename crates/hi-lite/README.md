@@ -23,7 +23,11 @@ per-byte representation. `byte_kinds_to_char_kinds_into` is available when a
 renderer needs UTF-8 character or two-column tab entries. Bracket and quote
 matching accept line callbacks rather than an editor buffer.
 
-`Language::from_name` accepts canonical names and common aliases such as `rs`,
-`py`, `js`, `ts`, `sh`, `yml`, and `md`. Rule tables and lexer modes are private
-implementation details; the crate intentionally does not expose a grammar DSL,
-themes, ANSI colors, or editor abstractions.
+`Language::from_name` accepts the programming-language names from syntect's
+default syntax set (including C++, Java, Ruby, SQL, Haskell, Lua, and the
+embedded/template forms) plus common aliases such as `rs`, `py`, `js`, `ts`,
+`sh`, `yml`, and `md`. These languages reuse a small set of static scanner rule
+families; only the languages that need multiline or structural behavior have a
+specialized lexer. Rule tables and lexer modes are private implementation
+details; the crate intentionally does not expose a grammar DSL, themes, ANSI
+colors, or editor abstractions.

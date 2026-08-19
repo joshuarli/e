@@ -68,3 +68,91 @@ fn language_aliases_are_small_and_explicit() {
     assert_eq!(Language::from_extension(".md"), Some(Language::Markdown));
     assert_eq!(Language::from_name("unknown"), None);
 }
+
+#[test]
+fn syntect_programming_syntax_names_have_dependency_free_lexers() {
+    // Keep this list aligned with the programming grammars in syntect's
+    // default SyntaxSet. Embedded/template syntaxes intentionally resolve to
+    // their reusable host lexer (for example JSP to HTML and SQL (Rails) to
+    // SQL).
+    let names = [
+        "Plain Text", "ASP", "HTML (ASP)", "ActionScript", "AppleScript", "Batch File",
+        "NAnt Build File", "C#", "C++", "C", "Clojure", "D", "Diff", "Erlang",
+        "HTML (Erlang)", "Go", "Graphviz (DOT)", "Groovy", "HTML", "Haskell",
+        "Literate Haskell", "Java Server Page (JSP)", "Java", "JavaDoc", "JSON",
+        "Regular Expressions (Javascript)", "BibTeX", "LaTeX Log", "LaTeX", "TeX",
+        "Lisp", "Lua", "Make Output", "Makefile", "Markdown", "MultiMarkdown", "MATLAB",
+        "OCaml", "OCamllex", "OCamlyacc", "camlp4", "Objective-C++", "Objective-C",
+        "PHP Source", "PHP", "Pascal", "Perl", "Python", "Regular Expressions (Python)",
+        "R Console", "R", "Rd (R Documentation)", "HTML (Rails)", "JavaScript (Rails)",
+        "Ruby Haml", "Ruby on Rails", "SQL (Rails)", "Regular Expression",
+        "reStructuredText", "Ruby", "Cargo Build Results", "Rust", "SQL", "Scala",
+        "Bourne Again Shell (bash)", "Shell-Unix-Generic", "commands-builtin-shell-bash",
+        "HTML (Tcl)", "Tcl", "Textile", "XML", "YAML",
+    ];
+    for name in names {
+        assert!(Language::from_name(name).is_some(), "missing syntax: {name}");
+    }
+}
+
+#[test]
+fn generic_language_families_share_the_common_scanner() {
+    let cases = [
+        (Language::Java, b"public int answer() { return 42; }".as_slice(), 0, Kind::Keyword),
+        (Language::Ruby, b"value = 42 # comment".as_slice(), 8, Kind::Number),
+        (Language::Haskell, b"value = 42 -- comment".as_slice(), 8, Kind::Number),
+        (Language::Sql, b"select count from users where id = 42".as_slice(), 0, Kind::Keyword),
+    ];
+    for (language, line, offset, expected) in cases {
+        let mut highlighter = Highlighter::new(language);
+        let mut scratch = Vec::new();
+        let kinds = highlighter.highlight_into(line, &mut scratch);
+        assert_eq!(kinds[offset], expected, "{}: {line:?}", language.name());
+    }
+}
+
+#[test]
+fn every_public_language_round_trips_its_canonical_name() {
+    let languages = [
+        Language::Rust, Language::Python, Language::Go, Language::JavaScript,
+        Language::TypeScript, Language::Bash, Language::C, Language::Cpp,
+        Language::CSharp, Language::Json, Language::Yaml, Language::Toml,
+        Language::Ini, Language::Makefile, Language::Html, Language::Css,
+        Language::Scss, Language::Less, Language::Dockerfile, Language::Markdown,
+        Language::Xml, Language::ActionScript, Language::AppleScript, Language::Batch,
+        Language::Clojure, Language::D, Language::Erlang, Language::Graphviz,
+        Language::Groovy, Language::Haskell, Language::Java, Language::LaTeX,
+        Language::Lisp, Language::Lua, Language::Matlab, Language::Ocaml,
+        Language::ObjectiveC, Language::ObjectiveCpp, Language::Pascal, Language::Perl,
+        Language::Php, Language::R, Language::Ruby, Language::Scala, Language::Sql,
+        Language::Swift, Language::Tcl, Language::Kotlin, Language::Elm, Language::Regex,
+        Language::PlainText, Language::Xsh,
+    ];
+    for language in languages {
+        assert_eq!(Language::from_name(language.name()), Some(language));
+    }
+}
+
+#[test]
+fn syntect_extensions_resolve_to_host_or_generic_lexers() {
+    let cases = [
+        (".cpp", Language::Cpp),
+        (".csx", Language::CSharp),
+        ("GNUmakefile", Language::Makefile),
+        (".txt", Language::PlainText),
+        (".asa", Language::Html),
+        (".gradle", Language::Groovy),
+        (".lhs", Language::Haskell),
+        (".jsp", Language::Html),
+        (".mli", Language::Ocaml),
+        (".mm", Language::ObjectiveCpp),
+        (".phtml", Language::Php),
+        (".rst", Language::Markdown),
+        (".sql.erb", Language::Sql),
+        (".svg", Language::Xml),
+        (".textile", Language::Markdown),
+    ];
+    for (extension, language) in cases {
+        assert_eq!(Language::from_extension(extension), Some(language), "{extension}");
+    }
+}
