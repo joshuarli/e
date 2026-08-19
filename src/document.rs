@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::buffer::GapBuffer;
@@ -326,13 +327,18 @@ impl Document {
         carets_after
     }
 
-    /// Ask hi-lite to detect the language from the filename and first-line shebang.
+    /// Ask hi-lite to detect the language from the file extension and first-line shebang.
     pub fn detect_language(&self) -> Option<hi_lite::Language> {
-        // Keep the filename branch lazy: extracting the first line allocates.
+        // Keep the extension branch lazy: extracting the first line allocates.
         if let Some(language) = self
             .file_path
             .as_deref()
-            .and_then(hi_lite::Language::from_filename)
+            .map(Path::new)
+            // Extensionless conventional names (for example Makefile) are
+            // passed as resolver tokens so they keep their language mode.
+            .and_then(|path| path.extension().or_else(|| path.file_name()))
+            .and_then(|extension| extension.to_str())
+            .and_then(hi_lite::Language::from_file_ext)
         {
             return Some(language);
         }
