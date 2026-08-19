@@ -1,0 +1,8 @@
+CC := cc
+CFLAGS := -Wall -O2
+
+all: app
+	$(CC) $(CFLAGS) -o $@ main.c
+
+app: main.c
+	$(CC) -o $@ $<

@@ -43,6 +43,26 @@ pub(crate) enum LexerKind {
     Code,
     /// Generic scanning plus Rust lifetimes, raw strings, and nested comments.
     Rust,
+    /// Generic scanning with Go declaration and block punctuation spans.
+    Go,
+    /// Generic scanning with Python declaration and receiver-name spans.
+    Python,
+    /// Generic scanning with TypeScript declaration spans.
+    TypeScript,
+    /// Generic scanning with language-specific shell interpolation.
+    Bash,
+    /// Generic scanning with C preprocessor directives.
+    C,
+    /// Generic scanning with HTML tag and attribute spans.
+    Html,
+    /// Generic scanning with CSS selectors, properties, and units.
+    Css,
+    /// Generic scanning with make variable and target spans.
+    Makefile,
+    /// Generic scanning with Dockerfile variable spans.
+    Dockerfile,
+    /// Generic scanning with JavaScript/TypeScript template interpolation.
+    Script,
     /// Markdown block and inline markup scanner.
     Markdown,
     /// JSON key/value scanner.

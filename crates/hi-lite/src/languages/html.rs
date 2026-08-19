@@ -20,5 +20,5 @@ pub(crate) static RULES: RuleSet = RuleSet {
     highlight_upper_constants: false,
     highlight_fn_calls: false,
     highlight_bang_macros: false,
-    lexer_kind: LexerKind::Code,
+    lexer_kind: LexerKind::Html,
 };

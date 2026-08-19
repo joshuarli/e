@@ -20,6 +20,18 @@ fn public_api_streams_opaque_state_and_reuses_output() {
 }
 
 #[test]
+fn public_api_clears_reused_slots_between_equal_length_lines() {
+    let mut highlighter = Highlighter::new(Language::Rust);
+    let mut output = Vec::new();
+
+    let first = highlighter.highlight_into(b"//x", &mut output);
+    assert!(first.iter().all(|&kind| kind == Kind::Comment));
+
+    let second = highlighter.highlight_into(b"let", &mut output);
+    assert!(second.iter().all(|&kind| kind == Kind::Keyword));
+}
+
+#[test]
 fn public_api_supports_stateless_lines_runs_and_char_mapping() {
     let line = b"let x = 1";
     let mut kinds = vec![Kind::Normal; line.len()];

@@ -20,15 +20,15 @@ pub(crate) static RULES: RuleSet = RuleSet {
         "yield",
     ],
     types: &[
-        "False", "None", "True", "bool", "bytes", "dict", "float", "int", "list", "self", "set",
+        "False", "None", "True", "bool", "bytes", "dict", "float", "int", "list", "set",
         "str", "tuple",
     ],
     constants: &[],
     macros: &[],
-    operators: &["!=", "==", "<=", ">="],
+    operators: &["!=", "==", "<=", ">=", "="],
     highlight_numbers: true,
     highlight_upper_constants: true,
     highlight_fn_calls: true,
     highlight_bang_macros: false,
-    lexer_kind: LexerKind::Code,
+    lexer_kind: LexerKind::Python,
 };

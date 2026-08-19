@@ -1,0 +1,16 @@
+//! A complete Rust fixture covering declarations, types, literals, macros, and comments.
+use std::fmt::{self, Display};
+
+#[derive(Debug)]
+struct User<'a> { name: &'a str, count: u32 }
+
+impl<'a> Display for User<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "user")
+    }
+}
+
+fn main() {
+    let user = User { name: "Ada", count: 42 };
+    println!("{user}"); // render the value
+}

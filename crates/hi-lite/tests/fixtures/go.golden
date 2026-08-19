@@ -1,0 +1,16 @@
+# hi-lite-golden-v1
+# Scope categories are normalized to hi-lite semantic kinds.
+
+line 1: 0..7=keyword 7..12=normal
+line 2: 
+line 3: 0..6=keyword 6..7=normal 7..8=string 8..11=string 11..12=string
+line 4: 
+line 5: 0..4=type 4..5=normal 5..9=normal 9..10=normal 10..16=type 16..17=normal 17..18=normal
+line 6: 0..1=normal 1..5=normal 5..7=normal 7..13=type
+line 7: 0..1=normal 1..6=normal 6..7=normal 7..13=type
+line 8: 0..1=normal
+line 9: 
+line 10: 0..4=keyword 4..5=normal 5..9=function 9..10=normal 10..11=normal 11..12=normal 12..13=normal
+line 11: 0..1=normal 1..5=normal 5..6=normal 6..8=operator 8..13=normal 13..14=normal 14..18=normal 18..19=normal 19..20=normal 20..21=string 21..24=string 24..25=string 25..26=normal 26..32=normal 32..33=normal 33..34=normal 34..36=number 36..37=normal
+line 12: 0..4=normal 4..5=operator 5..12=normal 12..13=normal 13..17=normal 17..18=normal 18..19=normal 19..21=comment 21..37=comment
+line 13: 0..1=normal

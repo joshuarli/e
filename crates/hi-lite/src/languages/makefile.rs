@@ -18,10 +18,10 @@ pub(crate) static RULES: RuleSet = RuleSet {
     types: &[],
     constants: &[],
     macros: &[],
-    operators: &[],
+    operators: &[":=", ":"],
     highlight_numbers: false,
     highlight_upper_constants: false,
     highlight_fn_calls: false,
     highlight_bang_macros: false,
-    lexer_kind: LexerKind::Code,
+    lexer_kind: LexerKind::Makefile,
 };

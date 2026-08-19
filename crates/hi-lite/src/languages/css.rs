@@ -18,7 +18,7 @@ pub(crate) static RULES: RuleSet = RuleSet {
     operators: &[],
     highlight_numbers: true,
     highlight_upper_constants: false,
-    highlight_fn_calls: false,
+    highlight_fn_calls: true,
     highlight_bang_macros: false,
-    lexer_kind: LexerKind::Code,
+    lexer_kind: LexerKind::Css,
 };

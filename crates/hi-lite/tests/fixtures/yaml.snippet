@@ -1,0 +1,11 @@
+name: Ada
+count: 42
+active: true
+roles:
+  - admin
+  - user
+defaults: &defaults
+  retries: 3
+service:
+  <<: *defaults
+  note: "hello # world" # inline comment

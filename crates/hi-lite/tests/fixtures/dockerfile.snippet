@@ -1,0 +1,6 @@
+FROM rust:1.82 AS builder
+WORKDIR /src
+ARG PROFILE=release
+COPY . .
+RUN cargo build --profile ${PROFILE} # build the application
+ENTRYPOINT ["/src/target/release/app"]

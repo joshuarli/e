@@ -59,6 +59,7 @@ enum StateKind {
     RustBlockComment(u16),
     MultiLineString(u8),
     RustRawString(u8),
+    CssBlock,
     FencedCodeBlock,
 }
 
@@ -340,6 +341,7 @@ fn highlight_line_code(
             }
             prev_sep = true;
         }
+        StateKind::CssBlock => {}
         StateKind::Normal => {}
         StateKind::FencedCodeBlock => {}
     }
@@ -588,6 +590,563 @@ fn highlight_line_code(
     }
 
     StateKind::Normal
+}
+
+/// Add the small amount of structure that generic code scanning cannot infer
+/// for markup, build files, and shell-like interpolation. The base scanner is
+/// deliberately run first so multiline comments and quoted strings retain the
+/// same state semantics across every language.
+fn highlight_line_specialized(
+    line: &[u8],
+    state: StateKind,
+    rules: &RuleSet,
+    user_types: &[Vec<u8>],
+    hl: &mut [Kind],
+) -> StateKind {
+    let mut next_state = highlight_line_code(line, state, rules, user_types, hl);
+    match rules.lexer_kind {
+        LexerKind::Bash => highlight_bash_variables(line, hl),
+        LexerKind::Go => highlight_go_structure(line, hl),
+        LexerKind::Python => highlight_python_structure(line, hl),
+        LexerKind::C => {
+            highlight_c_preprocessor(line, hl);
+            highlight_c_typedef_name(line, hl);
+        }
+        LexerKind::Html => highlight_html_tags(line, hl),
+        LexerKind::Css => {
+            let in_block = matches!(state, StateKind::CssBlock);
+            next_state = if highlight_css_structure(line, hl, in_block) {
+                StateKind::CssBlock
+            } else {
+                StateKind::Normal
+            };
+        }
+        LexerKind::Makefile => highlight_makefile_structure(line, hl),
+        LexerKind::Dockerfile => highlight_dockerfile_variables(line, hl),
+        LexerKind::Script => {
+            highlight_script_interpolation(line, rules, hl);
+            highlight_script_capitalized_types(line, hl);
+        }
+        LexerKind::TypeScript => {
+            highlight_script_interpolation(line, rules, hl);
+            highlight_typescript_structure(line, hl);
+        }
+        _ => {}
+    }
+    next_state
+}
+
+fn mark_range(hl: &mut [Kind], start: usize, end: usize, kind: Kind) {
+    if start < end && end <= hl.len() {
+        for byte in &mut hl[start..end] {
+            *byte = kind;
+        }
+    }
+}
+
+fn highlight_bash_variables(line: &[u8], hl: &mut [Kind]) {
+    let mut i = 0;
+    while i < line.len() {
+        if hl[i] == Kind::String || hl[i] == Kind::Comment || line[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let end = if line.get(i + 1) == Some(&b'{') {
+            let mut end = i + 2;
+            while end < line.len() && line[end] != b'}' {
+                end += 1;
+            }
+            (end + usize::from(end < line.len())).min(line.len())
+        } else if line
+            .get(i + 1)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'?' | b'#' | b'@' | b'*' | b'!'))
+        {
+            let mut end = i + 2;
+            while end < line.len() && (line[end].is_ascii_alphanumeric() || line[end] == b'_') {
+                end += 1;
+            }
+            end
+        } else {
+            i += 1;
+            continue;
+        };
+        if (i..end).all(|index| hl[index] == Kind::Normal) {
+            mark_range(hl, i, end, Kind::Constant);
+        }
+        i = end;
+    }
+}
+
+fn highlight_go_structure(line: &[u8], hl: &mut [Kind]) {
+    for (index, byte) in line.iter().enumerate() {
+        if matches!(byte, b'{' | b'}' | b'(' | b')') {
+            hl[index] = Kind::Normal;
+        } else if *byte == b'.' {
+            hl[index] = Kind::Operator;
+        }
+    }
+    let mut i = 0;
+    while i < line.len() {
+        if !line[i].is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < line.len() && line[i].is_ascii_alphanumeric() {
+            i += 1;
+        }
+        if matches!(&line[start..i], b"type" | b"struct") {
+            mark_range(hl, start, i, Kind::Type);
+        }
+    }
+    for index in 1..line.len() {
+        if line[index - 1] == b'.' && hl[index] == Kind::Function {
+            let mut end = index + 1;
+            while end < line.len() && (line[end].is_ascii_alphanumeric() || line[end] == b'_') {
+                end += 1;
+            }
+            mark_range(hl, index, end, Kind::Normal);
+        }
+    }
+}
+
+fn highlight_python_structure(line: &[u8], hl: &mut [Kind]) {
+    let indent = line.iter().take_while(|byte| byte.is_ascii_whitespace()).count();
+    if line[indent..].starts_with(b"def ") {
+        let start = indent + 4;
+        let mut end = start;
+        while line.get(end).is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_') {
+            end += 1;
+        }
+        mark_range(hl, start, end, Kind::Normal);
+    }
+    for index in 0..line.len().saturating_sub(1) {
+        if matches!(line[index], b'f' | b'r' | b'b' | b'F' | b'R' | b'B')
+            && matches!(line[index + 1], b'"' | b'\'')
+            && hl[index + 1] == Kind::String
+        {
+            hl[index] = Kind::String;
+        }
+    }
+    let trimmed = &line[indent..];
+    let is_definition = trimmed.starts_with(b"def ");
+    if (trimmed.starts_with(b"if ") || trimmed.starts_with(b"elif ") || trimmed.starts_with(b"else"))
+        && trimmed.iter().rposition(|&byte| byte == b':').is_some_and(|colon| {
+            trimmed[colon + 1..].iter().all(u8::is_ascii_whitespace)
+        })
+    {
+        if let Some(colon) = trimmed.iter().rposition(|&byte| byte == b':') {
+            let absolute = indent + colon;
+            if hl[absolute] == Kind::Normal {
+                hl[absolute] = Kind::Bracket;
+            }
+        }
+    }
+    for index in 0..line.len() {
+        if hl[index] == Kind::String {
+            continue;
+        }
+        if !is_definition && matches!(line[index], b'(' | b')') {
+            hl[index] = Kind::Normal;
+        } else if line[index] == b'.' {
+            hl[index] = Kind::Operator;
+        }
+    }
+    for index in 1..line.len() {
+        if line[index - 1] == b'.' && hl[index] == Kind::Function {
+            let mut end = index + 1;
+            while end < line.len() && (line[end].is_ascii_alphanumeric() || line[end] == b'_') {
+                end += 1;
+            }
+            mark_range(hl, index, end, Kind::Normal);
+        }
+    }
+    let mut index = 0;
+    while index < line.len() {
+        if line[index].is_ascii_uppercase() && hl[index] == Kind::Function {
+            let mut end = index + 1;
+            while end < line.len() && (line[end].is_ascii_alphanumeric() || line[end] == b'_') {
+                end += 1;
+            }
+            mark_range(hl, index, end, Kind::Normal);
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn highlight_c_preprocessor(line: &[u8], hl: &mut [Kind]) {
+    let indent = line.iter().take_while(|byte| byte.is_ascii_whitespace()).count();
+    if line.get(indent) != Some(&b'#') {
+        return;
+    }
+    let mut end = indent + 1;
+    while end < line.len() && line[end].is_ascii_alphabetic() {
+        end += 1;
+    }
+    mark_range(hl, indent, end, Kind::Macro);
+
+    if line[indent + 1..end].eq_ignore_ascii_case(b"define") {
+        let mut name_start = end;
+        while line.get(name_start).is_some_and(|byte| byte.is_ascii_whitespace()) {
+            name_start += 1;
+        }
+        let mut name_end = name_start;
+        while line
+            .get(name_end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            name_end += 1;
+        }
+        mark_range(hl, name_start, name_end, Kind::Macro);
+    }
+
+    if line.get(end).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        let mut i = end;
+        while i < line.len() {
+            if line[i] == b'<' {
+                let start = i;
+                i += 1;
+                while i < line.len() && line[i] != b'>' {
+                    i += 1;
+                }
+                if i < line.len() {
+                    i += 1;
+                }
+                mark_range(hl, start, i, Kind::String);
+                break;
+            }
+            i += 1;
+        }
+    }
+}
+
+fn highlight_c_typedef_name(line: &[u8], hl: &mut [Kind]) {
+    let indent = line.iter().take_while(|byte| byte.is_ascii_whitespace()).count();
+    if line.get(indent) != Some(&b'}') {
+        return;
+    }
+    let mut start = indent + 1;
+    while line.get(start).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        start += 1;
+    }
+    let mut end = start;
+    while line
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        end += 1;
+    }
+    mark_range(hl, start, end, Kind::Type);
+}
+
+fn highlight_html_tags(line: &[u8], hl: &mut [Kind]) {
+    let mut i = 0;
+    while i < line.len() {
+        if line[i] != b'<' || hl[i] == Kind::Comment || hl[i] == Kind::String {
+            i += 1;
+            continue;
+        }
+        let tag_start = i;
+        let mut cursor = i + 1;
+        if line.get(cursor) == Some(&b'/') {
+            cursor += 1;
+        }
+        if line.get(cursor) == Some(&b'!') {
+            mark_range(hl, tag_start, cursor + 1, Kind::Bracket);
+            let name_start = cursor + 1;
+            let mut name_end = name_start;
+            while name_end < line.len() && line[name_end].is_ascii_alphabetic() {
+                name_end += 1;
+            }
+            mark_range(hl, name_start, name_end, Kind::Keyword);
+            i = name_end;
+            while i < line.len() && line[i] != b'>' {
+                i += 1;
+            }
+            if i < line.len() {
+                mark_range(hl, i, i + 1, Kind::Bracket);
+            }
+            continue;
+        }
+        if !line.get(cursor).is_some_and(|byte| byte.is_ascii_alphabetic()) {
+            i += 1;
+            continue;
+        }
+        let name_start = cursor;
+        while cursor < line.len() && (line[cursor].is_ascii_alphanumeric() || matches!(line[cursor], b':' | b'-')) {
+            cursor += 1;
+        }
+        mark_range(hl, tag_start, name_start, Kind::Bracket);
+        mark_range(hl, name_start, cursor, Kind::Keyword);
+        let mut quote = None;
+        while cursor < line.len() {
+            if let Some(delimiter) = quote {
+                if line[cursor] == delimiter && hl[cursor] == Kind::String {
+                    quote = None;
+                }
+                cursor += 1;
+                continue;
+            }
+            if line[cursor] == b'>' {
+                mark_range(hl, cursor, cursor + 1, Kind::Bracket);
+                break;
+            }
+            if matches!(line[cursor], b'"' | b'\'') && hl[cursor] == Kind::String {
+                quote = Some(line[cursor]);
+                cursor += 1;
+                continue;
+            }
+            if line[cursor].is_ascii_alphabetic() || line[cursor] == b'_' {
+                let attr_start = cursor;
+                while cursor < line.len() && (line[cursor].is_ascii_alphanumeric() || matches!(line[cursor], b'_' | b'-' | b':')) {
+                    cursor += 1;
+                }
+                let mut lookahead = cursor;
+                while line.get(lookahead) == Some(&b' ') {
+                    lookahead += 1;
+                }
+                if line.get(lookahead) == Some(&b'=') {
+                    mark_range(hl, attr_start, cursor, Kind::Constant);
+                }
+                continue;
+            }
+            cursor += 1;
+        }
+        i = cursor.saturating_add(1);
+    }
+}
+
+fn highlight_css_structure(line: &[u8], hl: &mut [Kind], mut in_block: bool) -> bool {
+    let mut i = 0;
+    while i < line.len() {
+        if hl[i] == Kind::Comment || hl[i] == Kind::String {
+            i += 1;
+            continue;
+        }
+        match line[i] {
+            b'(' | b')' => {
+                hl[i] = Kind::Normal;
+                i += 1;
+            }
+            b'{' => {
+                hl[i] = Kind::Normal;
+                in_block = true;
+                i += 1;
+            }
+            b'}' => {
+                hl[i] = Kind::Normal;
+                in_block = false;
+                i += 1;
+            }
+            b'#' if !in_block => {
+                i += 1;
+            }
+            b'#' => {
+                let start = i;
+                i += 1;
+                while i < line.len() && line[i].is_ascii_hexdigit() {
+                    i += 1;
+                }
+                if matches!(i - start, 4 | 5 | 7 | 9) {
+                    mark_range(hl, start + 1, i, Kind::Constant);
+                }
+            }
+            _ if !in_block => {
+                while i < line.len() && !matches!(line[i], b'{' | b'}') {
+                    if hl[i] == Kind::Comment || hl[i] == Kind::String {
+                        break;
+                    }
+                    i += 1;
+                }
+                // Selectors are intentionally left as normal text; syntect's
+                // selector scope is structural rather than a name/type token.
+            }
+            _ if in_block && (line[i].is_ascii_alphabetic() || line[i] == b'-') => {
+                let start = i;
+                while i < line.len() && (line[i].is_ascii_alphanumeric() || line[i] == b'-') {
+                    i += 1;
+                }
+                let mut lookahead = i;
+                while line.get(lookahead) == Some(&b' ') {
+                    lookahead += 1;
+                }
+                if line.get(lookahead) == Some(&b':') {
+                    let name_start = start + line[start..i].iter().take_while(|&&byte| byte == b'-').count();
+                    mark_range(hl, name_start, i, Kind::Type);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    // CSS units follow a numeric literal and are semantically distinct from it.
+    let mut number_end = 0;
+    while number_end < line.len() {
+        if hl[number_end] == Kind::Number {
+            let mut digit_end = number_end;
+            while digit_end < line.len() && hl[digit_end] == Kind::Number {
+                digit_end += 1;
+            }
+            let mut unit_end = digit_end;
+            while unit_end < line.len() && line[unit_end].is_ascii_alphabetic() {
+                unit_end += 1;
+            }
+            if unit_end > digit_end {
+                mark_range(hl, digit_end, unit_end, Kind::Keyword);
+            }
+            number_end = unit_end.max(digit_end);
+        } else {
+            number_end += 1;
+        }
+    }
+    in_block
+}
+
+fn highlight_makefile_structure(line: &[u8], hl: &mut [Kind]) {
+    let indent = line.iter().take_while(|byte| byte.is_ascii_whitespace()).count();
+    if indent == 0 && !line.starts_with(b"#") {
+        if let Some(colon) = line.iter().position(|&byte| byte == b':') {
+            if colon > 0 && line.get(colon + 1) != Some(&b'=') {
+                mark_range(hl, 0, colon, Kind::Function);
+                hl[colon] = Kind::Operator;
+                let mut prerequisite_start = colon + 1;
+                while line.get(prerequisite_start) == Some(&b' ') {
+                    prerequisite_start += 1;
+                }
+                mark_range(hl, prerequisite_start, line.len(), Kind::String);
+            }
+        }
+        if let Some(assign) = line.windows(2).position(|pair| pair == b":=") {
+            let mut value_start = assign + 2;
+            while line.get(value_start) == Some(&b' ') {
+                value_start += 1;
+            }
+            if value_start < line.len() {
+                mark_range(hl, value_start, line.len(), Kind::String);
+            }
+        }
+    }
+    highlight_dollar_expansions(line, hl);
+}
+
+fn highlight_dockerfile_variables(line: &[u8], hl: &mut [Kind]) {
+    highlight_dollar_expansions(line, hl);
+}
+
+fn highlight_dollar_expansions(line: &[u8], hl: &mut [Kind]) {
+    let mut i = 0;
+    while i < line.len() {
+        if line[i] != b'$' || hl[i] == Kind::Comment || hl[i] == Kind::String {
+            i += 1;
+            continue;
+        }
+        let end = if line.get(i + 1) == Some(&b'(') || line.get(i + 1) == Some(&b'{') {
+            let close = if line[i + 1] == b'(' { b')' } else { b'}' };
+            let mut end = i + 2;
+            while end < line.len() && line[end] != close {
+                end += 1;
+            }
+            (end + usize::from(end < line.len())).min(line.len())
+        } else if line.get(i + 1).is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'@' || *byte == b'<') {
+            (i + 2).min(line.len())
+        } else {
+            i += 1;
+            continue;
+        };
+        mark_range(hl, i, end, Kind::Macro);
+        i = end;
+    }
+}
+
+fn highlight_script_interpolation(line: &[u8], rules: &RuleSet, hl: &mut [Kind]) {
+    let mut i = 0;
+    while i + 1 < line.len() {
+        if line[i] != b'$' || line[i + 1] != b'{' || hl[i] != Kind::String {
+            i += 1;
+            continue;
+        }
+        mark_range(hl, i, i + 2, Kind::Normal);
+        let mut cursor = i + 2;
+        while cursor < line.len() {
+            if line[cursor] == b'}' {
+                mark_range(hl, cursor, cursor + 1, Kind::Normal);
+                i = cursor + 1;
+                break;
+            }
+            if line[cursor] == b'.' {
+                hl[cursor] = Kind::Operator;
+                cursor += 1;
+                continue;
+            }
+            if line[cursor].is_ascii_digit() {
+                let start = cursor;
+                while cursor < line.len() && line[cursor].is_ascii_digit() {
+                    cursor += 1;
+                }
+                mark_range(hl, start, cursor, Kind::Number);
+                continue;
+            }
+            if line[cursor].is_ascii_alphabetic() || line[cursor] == b'_' {
+                let start = cursor;
+                cursor += 1;
+                while cursor < line.len() && (line[cursor].is_ascii_alphanumeric() || line[cursor] == b'_') {
+                    cursor += 1;
+                }
+                let id = &line[start..cursor];
+                let kind = if keyword_search(id, rules.keywords) {
+                    Kind::Keyword
+                } else if keyword_search(id, rules.types) {
+                    Kind::Type
+                } else if line.get(cursor) == Some(&b'(') {
+                    Kind::Function
+                } else {
+                    Kind::Normal
+                };
+                mark_range(hl, start, cursor, kind);
+                continue;
+            }
+            cursor += 1;
+        }
+        if i == cursor {
+            i += 1;
+        }
+    }
+}
+
+fn highlight_script_capitalized_types(line: &[u8], hl: &mut [Kind]) {
+    let mut i = 0;
+    while i < line.len() {
+        if !line[i].is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < line.len() && (line[i].is_ascii_alphanumeric() || line[i] == b'_') {
+            i += 1;
+        }
+        if line[start].is_ascii_uppercase()
+            && hl[start..i].iter().all(|kind| *kind == Kind::Function)
+        {
+            mark_range(hl, start, i, Kind::Normal);
+        }
+    }
+}
+
+fn highlight_typescript_structure(line: &[u8], hl: &mut [Kind]) {
+    let Some(function_start) = line.windows(8).position(|window| window == b"function") else {
+        return;
+    };
+    let mut cursor = function_start;
+    while cursor < line.len() && line[cursor] != b'(' {
+        if hl[cursor] == Kind::Keyword || hl[cursor] == Kind::Function {
+            hl[cursor] = Kind::Normal;
+        }
+        cursor += 1;
+    }
 }
 
 fn is_digit_start(line: &[u8], i: usize) -> bool {
@@ -1826,10 +2385,25 @@ fn highlight_line_into_rules(
         LexerKind::Json => highlight_line_json(line, state, out),
         LexerKind::Yaml => highlight_line_yaml(line, state, out),
         LexerKind::Ini => highlight_line_ini(line, state, out),
-        LexerKind::Code | LexerKind::Rust => {
-            highlight_line_code(line, state, rules, user_types, out)
-        }
+        LexerKind::Code | LexerKind::Rust => highlight_line_code(line, state, rules, user_types, out),
+        LexerKind::Bash
+        | LexerKind::Go
+        | LexerKind::Python
+        | LexerKind::C
+        | LexerKind::Html
+        | LexerKind::Css
+        | LexerKind::Makefile
+        | LexerKind::Dockerfile
+        | LexerKind::Script
+        | LexerKind::TypeScript => highlight_line_specialized(line, state, rules, user_types, out),
     };
+    if rules.lexer_kind == LexerKind::Rust && line.starts_with(b"#") {
+        for kind in out.iter_mut() {
+            if *kind == Kind::Function {
+                *kind = Kind::Normal;
+            }
+        }
+    }
     highlight_semver(line, out, rules.lexer_kind, state);
     next_state
 }
@@ -1910,6 +2484,10 @@ impl Highlighter {
     /// Highlight one line, reusing the caller's scratch allocation.
     pub fn highlight_into<'a>(&mut self, line: &[u8], scratch: &'a mut Vec<Kind>) -> &'a [Kind] {
         scratch.resize(line.len(), Kind::Normal);
+        // `Vec::resize` preserves existing elements when the next line has
+        // the same length; clear them so a previous comment/string cannot
+        // leak into this line's semantic runs.
+        scratch.fill(Kind::Normal);
         self.state = State(highlight_line_into_rules(
             line,
             self.state.0,
