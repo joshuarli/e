@@ -36,6 +36,12 @@ colors, or editor abstractions.
 filename, shebang, and comment-delimiter policy for clients. Callers do not
 need a second supported-language registry.
 
+`diff` computes borrowed line operations using the same LCS tie-breaking and
+trailing-newline markers as `fx`. `diff_preview` or reusable `DiffScratch`
+projects those rows into renderer-neutral unified context/addition/deletion/
+elision rows; callers can combine each source row with ordinary syntax runs
+and choose their own colors or terminal protocol.
+
 ## Benchmarks
 
 The checked-in golden corpus has warm (reused highlighter and scratch) and cold
@@ -50,3 +56,11 @@ snippets. The warm aggregate is the steady-state target; cold runs expose
 allocation costs for callers that do not retain their scratch buffer. The
 `hi_lite_highlight_single_lines_{warm,cold}` pair isolates one representative
 line from each fixture for latency-sensitive editor use.
+
+`hi_lite_unified_diff_{warm,cold}` measures the checked-in unified diff cases;
+the warm form reuses `DiffScratch` and output vectors. Regenerate their
+semantic fixtures with:
+
+```sh
+sh tools/generate-hi-lite-diff-goldens.sh
+```

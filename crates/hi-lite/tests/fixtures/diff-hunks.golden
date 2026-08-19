@@ -1,0 +1,23 @@
+# hi-lite-diff-v1
+line 1: equal old=1 new=1 text=line 1
+line 2: equal old=2 new=2 text=line 2
+line 3: remove old=3 new=- text=old hunk one
+line 4: add old=- new=3 text=new hunk one
+line 5: equal old=4 new=4 text=line 4
+line 6: equal old=5 new=5 text=line 5
+line 7: equal old=6 new=6 text=line 6
+line 8: equal old=7 new=7 text=line 7
+line 9: equal old=8 new=8 text=line 8
+line 10: equal old=9 new=9 text=line 9
+line 11: remove old=10 new=- text=old hunk two
+line 12: add old=- new=10 text=new hunk two
+line 13: equal old=11 new=11 text=line 11
+line 14: equal old=12 new=12 text=line 12
+
+preview 1: context old=1 new=1 text=line 1
+preview 2: context old=2 new=2 text=line 2
+preview 3: deletion old=3 new=- text=old hunk one
+preview 4: addition old=- new=3 text=new hunk one
+preview 5: context old=4 new=4 text=line 4
+preview 6: context old=5 new=5 text=line 5
+preview 7: elision old=- new=- text=⋯

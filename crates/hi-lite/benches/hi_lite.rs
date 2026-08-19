@@ -5,7 +5,10 @@
 //! while the cold variants deliberately include scratch/highlighter setup so
 //! allocation costs remain visible in rustybench's allocation report.
 
-use hi_lite::{Highlighter, Kind, Language};
+use hi_lite::{
+    DEFAULT_CONTEXT_LINES, DEFAULT_MAX_DISPLAY_LINES, DiffOp, DiffPreviewOp, DiffPreviewText,
+    DiffScratch, Highlighter, Kind, Language, diff, unified_preview,
+};
 use rustybench::counter::{BytesCount, ItemsCount};
 use rustybench::{AllocProfiler, Bencher, black_box};
 
@@ -13,6 +16,18 @@ use rustybench::{AllocProfiler, Bencher, black_box};
 static ALLOC: AllocProfiler = AllocProfiler::system();
 
 const CORPUS_REPETITIONS: usize = 512;
+const DIFF_REPETITIONS: usize = 512;
+
+const DIFF_FIXTURES: &[(&[u8], &[u8])] = &[
+    (
+        include_bytes!("../tests/fixtures/diff-basic.old"),
+        include_bytes!("../tests/fixtures/diff-basic.new"),
+    ),
+    (
+        include_bytes!("../tests/fixtures/diff-hunks.old"),
+        include_bytes!("../tests/fixtures/diff-hunks.new"),
+    ),
+];
 
 struct Fixture {
     language: Language,
@@ -269,6 +284,90 @@ fn configure_single_line_bench<'a, 'b>(
         .counter(ItemsCount::new(line_count * CORPUS_REPETITIONS))
 }
 
+fn diff_totals() -> (usize, usize) {
+    DIFF_FIXTURES.iter().fold((0, 0), |(bytes, lines), (old, new)| {
+        let line_count = old.iter().chain(new.iter()).filter(|&&byte| byte == b'\n').count();
+        (bytes + old.len() + new.len(), lines + line_count)
+    })
+}
+
+fn diff_checksum(
+    lines: &[hi_lite::DiffLine<'_>],
+    preview: &[hi_lite::DiffPreviewLine<'_>],
+) -> u64 {
+    let mut checksum = 0u64;
+    for line in lines {
+        let op = match line.op {
+            DiffOp::Equal => 1,
+            DiffOp::Add => 2,
+            DiffOp::Remove => 3,
+        };
+        checksum = checksum.wrapping_mul(31).wrapping_add(op);
+        for &byte in line.text {
+            checksum = checksum.wrapping_mul(31).wrapping_add(byte as u64);
+        }
+    }
+    for line in preview {
+        let op = match line.op {
+            DiffPreviewOp::Context => 4,
+            DiffPreviewOp::Addition => 5,
+            DiffPreviewOp::Deletion => 6,
+            DiffPreviewOp::Elision => 7,
+        };
+        checksum = checksum.wrapping_mul(31).wrapping_add(op);
+        if let DiffPreviewText::Source(text) = line.text {
+            for &byte in text {
+                checksum = checksum.wrapping_mul(31).wrapping_add(byte as u64);
+            }
+        }
+    }
+    checksum
+}
+
+fn configure_diff_bench<'a, 'b>(bencher: Bencher<'a, 'b>) -> Bencher<'a, 'b> {
+    let (bytes, lines) = diff_totals();
+    bencher
+        .counter(BytesCount::new(bytes * DIFF_REPETITIONS))
+        .counter(ItemsCount::new(lines * DIFF_REPETITIONS))
+}
+
+fn warm_diff_corpus(
+    scratch: &mut DiffScratch,
+    lines: &mut Vec<hi_lite::DiffLine<'static>>,
+    preview: &mut Vec<hi_lite::DiffPreviewLine<'static>>,
+) -> u64 {
+    let mut checksum = 0;
+    for _ in 0..DIFF_REPETITIONS {
+        for &(old, new) in DIFF_FIXTURES {
+            scratch.diff_into(old, new, lines);
+            scratch.unified_preview_into(
+                lines,
+                DEFAULT_CONTEXT_LINES,
+                DEFAULT_MAX_DISPLAY_LINES,
+                preview,
+            );
+            checksum ^= diff_checksum(lines, preview);
+        }
+    }
+    checksum
+}
+
+fn cold_diff_corpus() -> u64 {
+    let mut checksum = 0;
+    for _ in 0..DIFF_REPETITIONS {
+        for &(old, new) in DIFF_FIXTURES {
+            let lines = diff(old, new);
+            let preview = unified_preview(
+                &lines,
+                DEFAULT_CONTEXT_LINES,
+                DEFAULT_MAX_DISPLAY_LINES,
+            );
+            checksum ^= diff_checksum(&lines, &preview);
+        }
+    }
+    checksum
+}
+
 #[rustybench::bench]
 fn hi_lite_highlight_all_goldens_warm(bencher: Bencher) {
     let fixtures = load_fixtures();
@@ -320,6 +419,32 @@ fn hi_lite_highlight_single_lines_cold(bencher: Bencher) {
     let lines = single_lines(&fixtures);
     configure_single_line_bench(bencher, &lines).bench_local(|| {
         black_box(cold_single_line_corpus(&fixtures, &lines, CORPUS_REPETITIONS));
+    });
+}
+
+#[rustybench::bench]
+fn hi_lite_unified_diff_warm(bencher: Bencher) {
+    let mut scratch = DiffScratch::new();
+    let mut lines = Vec::new();
+    let mut preview = Vec::new();
+    for &(old, new) in DIFF_FIXTURES {
+        scratch.diff_into(old, new, &mut lines);
+        scratch.unified_preview_into(
+            &lines,
+            DEFAULT_CONTEXT_LINES,
+            DEFAULT_MAX_DISPLAY_LINES,
+            &mut preview,
+        );
+    }
+    configure_diff_bench(bencher).bench_local(|| {
+        black_box(warm_diff_corpus(&mut scratch, &mut lines, &mut preview));
+    });
+}
+
+#[rustybench::bench]
+fn hi_lite_unified_diff_cold(bencher: Bencher) {
+    configure_diff_bench(bencher).bench_local(|| {
+        black_box(cold_diff_corpus());
     });
 }
 

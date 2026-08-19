@@ -4,9 +4,15 @@
 /// not depend on an editor buffer or renderer; callers provide one line of bytes
 /// at a time and choose their own presentation for the semantic `Kind` values.
 mod highlight;
+mod diff;
 mod language;
 mod languages;
 
+pub use diff::{
+    DiffLine, DiffOp, DiffPreviewLine, DiffPreviewOp, DiffPreviewText, DiffScratch,
+    DEFAULT_CONTEXT_LINES, DEFAULT_MAX_DISPLAY_LINES, diff, diff_preview,
+    unified_preview,
+};
 pub use highlight::{
     Highlighter, Kind, Run, State, TextPosition, byte_kinds_to_char_kinds,
     byte_kinds_to_char_kinds_into, find_bracket_match, find_quote_match, highlight_line_into, runs,
