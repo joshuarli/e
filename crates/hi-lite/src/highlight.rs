@@ -678,36 +678,45 @@ fn highlight_bash_variables(line: &[u8], hl: &mut [Kind]) {
 }
 
 fn highlight_go_structure(line: &[u8], hl: &mut [Kind]) {
-    for (index, byte) in line.iter().enumerate() {
-        if matches!(byte, b'{' | b'}' | b'(' | b')') {
-            hl[index] = Kind::Normal;
-        } else if *byte == b'.' {
-            hl[index] = Kind::Operator;
-        }
-    }
+    // Fold punctuation, type adjustment, and dotted-call cleanup into one
+    // walk; the generic scanner has already identified function candidates.
     let mut i = 0;
     while i < line.len() {
-        if !line[i].is_ascii_alphabetic() {
+        if line[i].is_ascii_alphabetic() {
+            let start = i;
             i += 1;
+            while i < line.len() && line[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+            if matches!(&line[start..i], b"type" | b"struct") {
+                mark_range(hl, start, i, Kind::Type);
+            } else if start > 0 && line[start - 1] == b'.' && hl[start] == Kind::Function {
+                let mut end = i;
+                while end < line.len()
+                    && (line[end].is_ascii_alphanumeric() || line[end] == b'_')
+                {
+                    end += 1;
+                }
+                mark_range(hl, start, end, Kind::Normal);
+                i = end;
+            }
             continue;
         }
-        let start = i;
-        i += 1;
-        while i < line.len() && line[i].is_ascii_alphanumeric() {
-            i += 1;
-        }
-        if matches!(&line[start..i], b"type" | b"struct") {
-            mark_range(hl, start, i, Kind::Type);
-        }
-    }
-    for index in 1..line.len() {
-        if line[index - 1] == b'.' && hl[index] == Kind::Function {
-            let mut end = index + 1;
+        if i > 0 && line[i - 1] == b'.' && hl[i] == Kind::Function {
+            let mut end = i + 1;
             while end < line.len() && (line[end].is_ascii_alphanumeric() || line[end] == b'_') {
                 end += 1;
             }
-            mark_range(hl, index, end, Kind::Normal);
+            mark_range(hl, i, end, Kind::Normal);
+            i = end;
+            continue;
         }
+        if matches!(line[i], b'{' | b'}' | b'(' | b')') {
+            hl[i] = Kind::Normal;
+        } else if line[i] == b'.' {
+            hl[i] = Kind::Operator;
+        }
+        i += 1;
     }
 }
 
@@ -743,8 +752,12 @@ fn highlight_python_structure(line: &[u8], hl: &mut [Kind]) {
             }
         }
     }
-    for index in 0..line.len() {
+    let mut index = 0;
+    // Keep punctuation, dotted-call cleanup, and capitalized-call cleanup in
+    // one walk after the definition and f-string prefix passes above.
+    while index < line.len() {
         if hl[index] == Kind::String {
+            index += 1;
             continue;
         }
         if !is_definition && matches!(line[index], b'(' | b')') {
@@ -752,18 +765,15 @@ fn highlight_python_structure(line: &[u8], hl: &mut [Kind]) {
         } else if line[index] == b'.' {
             hl[index] = Kind::Operator;
         }
-    }
-    for index in 1..line.len() {
-        if line[index - 1] == b'.' && hl[index] == Kind::Function {
+        if index > 0 && line[index - 1] == b'.' && hl[index] == Kind::Function {
             let mut end = index + 1;
             while end < line.len() && (line[end].is_ascii_alphanumeric() || line[end] == b'_') {
                 end += 1;
             }
             mark_range(hl, index, end, Kind::Normal);
+            index = end;
+            continue;
         }
-    }
-    let mut index = 0;
-    while index < line.len() {
         if line[index].is_ascii_uppercase() && hl[index] == Kind::Function {
             let mut end = index + 1;
             while end < line.len() && (line[end].is_ascii_alphanumeric() || line[end] == b'_') {
@@ -771,9 +781,9 @@ fn highlight_python_structure(line: &[u8], hl: &mut [Kind]) {
             }
             mark_range(hl, index, end, Kind::Normal);
             index = end;
-        } else {
-            index += 1;
+            continue;
         }
+        index += 1;
     }
 }
 
@@ -1289,9 +1299,15 @@ fn scan_number_end(line: &[u8], start: usize) -> usize {
 /// Match the longest operator, regardless of static table order.
 fn try_operator(line: &[u8], pos: usize, ops: &[&str], hl: &mut [Kind]) -> Option<usize> {
     let mut best_len = 0;
+    // Operator tables are shared by generic lexers; reject different first
+    // bytes before doing a longer slice comparison at each source position.
+    let first = line[pos];
     for &op in ops {
         let ob = op.as_bytes();
-        if ob.len() > best_len && starts_with_at(line, ob, pos) {
+        if ob.len() > best_len
+            && ob.first() == Some(&first)
+            && starts_with_at(line, ob, pos)
+        {
             best_len = ob.len();
         }
     }
@@ -1314,6 +1330,9 @@ fn keyword_search(id: &[u8], words: &[&str]) -> bool {
 /// Post-pass: highlight semver patterns like v1.2.3 or 0.3.5-beta.1
 fn highlight_semver(line: &[u8], hl: &mut [Kind], lexer_kind: LexerKind, state: StateKind) {
     let len = line.len();
+    if len < 5 || !line.contains(&b'.') {
+        return;
+    }
     let mut i = 0;
     let mut raw_hash_count = match state {
         StateKind::RustRawString(hash_count) => Some(hash_count),
@@ -3743,6 +3762,14 @@ mod tests {
 
         highlighter.reset();
         assert_eq!(highlighter.state(), State::default());
+    }
+
+    #[test]
+    fn go_dotted_function_cleanup_keeps_underscored_names_together() {
+        let mut highlighter = Highlighter::new(Language::Go);
+        let mut scratch = Vec::new();
+        let kinds = highlighter.highlight_into(b"pkg.foo_bar()", &mut scratch);
+        assert!(kinds[4..11].iter().all(|&kind| kind == Kind::Normal));
     }
 
     #[test]

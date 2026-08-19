@@ -30,7 +30,7 @@ RELEASE_RUSTFLAGS := $(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-
 LINUX_DYNAMIC_RUSTFLAGS := $(RELEASE_RUSTFLAGS) -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER)
 PGO_USE_FLAGS := -Cprofile-use=$(PGO_MERGED) -Cllvm-args=-pgo-warn-missing-function
 
-.PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-instrument pgo-instrument-linux pgo-profile pgo-profile-linux pgo-merge bench-pgo install record gifs ensure-musl-target gen-xsh
+.PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-hi-lite bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-instrument pgo-instrument-linux pgo-profile pgo-profile-linux pgo-merge bench-pgo install record gifs ensure-musl-target gen-xsh
 
 # Regenerate the XSH vocabulary region of crates/hi-lite/src/languages/xsh.rs from the
 # registry (XSH_REPO overrides the path)
@@ -97,6 +97,10 @@ lint:
 
 bench:
 	@$(RUSTYBENCH) baseline --root "$(CURDIR)" --baseline "$(CURDIR)/benches/baseline.json" -- cargo bench --bench bench
+
+# Benchmark hi-lite independently across the complete checked-in golden corpus.
+bench-hi-lite:
+	@$(RUSTYBENCH) baseline --root "$(CURDIR)" --baseline "$(CURDIR)/crates/hi-lite/benches/hi-lite-baseline.json" -- cargo bench --manifest-path "$(CURDIR)/crates/hi-lite/Cargo.toml" --bench hi_lite
 
 bench-syscalls:
 	@$(RUSTYBENCH) syscalls --root "$(CURDIR)"

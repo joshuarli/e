@@ -3,6 +3,9 @@ name = "e"
 version = "0.1.13"
 edition = "2024"
 
+[workspace]
+members = ["crates/hi-lite"]
+
 [dependencies]
 hi-lite = { path = "crates/hi-lite" }
 fxhash = "0.2"

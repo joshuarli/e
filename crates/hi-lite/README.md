@@ -31,3 +31,16 @@ families; only the languages that need multiline or structural behavior have a
 specialized lexer. Rule tables and lexer modes are private implementation
 details; the crate intentionally does not expose a grammar DSL, themes, ANSI
 colors, or editor abstractions.
+
+## Benchmarks
+
+The checked-in golden corpus has warm (reused highlighter and scratch) and cold
+(setup included) rustybench workloads:
+
+```sh
+cargo bench --bench hi_lite
+```
+
+The crate benchmark is intentionally weighted toward small, syntax-complete
+snippets. The warm aggregate is the steady-state target; cold runs expose
+allocation costs for callers that do not retain their scratch buffer.

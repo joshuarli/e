@@ -24,3 +24,17 @@ The public `hi_lite::Language` registry covers the programming-language portion
 of that same default bundle. Languages with equivalent lexical structure share
 static rule families in `crates/hi-lite/src/languages/generic.rs`; embedded
 grammars resolve to their host language. XSH remains intentionally separate.
+
+The same corpus is benchmarked independently with rustybench:
+
+```sh
+make bench-hi-lite
+```
+
+The benchmark target lives in `crates/hi-lite/benches/hi_lite.rs` and can also be
+run directly with `cargo bench --manifest-path crates/hi-lite/Cargo.toml --bench hi_lite`.
+
+`hi_lite_highlight_all_goldens_warm` reports steady-state throughput with
+reused scratch storage; the `_cold` variant includes per-fixture scratch setup.
+The per-language entries (and their `_cold` counterparts) make slower lexers and
+allocation-heavy fixtures easy to attribute.
