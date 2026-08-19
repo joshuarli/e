@@ -32,7 +32,7 @@ PGO_USE_FLAGS := -Cprofile-use=$(PGO_MERGED) -Cllvm-args=-pgo-warn-missing-funct
 
 .PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-instrument pgo-instrument-linux pgo-profile pgo-profile-linux pgo-merge bench-pgo install record gifs ensure-musl-target gen-xsh
 
-# Regenerate the XSH vocabulary region of src/languages/xsh.rs from the
+# Regenerate the XSH vocabulary region of crates/hi-lite/src/languages/xsh.rs from the
 # registry (XSH_REPO overrides the path)
 gen-xsh:
 	cargo run --quiet --example gen_xsh

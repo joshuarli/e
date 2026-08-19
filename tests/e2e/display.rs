@@ -133,7 +133,11 @@ fn syntax_highlight_string() {
     if let Some(pos) = r.find('"') {
         let fg = e.cell_fg(0, pos as u16 + 1); // character after opening quote
         // Strings should be green (Idx(2))
-        assert_eq!(fg, ptytest::Color::Indexed(2), "string content should be green");
+        assert_eq!(
+            fg,
+            ptytest::Color::Indexed(2),
+            "string content should be green"
+        );
     }
 }
 

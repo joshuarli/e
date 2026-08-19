@@ -15,8 +15,7 @@ fn save_writes_file() {
     e.type_text(" modified");
     e.ctrl('s');
     e.wait_until(std::time::Duration::from_secs(2), |_| {
-        std::fs::read_to_string(&path)
-            .is_ok_and(|content| content.contains("original modified"))
+        std::fs::read_to_string(&path).is_ok_and(|content| content.contains("original modified"))
     });
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(
@@ -142,8 +141,7 @@ fn quit_dirty_save_and_exit() {
     e.ctrl('q');
     e.send_raw(b"y"); // save
     e.wait_until(std::time::Duration::from_secs(2), |_| {
-        std::fs::read_to_string(&path)
-            .is_ok_and(|content| content.contains("hello modified"))
+        std::fs::read_to_string(&path).is_ok_and(|content| content.contains("hello modified"))
     });
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(

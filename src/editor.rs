@@ -9,9 +9,9 @@ use crate::command::{CommandAction, CommandRegistry};
 use crate::command_buffer::{CommandBuffer, CommandBufferMode, CommandBufferResult};
 use crate::document::{Document, TextEdit};
 use crate::find::FindState;
-use crate::highlight;
 use crate::input::{self, EditorEvent, InputParser, Key, MouseButton, MouseEvent, MouseMods};
 use crate::keybind::{EditorAction, KeybindingTable};
+use crate::language::DetectedLanguage;
 use crate::mouse::MouseState;
 use crate::render::{Renderer, gutter_width};
 use crate::selection::{
@@ -56,6 +56,39 @@ fn common_prefix(strings: &[&str]) -> String {
         }
     }
     first[..len].to_string()
+}
+
+// The editor keeps character positions in its own selection model. Convert
+// only at this storage-agnostic matching boundary; the reusable highlighter
+// remains byte-oriented and does not depend on editor types.
+fn find_bracket_match(
+    pos: TextPosition,
+    get_line: &mut impl FnMut(usize, &mut Vec<u8>),
+    scratch: &mut Vec<u8>,
+    line_count: usize,
+) -> Option<TextPosition> {
+    hi_lite::find_bracket_match(
+        hi_lite::TextPosition::new(pos.line, pos.column),
+        get_line,
+        scratch,
+        line_count,
+    )
+    .map(|position| TextPosition::new(position.line, position.column))
+}
+
+fn find_quote_match(
+    pos: TextPosition,
+    get_line: &mut impl FnMut(usize, &mut Vec<u8>),
+    scratch: &mut Vec<u8>,
+    line_count: usize,
+) -> Option<TextPosition> {
+    hi_lite::find_quote_match(
+        hi_lite::TextPosition::new(pos.line, pos.column),
+        get_line,
+        scratch,
+        line_count,
+    )
+    .map(|position| TextPosition::new(position.line, position.column))
 }
 
 pub struct Editor {
@@ -523,12 +556,11 @@ impl Editor {
         scratch: &mut Vec<u8>,
         pos: TextPosition,
     ) -> Option<TextPosition> {
-        let line_count = document.buffer.line_count();
-        highlight::find_bracket_match(
+        find_bracket_match(
             pos,
             &mut |line_idx, buf| document.buffer.line_text_into(line_idx, buf),
             scratch,
-            line_count,
+            document.buffer.line_count(),
         )
     }
 
@@ -595,8 +627,8 @@ impl Editor {
                 .refresh_viewport_matches(&self.document.buffer, &self.viewport);
         }
 
-        let rules = lang.and_then(|l| crate::languages::rules_for_language(l.name));
-        self.renderer.set_syntax(rules);
+        let language = lang.and_then(DetectedLanguage::syntax);
+        self.renderer.set_language(language);
         if self.carets.is_multicursor() {
             self.renderer.force_full_redraw();
         }
@@ -710,7 +742,7 @@ impl Editor {
         let line_count = self.document.buffer.line_count();
         // Reuse the editor's scratch buffer to avoid a per-frame allocation.
         let mut scratch = std::mem::take(&mut self.line_text_scratch);
-        if let Some(match_pos) = highlight::find_bracket_match(
+        if let Some(match_pos) = find_bracket_match(
             cursor,
             &mut |line_idx, buf| self.document.buffer.line_text_into(line_idx, buf),
             &mut scratch,
@@ -719,7 +751,7 @@ impl Editor {
             self.line_text_scratch = scratch;
             return Some((cursor, match_pos));
         }
-        let match_pos = highlight::find_quote_match(
+        let match_pos = find_quote_match(
             cursor,
             &mut |line_idx, buf| self.document.buffer.line_text_into(line_idx, buf),
             &mut scratch,

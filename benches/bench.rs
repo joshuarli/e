@@ -18,10 +18,10 @@ use e::command::CommandRegistry;
 use e::command_buffer::{CommandBuffer, CommandBufferMode, CommandBufferResult};
 use e::document::Document;
 use e::find::FindState;
-use e::languages::{SyntaxRules, rules_for_language};
 use e::render::Renderer;
 use e::selection::{Selection, TextPosition};
 use e::viewport::Viewport;
+use hi_lite::Language;
 
 #[cfg(target_os = "linux")]
 const TRACE_BEGIN: &CStr = c"BENCH_BEGIN";
@@ -209,10 +209,10 @@ fn document_insert_delete_interleaved(b: Bencher) {
 #[rustybench::bench]
 fn edit_and_render_python_10k(b: Bencher) {
     let data = make_python_source(10_000);
-    let rules = rules_for_language("Python");
+    let rules = Some(Language::Python);
     let mut document = Document::new(data, Some("fixture.py".to_string()));
     let mut renderer = Renderer::new();
-    renderer.set_syntax(rules);
+    renderer.set_language(rules);
     let mut viewport = Viewport::new(120, 40);
     let cursor = TextPosition::new(5_000, 12);
     viewport.scroll_line = cursor.line;
@@ -244,10 +244,10 @@ fn edit_and_render_python_10k(b: Bencher) {
 #[rustybench::bench]
 fn edit_and_render_python_short(b: Bencher) {
     let data = make_python_source(40);
-    let rules = rules_for_language("Python");
+    let rules = Some(Language::Python);
     let mut document = Document::new(data, Some("fixture.py".to_string()));
     let mut renderer = Renderer::new();
-    renderer.set_syntax(rules);
+    renderer.set_language(rules);
     let viewport = Viewport::new(120, 40);
     let cursor = TextPosition::new(5, 12);
     let mut sink = Vec::with_capacity(32 * 1024);
@@ -425,10 +425,10 @@ fn render_setup(
     data: &[u8],
     width: u16,
     height: u16,
-    syntax: Option<&'static SyntaxRules>,
+    language: Option<Language>,
 ) -> (Renderer, GapBuffer, Viewport) {
     let mut renderer = Renderer::new();
-    renderer.set_syntax(syntax);
+    renderer.set_language(language);
     let buffer = GapBuffer::from_bytes(data.to_vec());
     let mut viewport = Viewport::new(width, height);
     viewport.scroll_line = buffer.line_count() / 2;
@@ -491,7 +491,7 @@ fn command_palette_trace_python_10k(b: Bencher) {
     let data = make_python_source(10_000);
     let mut document = Document::new(data, Some("fixture.py".to_string()));
     let mut renderer = Renderer::new();
-    renderer.set_syntax(rules_for_language("Python"));
+    renderer.set_language(Some(Language::Python));
     let viewport = Viewport::new(120, 40);
     let cursor = TextPosition::new(5_000, 12);
     let mut command = CommandBuffer::new();
@@ -545,7 +545,7 @@ fn find_command_trace_python_10k(b: Bencher) {
     let data = make_python_source(10_000);
     let mut document = Document::new(data, Some("fixture.py".to_string()));
     let mut renderer = Renderer::new();
-    renderer.set_syntax(rules_for_language("Python"));
+    renderer.set_language(Some(Language::Python));
     let viewport = Viewport::new(120, 40);
     let cursor = TextPosition::new(5_000, 12);
     let mut command = CommandBuffer::new();
@@ -598,9 +598,9 @@ fn render_frame(
     width: u16,
     height: u16,
     selection: Option<Selection>,
-    syntax: Option<&'static SyntaxRules>,
+    language: Option<Language>,
 ) {
-    let (mut renderer, mut buffer, viewport) = render_setup(data, width, height, syntax);
+    let (mut renderer, mut buffer, viewport) = render_setup(data, width, height, language);
     let cursor_line = viewport.scroll_line;
     let mut sink = Vec::with_capacity(32 * 1024);
     bench_with_syscall_trace(b, || {
@@ -621,12 +621,12 @@ fn open_and_render_python(b: Bencher, data: &[u8], label: &str) {
     let dir = BenchDir::new(label);
     let path = dir.0.join("fixture.py");
     fs::write(&path, data).unwrap();
-    let rules = rules_for_language("Python");
+    let rules = Some(Language::Python);
     bench_with_syscall_trace(b, || {
         let loaded = e::file_io::read_file(&path).unwrap();
         let mut buffer = GapBuffer::from_bytes(loaded);
         let mut renderer = Renderer::new();
-        renderer.set_syntax(rules);
+        renderer.set_language(rules);
         let mut viewport = Viewport::new(120, 40);
         viewport.scroll_line = buffer.line_count() / 2;
         let cursor = TextPosition::new(viewport.scroll_line, 0);
@@ -658,14 +658,14 @@ fn open_and_render_python_10mb(b: Bencher) {
 #[rustybench::bench]
 fn render_frame_120x40_viewport_syntax(b: Bencher) {
     let data = make_rust_source(1_000);
-    let rules = rules_for_language("Rust");
+    let rules = Some(Language::Rust);
     render_frame(b, &data, 120, 40, None, rules);
 }
 
 #[rustybench::bench]
 fn render_frame_120x40_viewport_selection(b: Bencher) {
     let data = make_rust_source(1_000);
-    let rules = rules_for_language("Rust");
+    let rules = Some(Language::Rust);
     let line = 1_000 / 2;
     let selection = Selection {
         anchor: TextPosition::new(line, 0),
@@ -685,7 +685,7 @@ fn render_incremental(
     mut movement: impl FnMut(&mut Renderer, &mut GapBuffer, &mut Vec<u8>, &Viewport, usize),
 ) {
     let data = make_rust_source(1_000);
-    let rules = rules_for_language("Rust");
+    let rules = Some(Language::Rust);
     let (mut renderer, mut buffer, viewport) = render_setup(&data, 120, 40, rules);
     let cursor_line = viewport.scroll_line;
     let mut sink = Vec::with_capacity(32 * 1024);

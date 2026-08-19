@@ -1,365 +1,376 @@
-/// Language detection and comment syntax.
+//! Application language detection and comment syntax.
+//!
+//! `hi-lite::Language` is the canonical lexer selection type. This module is
+//! intentionally narrower: filename/shebang matching and comment insertion are
+//! editor policy, including entries for languages that have no `hi-lite` lexer.
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Language {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetectedLanguage {
     pub name: &'static str,
     pub comment: &'static str,
 }
 
-const LANGUAGES: &[(&[&str], Language)] = &[
+impl DetectedLanguage {
+    /// Return the reusable lexer language when `hi-lite` has rules for it.
+    pub fn syntax(self) -> Option<hi_lite::Language> {
+        hi_lite::Language::from_name(self.name)
+    }
+}
+
+const LANGUAGES: &[(&[&str], DetectedLanguage)] = &[
     (
         &[".rs"],
-        Language {
+        DetectedLanguage {
             name: "Rust",
             comment: "//",
         },
     ),
     (
         &[".c", ".h"],
-        Language {
+        DetectedLanguage {
             name: "C",
             comment: "//",
         },
     ),
     (
         &[".cpp", ".cc", ".cxx", ".hpp", ".hxx"],
-        Language {
+        DetectedLanguage {
             name: "C++",
             comment: "//",
         },
     ),
     (
         &[".go"],
-        Language {
+        DetectedLanguage {
             name: "Go",
             comment: "//",
         },
     ),
     (
         &[".js", ".jsx", ".mjs"],
-        Language {
+        DetectedLanguage {
             name: "JavaScript",
             comment: "//",
         },
     ),
     (
         &[".ts", ".tsx"],
-        Language {
+        DetectedLanguage {
             name: "TypeScript",
             comment: "//",
         },
     ),
     (
         &[".java"],
-        Language {
+        DetectedLanguage {
             name: "Java",
             comment: "//",
         },
     ),
     (
         &[".cs"],
-        Language {
+        DetectedLanguage {
             name: "C#",
             comment: "//",
         },
     ),
     (
         &[".swift"],
-        Language {
+        DetectedLanguage {
             name: "Swift",
             comment: "//",
         },
     ),
     (
         &[".kt", ".kts"],
-        Language {
+        DetectedLanguage {
             name: "Kotlin",
             comment: "//",
         },
     ),
     (
         &[".scala"],
-        Language {
+        DetectedLanguage {
             name: "Scala",
             comment: "//",
         },
     ),
     (
         &[".py", ".pyi"],
-        Language {
+        DetectedLanguage {
             name: "Python",
             comment: "#",
         },
     ),
     (
         &[".rb"],
-        Language {
+        DetectedLanguage {
             name: "Ruby",
             comment: "#",
         },
     ),
     (
         &[".sh", ".bash", ".zsh", ".fish"],
-        Language {
+        DetectedLanguage {
             name: "Shell",
             comment: "#",
         },
     ),
     (
         &[".pl", ".pm"],
-        Language {
+        DetectedLanguage {
             name: "Perl",
             comment: "#",
         },
     ),
     (
         &[".r"],
-        Language {
+        DetectedLanguage {
             name: "R",
             comment: "#",
         },
     ),
     (
         &[".json"],
-        Language {
+        DetectedLanguage {
             name: "JSON",
             comment: "",
         },
     ),
     (
         &[".yaml", ".yml"],
-        Language {
+        DetectedLanguage {
             name: "YAML",
             comment: "#",
         },
     ),
     (
         &[".toml"],
-        Language {
+        DetectedLanguage {
             name: "TOML",
             comment: "#",
         },
     ),
     (
         &[".conf", ".cfg", ".ini"],
-        Language {
+        DetectedLanguage {
             name: "Config",
             comment: "#",
         },
     ),
     (
         &[".lua"],
-        Language {
+        DetectedLanguage {
             name: "Lua",
             comment: "--",
         },
     ),
     (
         &[".sql"],
-        Language {
+        DetectedLanguage {
             name: "SQL",
             comment: "--",
         },
     ),
     (
         &[".hs"],
-        Language {
+        DetectedLanguage {
             name: "Haskell",
             comment: "--",
         },
     ),
     (
         &[".elm"],
-        Language {
+        DetectedLanguage {
             name: "Elm",
             comment: "--",
         },
     ),
     (
         &[".html", ".htm"],
-        Language {
+        DetectedLanguage {
             name: "HTML",
             comment: "<!--",
         },
     ),
     (
         &[".xml", ".svg"],
-        Language {
+        DetectedLanguage {
             name: "XML",
             comment: "<!--",
         },
     ),
     (
         &[".css"],
-        Language {
+        DetectedLanguage {
             name: "CSS",
             comment: "/*",
         },
     ),
     (
         &[".scss", ".sass"],
-        Language {
+        DetectedLanguage {
             name: "SCSS",
             comment: "//",
         },
     ),
     (
         &[".less"],
-        Language {
+        DetectedLanguage {
             name: "Less",
             comment: "//",
         },
     ),
     (
         &[".php"],
-        Language {
+        DetectedLanguage {
             name: "PHP",
             comment: "//",
         },
     ),
     (
         &[".ex", ".exs"],
-        Language {
+        DetectedLanguage {
             name: "Elixir",
             comment: "#",
         },
     ),
     (
         &[".erl", ".hrl"],
-        Language {
+        DetectedLanguage {
             name: "Erlang",
             comment: "%",
         },
     ),
     (
         &[".clj", ".cljs"],
-        Language {
+        DetectedLanguage {
             name: "Clojure",
             comment: ";;",
         },
     ),
     (
         &[".lisp", ".cl", ".el"],
-        Language {
+        DetectedLanguage {
             name: "Lisp",
             comment: ";;",
         },
     ),
     (
         &[".vim"],
-        Language {
+        DetectedLanguage {
             name: "Vim",
             comment: "\"",
         },
     ),
     (
         &[".zig"],
-        Language {
+        DetectedLanguage {
             name: "Zig",
             comment: "//",
         },
     ),
     (
         &[".d"],
-        Language {
+        DetectedLanguage {
             name: "D",
             comment: "//",
         },
     ),
     (
         &[".dart"],
-        Language {
+        DetectedLanguage {
             name: "Dart",
             comment: "//",
         },
     ),
     (
         &[".m"],
-        Language {
+        DetectedLanguage {
             name: "Objective-C",
             comment: "//",
         },
     ),
     (
         &[".v"],
-        Language {
+        DetectedLanguage {
             name: "V",
             comment: "//",
         },
     ),
     (
         &[".nim"],
-        Language {
+        DetectedLanguage {
             name: "Nim",
             comment: "#",
         },
     ),
     (
         &[".cr"],
-        Language {
+        DetectedLanguage {
             name: "Crystal",
             comment: "#",
         },
     ),
     (
         &[".jl"],
-        Language {
+        DetectedLanguage {
             name: "Julia",
             comment: "#",
         },
     ),
     (
         &[".tf"],
-        Language {
+        DetectedLanguage {
             name: "Terraform",
             comment: "#",
         },
     ),
     (
         &["Makefile", "makefile", "GNUmakefile"],
-        Language {
+        DetectedLanguage {
             name: "Makefile",
             comment: "#",
         },
     ),
     (
         &["Dockerfile"],
-        Language {
+        DetectedLanguage {
             name: "Dockerfile",
             comment: "#",
         },
     ),
     (
         &[".cmake"],
-        Language {
+        DetectedLanguage {
             name: "CMake",
             comment: "#",
         },
     ),
     (
         &[".proto"],
-        Language {
+        DetectedLanguage {
             name: "Protobuf",
             comment: "//",
         },
     ),
     (
         &[".graphql", ".gql"],
-        Language {
+        DetectedLanguage {
             name: "GraphQL",
             comment: "#",
         },
     ),
     (
         &[".md", ".markdown", ".mkd", ".mdx"],
-        Language {
+        DetectedLanguage {
             name: "Markdown",
             comment: "<!--",
         },
     ),
     (
         &[".xsh"],
-        Language {
+        DetectedLanguage {
             name: "XSH",
             comment: "#",
         },
@@ -367,7 +378,7 @@ const LANGUAGES: &[(&[&str], Language)] = &[
 ];
 
 /// Detect language from a filename.
-pub fn detect(filename: &str) -> Option<Language> {
+pub fn detect(filename: &str) -> Option<DetectedLanguage> {
     let basename = filename.rsplit('/').next().unwrap_or(filename);
     for (patterns, lang) in LANGUAGES {
         for pattern in *patterns {
@@ -391,31 +402,31 @@ pub fn detect(filename: &str) -> Option<Language> {
 
 /// Map interpreter names (from shebangs) to languages.
 /// Only covers languages that have syntax-highlighting rules.
-const SHEBANGS: &[(&[&str], Language)] = &[
+const SHEBANGS: &[(&[&str], DetectedLanguage)] = &[
     (
         &["sh", "bash", "zsh", "fish", "dash", "ash", "ksh"],
-        Language {
+        DetectedLanguage {
             name: "Shell",
             comment: "#",
         },
     ),
     (
         &["python", "python3", "python2"],
-        Language {
+        DetectedLanguage {
             name: "Python",
             comment: "#",
         },
     ),
     (
         &["node", "nodejs", "deno", "bun"],
-        Language {
+        DetectedLanguage {
             name: "JavaScript",
             comment: "//",
         },
     ),
     (
         &["xsh", "xshi", "xsht"],
-        Language {
+        DetectedLanguage {
             name: "XSH",
             comment: "#",
         },
@@ -423,7 +434,7 @@ const SHEBANGS: &[(&[&str], Language)] = &[
 ];
 
 /// Detect language from a shebang line (the first line of file content).
-pub fn detect_from_shebang(first_line: &[u8]) -> Option<Language> {
+pub fn detect_from_shebang(first_line: &[u8]) -> Option<DetectedLanguage> {
     let line = first_line.strip_prefix(b"#!")?;
     // Extract the interpreter: split on whitespace to get the command and args.
     let line = line.trim_ascii();
@@ -490,6 +501,19 @@ mod tests {
     #[test]
     fn test_detect_with_path() {
         assert_eq!(detect("/some/path/main.rs").unwrap().name, "Rust");
+    }
+
+    #[test]
+    fn test_detected_language_delegates_syntax_selection() {
+        assert_eq!(
+            detect("main.rs").unwrap().syntax(),
+            Some(hi_lite::Language::Rust)
+        );
+        assert_eq!(
+            detect("main.cpp").unwrap().syntax(),
+            None,
+            "detection can retain comment support without claiming a hi-lite lexer"
+        );
     }
 
     #[test]

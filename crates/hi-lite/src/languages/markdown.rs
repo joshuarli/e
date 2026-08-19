@@ -1,8 +1,8 @@
 //! Markdown syntax rules.
 
-use super::SyntaxRules;
+use super::{LexerKind, RuleSet};
 
-pub static RULES: SyntaxRules = SyntaxRules {
+pub(crate) static RULES: RuleSet = RuleSet {
     line_comment: "",
     block_comment: ("<!--", "-->"),
     string_delims: &[],
@@ -15,8 +15,5 @@ pub static RULES: SyntaxRules = SyntaxRules {
     highlight_upper_constants: false,
     highlight_fn_calls: false,
     highlight_bang_macros: false,
-    is_markdown: true,
-    is_json: false,
-    is_yaml: false,
-    is_ini: false,
+    lexer_kind: LexerKind::Markdown,
 };

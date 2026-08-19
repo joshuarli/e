@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::buffer::GapBuffer;
-use crate::language::{self, Language};
+use crate::language::{self, DetectedLanguage};
 use crate::operation::{UndoOperation, UndoStack};
 use crate::selection::{CaretSnapshot, Selection, TextPosition};
 
@@ -328,7 +328,7 @@ impl Document {
     }
 
     /// Detect language from filename, falling back to shebang on the first line.
-    pub fn detect_language(&self) -> Option<Language> {
+    pub fn detect_language(&self) -> Option<DetectedLanguage> {
         self.file_path
             .as_deref()
             .and_then(language::detect)

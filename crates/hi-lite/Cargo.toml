@@ -1,0 +1,6 @@
+[package]
+name = "hi-lite"
+version = "0.1.0"
+edition = "2024"
+description = "Dependency-free line-oriented syntax highlighting"
+license = "MIT OR Apache-2.0"

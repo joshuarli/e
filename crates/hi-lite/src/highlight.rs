@@ -1,15 +1,41 @@
 //! Syntax highlighting engine.
 //!
-//! Byte-by-byte highlighter inspired by kilo/kibi. Produces one `HighlightKind` per
+//! Byte-by-byte highlighter inspired by kilo/kibi. Produces one `Kind` per
 //! byte, then maps to per-char highlights for the renderer.
 
-use crate::buffer;
-use crate::languages::SyntaxRules;
+use crate::languages::{LexerKind, RuleSet};
+
+fn utf8_char_len(first_byte: u8) -> usize {
+    if first_byte < 0xC0 {
+        1
+    } else if first_byte < 0xE0 {
+        2
+    } else if first_byte < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// A zero-based logical line and character column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TextPosition {
+    pub line: usize,
+    pub column: usize,
+}
+
+impl TextPosition {
+    pub const fn new(line: usize, column: usize) -> Self {
+        Self { line, column }
+    }
+}
 
 // -- Types ------------------------------------------------------------------
 
+/// Semantic category assigned to one source byte or rendered character.
+#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-pub enum HighlightKind {
+pub enum Kind {
     #[default]
     Normal,
     Keyword,
@@ -24,33 +50,31 @@ pub enum HighlightKind {
     Macro,
 }
 
+/// Internal multiline scanner state.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-pub enum HighlightState {
+enum StateKind {
     #[default]
     Normal,
     BlockComment,
+    RustBlockComment(u16),
     MultiLineString(u8),
+    RustRawString(u8),
     FencedCodeBlock,
 }
 
-// -- ANSI color codes -------------------------------------------------------
+/// Opaque state carried from one source line to the next.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct State(StateKind);
 
-impl HighlightKind {
-    /// Return the ANSI color code for this highlight type, or empty for Normal.
-    pub fn ansi_code(self) -> &'static str {
-        match self {
-            HighlightKind::Normal => "",
-            HighlightKind::Comment => "\x1b[90m",    // grey
-            HighlightKind::Keyword => "\x1b[33m",    // yellow
-            HighlightKind::Type => "\x1b[36m",       // cyan
-            HighlightKind::String => "\x1b[32m",     // green
-            HighlightKind::Number => "\x1b[31m",     // red
-            HighlightKind::Bracket => "\x1b[35m",    // magenta
-            HighlightKind::Operator => "\x1b[33m",   // yellow (same as keyword)
-            HighlightKind::Function => "\x1b[34m",   // blue
-            HighlightKind::Constant => "\x1b[31;1m", // bold red
-            HighlightKind::Macro => "\x1b[35;1m",    // bold magenta
-        }
+impl State {
+    /// Return the initial state for a new document or stream.
+    pub const fn normal() -> Self {
+        Self(StateKind::Normal)
+    }
+
+    /// Return whether no multiline lexical construct is active.
+    pub const fn is_normal(self) -> bool {
+        matches!(self.0, StateKind::Normal)
     }
 }
 
@@ -96,24 +120,140 @@ fn starts_with_at(haystack: &[u8], needle: &[u8], pos: usize) -> bool {
     &haystack[pos..pos + needle.len()] == needle
 }
 
-/// Highlight a single line. Returns (per-byte HighlightKind vec, next-line state).
-pub fn highlight_line(
-    line: &[u8],
-    state: HighlightState,
-    rules: &SyntaxRules,
-) -> (Vec<HighlightKind>, HighlightState) {
+/// Allocate a per-byte result for the internal rule-table tests.
+#[cfg(test)]
+fn highlight_line(line: &[u8], state: StateKind, rules: &RuleSet) -> (Vec<Kind>, StateKind) {
     let mut hl = Vec::new();
-    let next_state = highlight_line_into(line, state, rules, &[], &mut hl);
+    hl.resize(line.len(), Kind::Normal);
+    let next_state = highlight_line_into_rules(line, state, rules, &[], &mut hl);
     (hl, next_state)
+}
+
+fn rust_comment_state(depth: u16) -> StateKind {
+    if depth <= 1 {
+        StateKind::BlockComment
+    } else {
+        StateKind::RustBlockComment(depth)
+    }
+}
+
+/// Scan a Rust block comment, retaining nesting depth when it crosses a line.
+fn scan_rust_block_comment(
+    line: &[u8],
+    mark_start: usize,
+    scan_start: usize,
+    mut depth: u16,
+    block_open: &[u8],
+    block_close: &[u8],
+    hl: &mut [Kind],
+) -> (usize, StateKind) {
+    let mut i = scan_start;
+    while i < line.len() {
+        if starts_with_at(line, block_open, i) {
+            depth = depth.saturating_add(1);
+            i += block_open.len();
+        } else if starts_with_at(line, block_close, i) {
+            depth = depth.saturating_sub(1);
+            i += block_close.len();
+            if depth == 0 {
+                for byte in &mut hl[mark_start..i] {
+                    *byte = Kind::Comment;
+                }
+                return (i, StateKind::Normal);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    for byte in &mut hl[mark_start..] {
+        *byte = Kind::Comment;
+    }
+    (line.len(), rust_comment_state(depth))
+}
+
+fn rust_raw_string_open(line: &[u8], pos: usize) -> Option<(usize, u8)> {
+    let prefix_len = if line.get(pos) == Some(&b'r') {
+        1
+    } else if line.get(pos) == Some(&b'b') && line.get(pos + 1) == Some(&b'r') {
+        2
+    } else {
+        return None;
+    };
+
+    let mut hash_count = 0usize;
+    let mut quote = pos + prefix_len;
+    while line.get(quote) == Some(&b'#') {
+        hash_count += 1;
+        if hash_count > u8::MAX as usize {
+            return None;
+        }
+        quote += 1;
+    }
+    (line.get(quote) == Some(&b'"')).then_some((quote + 1, hash_count as u8))
+}
+
+fn rust_raw_string_close(line: &[u8], pos: usize, hash_count: u8) -> Option<usize> {
+    if line.get(pos) != Some(&b'"') {
+        return None;
+    }
+    let mut end = pos + 1;
+    for _ in 0..hash_count {
+        if line.get(end) != Some(&b'#') {
+            return None;
+        }
+        end += 1;
+    }
+    Some(end)
+}
+
+fn scan_rust_raw_string(
+    line: &[u8],
+    start: usize,
+    hash_count: u8,
+    hl: &mut [Kind],
+) -> (usize, StateKind) {
+    let mut i = start;
+    while i < line.len() {
+        if let Some(end) = rust_raw_string_close(line, i, hash_count) {
+            for byte in &mut hl[start..end] {
+                *byte = Kind::String;
+            }
+            return (end, StateKind::Normal);
+        }
+        i += 1;
+    }
+    for byte in &mut hl[start..] {
+        *byte = Kind::String;
+    }
+    (line.len(), StateKind::RustRawString(hash_count))
+}
+
+fn rust_lifetime_end(line: &[u8], pos: usize) -> Option<usize> {
+    if line.get(pos) != Some(&b'\'')
+        || !line
+            .get(pos + 1)
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+    {
+        return None;
+    }
+    let mut end = pos + 2;
+    while line
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        end += 1;
+    }
+    // `'a'` is a character literal, not a lifetime.
+    (line.get(end) != Some(&b'\'')).then_some(end)
 }
 
 fn highlight_line_code(
     line: &[u8],
-    state: HighlightState,
-    rules: &SyntaxRules,
+    state: StateKind,
+    rules: &RuleSet,
     user_types: &[Vec<u8>],
-    hl: &mut [HighlightKind],
-) -> HighlightState {
+    hl: &mut [Kind],
+) -> StateKind {
     let len = line.len();
     let mut i = 0;
     let mut prev_sep = true;
@@ -125,54 +265,83 @@ fn highlight_line_code(
 
     // Handle entering in a multiline state
     match current_state {
-        HighlightState::BlockComment => {
+        StateKind::BlockComment if rules.lexer_kind == LexerKind::Rust => {
+            let (next, next_state) =
+                scan_rust_block_comment(line, 0, 0, 1, block_open, block_close, hl);
+            i = next;
+            current_state = next_state;
+            if current_state != StateKind::Normal {
+                return current_state;
+            }
+            prev_sep = true;
+        }
+        StateKind::BlockComment => {
             while i < len {
                 if starts_with_at(line, block_close, i) {
                     let end = i + block_close.len();
                     for b in &mut hl[i..end] {
-                        *b = HighlightKind::Comment;
+                        *b = Kind::Comment;
                     }
                     i = end;
-                    current_state = HighlightState::Normal;
+                    current_state = StateKind::Normal;
                     prev_sep = true;
                     break;
                 }
-                hl[i] = HighlightKind::Comment;
+                hl[i] = Kind::Comment;
                 i += 1;
             }
-            if current_state == HighlightState::BlockComment {
-                return HighlightState::BlockComment;
+            if current_state == StateKind::BlockComment {
+                return StateKind::BlockComment;
             }
         }
-        HighlightState::MultiLineString(idx) => {
+        StateKind::RustBlockComment(depth) => {
+            let (next, next_state) =
+                scan_rust_block_comment(line, 0, 0, depth, block_open, block_close, hl);
+            i = next;
+            current_state = next_state;
+            if current_state != StateKind::Normal {
+                return current_state;
+            }
+            prev_sep = true;
+        }
+        StateKind::MultiLineString(idx) => {
             let close = rules.string_delims[idx as usize].close.as_bytes();
             while i < len {
                 // Check for backslash escape
                 if line[i] == b'\\' && i + 1 < len {
-                    hl[i] = HighlightKind::String;
-                    hl[i + 1] = HighlightKind::String;
+                    hl[i] = Kind::String;
+                    hl[i + 1] = Kind::String;
                     i += 2;
                     continue;
                 }
                 if starts_with_at(line, close, i) {
                     let end = i + close.len();
                     for b in &mut hl[i..end] {
-                        *b = HighlightKind::String;
+                        *b = Kind::String;
                     }
                     i = end;
-                    current_state = HighlightState::Normal;
+                    current_state = StateKind::Normal;
                     prev_sep = true;
                     break;
                 }
-                hl[i] = HighlightKind::String;
+                hl[i] = Kind::String;
                 i += 1;
             }
-            if matches!(current_state, HighlightState::MultiLineString(_)) {
+            if matches!(current_state, StateKind::MultiLineString(_)) {
                 return current_state;
             }
         }
-        HighlightState::Normal => {}
-        HighlightState::FencedCodeBlock => {}
+        StateKind::RustRawString(hash_count) => {
+            let (next, next_state) = scan_rust_raw_string(line, 0, hash_count, hl);
+            i = next;
+            current_state = next_state;
+            if current_state != StateKind::Normal {
+                return current_state;
+            }
+            prev_sep = true;
+        }
+        StateKind::Normal => {}
+        StateKind::FencedCodeBlock => {}
     }
 
     // Main loop
@@ -180,13 +349,30 @@ fn highlight_line_code(
         // Line comment
         if !line_com.is_empty() && starts_with_at(line, line_com, i) {
             for b in &mut hl[i..len] {
-                *b = HighlightKind::Comment;
+                *b = Kind::Comment;
             }
-            return HighlightState::Normal;
+            return StateKind::Normal;
         }
 
         // Block comment start
         if !block_open.is_empty() && starts_with_at(line, block_open, i) {
+            if rules.lexer_kind == LexerKind::Rust {
+                let (next, next_state) = scan_rust_block_comment(
+                    line,
+                    i,
+                    i + block_open.len(),
+                    1,
+                    block_open,
+                    block_close,
+                    hl,
+                );
+                i = next;
+                if next_state != StateKind::Normal {
+                    return next_state;
+                }
+                prev_sep = true;
+                continue;
+            }
             let start = i;
             i += block_open.len();
             // Scan for close on same line
@@ -195,7 +381,7 @@ fn highlight_line_code(
                 if starts_with_at(line, block_close, i) {
                     let end = i + block_close.len();
                     for b in &mut hl[start..end] {
-                        *b = HighlightKind::Comment;
+                        *b = Kind::Comment;
                     }
                     i = end;
                     prev_sep = true;
@@ -206,10 +392,42 @@ fn highlight_line_code(
             }
             if !found {
                 for b in &mut hl[start..len] {
-                    *b = HighlightKind::Comment;
+                    *b = Kind::Comment;
                 }
-                return HighlightState::BlockComment;
+                return StateKind::BlockComment;
             }
+            continue;
+        }
+
+        // Rust raw strings (including raw byte strings) use a matching number
+        // of `#` markers and do not treat backslashes as escapes.
+        if rules.lexer_kind == LexerKind::Rust
+            && prev_sep
+            && let Some((content_start, hash_count)) = rust_raw_string_open(line, i)
+        {
+            let (next, next_state) = scan_rust_raw_string(line, content_start, hash_count, hl);
+            for byte in &mut hl[i..content_start] {
+                *byte = Kind::String;
+            }
+            i = next;
+            if next_state != StateKind::Normal {
+                return next_state;
+            }
+            prev_sep = true;
+            continue;
+        }
+
+        // A Rust lifetime (`'a`, `'static`) is an identifier-like token, not
+        // an unterminated character literal. Character literals still use the
+        // ordinary quoted-string path below.
+        if rules.lexer_kind == LexerKind::Rust
+            && let Some(end) = rust_lifetime_end(line, i)
+        {
+            for byte in &mut hl[i..end] {
+                *byte = Kind::Type;
+            }
+            i = end;
+            prev_sep = false;
             continue;
         }
 
@@ -225,15 +443,15 @@ fn highlight_line_code(
                 let mut found = false;
                 while i < len {
                     if line[i] == b'\\' && i + 1 < len {
-                        hl[i] = HighlightKind::String;
-                        hl[i + 1] = HighlightKind::String;
+                        hl[i] = Kind::String;
+                        hl[i + 1] = Kind::String;
                         i += 2;
                         continue;
                     }
                     if starts_with_at(line, close, i) {
                         let end = i + close.len();
                         for b in &mut hl[start..end] {
-                            *b = HighlightKind::String;
+                            *b = Kind::String;
                         }
                         i = end;
                         prev_sep = true;
@@ -244,12 +462,12 @@ fn highlight_line_code(
                 }
                 if !found {
                     for b in &mut hl[start..len] {
-                        *b = HighlightKind::String;
+                        *b = Kind::String;
                     }
                     if delim.multiline {
-                        return HighlightState::MultiLineString(di as u8);
+                        return StateKind::MultiLineString(di as u8);
                     }
-                    return HighlightState::Normal;
+                    return StateKind::Normal;
                 }
                 matched_string = true;
                 break;
@@ -260,14 +478,13 @@ fn highlight_line_code(
         }
 
         // Numbers (after separator)
-        if rules.highlight_numbers && prev_sep && is_digit_start(line, i) {
+        let starts_range_after_dot = i > 0 && line[i] == b'.' && line[i - 1] == b'.';
+        if rules.highlight_numbers && prev_sep && !starts_range_after_dot && is_digit_start(line, i)
+        {
             let start = i;
-            i += 1;
-            while i < len && is_number_char(line[i]) {
-                i += 1;
-            }
+            i = scan_number_end(line, i);
             for b in &mut hl[start..i] {
-                *b = HighlightKind::Number;
+                *b = Kind::Number;
             }
             prev_sep = false;
             continue;
@@ -285,13 +502,13 @@ fn highlight_line_code(
 
             // Binary search each sorted keyword list.
             let matched = if keyword_search(id, rules.keywords) {
-                Some(HighlightKind::Keyword)
+                Some(Kind::Keyword)
             } else if keyword_search(id, rules.types) {
-                Some(HighlightKind::Type)
+                Some(Kind::Type)
             } else if keyword_search(id, rules.constants) {
-                Some(HighlightKind::Constant)
+                Some(Kind::Constant)
             } else if keyword_search(id, rules.macros) {
-                Some(HighlightKind::Macro)
+                Some(Kind::Macro)
             } else {
                 None
             };
@@ -307,7 +524,7 @@ fn highlight_line_code(
             // User-defined types (scanned from type declarations)
             if !user_types.is_empty() && user_types.iter().any(|t| t.as_slice() == id) {
                 for b in &mut hl[id_start..i] {
-                    *b = HighlightKind::Type;
+                    *b = Kind::Type;
                 }
                 prev_sep = false;
                 continue;
@@ -318,9 +535,9 @@ fn highlight_line_code(
                 // Only treat as macro if the `!` is not followed by `=` (i.e. not `!=`)
                 if i + 1 >= len || line[i + 1] != b'=' {
                     for b in &mut hl[id_start..i] {
-                        *b = HighlightKind::Macro;
+                        *b = Kind::Macro;
                     }
-                    hl[i] = HighlightKind::Macro; // the `!`
+                    hl[i] = Kind::Macro; // the `!`
                     i += 1;
                     prev_sep = true;
                     continue;
@@ -329,7 +546,7 @@ fn highlight_line_code(
             // Function calls: ident(
             if rules.highlight_fn_calls && i < len && line[i] == b'(' {
                 for b in &mut hl[id_start..i] {
-                    *b = HighlightKind::Function;
+                    *b = Kind::Function;
                 }
                 // Don't advance i — let the main loop process '(' as a bracket
                 prev_sep = true;
@@ -344,7 +561,7 @@ fn highlight_line_code(
                 let has_letter = id.iter().any(|&b| b.is_ascii_uppercase());
                 if all_upper && has_letter {
                     for b in &mut hl[id_start..i] {
-                        *b = HighlightKind::Constant;
+                        *b = Kind::Constant;
                     }
                     prev_sep = false;
                     continue;
@@ -364,13 +581,13 @@ fn highlight_line_code(
         }
 
         if matches!(line[i], b'(' | b')' | b'[' | b']' | b'{' | b'}') {
-            hl[i] = HighlightKind::Bracket;
+            hl[i] = Kind::Bracket;
         }
         prev_sep = is_separator(line[i]);
         i += 1;
     }
 
-    HighlightState::Normal
+    StateKind::Normal
 }
 
 fn is_digit_start(line: &[u8], i: usize) -> bool {
@@ -385,21 +602,147 @@ fn is_digit_start(line: &[u8], i: usize) -> bool {
     false
 }
 
-fn is_number_char(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_' || c == b'.'
+fn is_base_digit(byte: u8, base: u8) -> bool {
+    match base {
+        2 => matches!(byte, b'0' | b'1'),
+        8 => byte.is_ascii_digit() && byte < b'8',
+        16 => byte.is_ascii_hexdigit(),
+        _ => byte.is_ascii_digit(),
+    }
 }
 
-fn try_operator(line: &[u8], pos: usize, ops: &[&str], hl: &mut [HighlightKind]) -> Option<usize> {
-    for &op in ops {
-        let ob = op.as_bytes();
-        if starts_with_at(line, ob, pos) {
-            for b in &mut hl[pos..pos + ob.len()] {
-                *b = HighlightKind::Operator;
-            }
-            return Some(ob.len());
+fn consume_digits(line: &[u8], mut pos: usize, base: u8) -> usize {
+    while pos < line.len() {
+        if is_base_digit(line[pos], base) {
+            pos += 1;
+        } else if line[pos] == b'_' && pos + 1 < line.len() && is_base_digit(line[pos + 1], base) {
+            pos += 1;
+        } else {
+            break;
         }
     }
-    None
+    pos
+}
+
+fn is_number_suffix(suffix: &[u8]) -> bool {
+    matches!(
+        suffix,
+        b"u8"
+            | b"u16"
+            | b"u32"
+            | b"u64"
+            | b"u128"
+            | b"usize"
+            | b"i8"
+            | b"i16"
+            | b"i32"
+            | b"i64"
+            | b"i128"
+            | b"isize"
+            | b"f32"
+            | b"f64"
+            | b"f"
+            | b"j"
+            | b"n"
+            | b"ms"
+            | b"us"
+            | b"ns"
+            | b"ps"
+            | b"s"
+            | b"m"
+            | b"h"
+            | b"d"
+    )
+}
+
+/// Consume a common numeric literal without swallowing an arbitrary identifier.
+fn scan_number_end(line: &[u8], start: usize) -> usize {
+    let mut end = start;
+
+    if line.get(start) == Some(&b'0') {
+        let prefixed = match line.get(start + 1).copied() {
+            Some(b'x' | b'X') => Some(16),
+            Some(b'b' | b'B') => Some(2),
+            Some(b'o' | b'O') => Some(8),
+            _ => None,
+        };
+        if let Some(base) = prefixed {
+            let digits_start = start + 2;
+            let digits_end = consume_digits(line, digits_start, base);
+            if digits_end == digits_start {
+                return start + 1;
+            }
+            end = digits_end;
+        }
+    }
+
+    if end == start {
+        end = consume_digits(line, start, 10);
+        if line.get(end) == Some(&b'.')
+            && line.get(end + 1).is_some_and(|byte| byte.is_ascii_digit())
+            && line.get(end + 2) != Some(&b'.')
+        {
+            end = consume_digits(line, end + 1, 10);
+        }
+
+        if line
+            .get(end)
+            .is_some_and(|byte| matches!(byte, b'e' | b'E'))
+        {
+            let mut exponent_end = end + 1;
+            if matches!(line.get(exponent_end), Some(b'+' | b'-')) {
+                exponent_end += 1;
+            }
+            let digits_end = consume_digits(line, exponent_end, 10);
+            if digits_end > exponent_end {
+                end = digits_end;
+            }
+        }
+    }
+
+    let suffix_start = end;
+    let mut suffix_end = suffix_start;
+    while line
+        .get(suffix_end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+    {
+        suffix_end += 1;
+    }
+    if suffix_end > suffix_start && is_number_suffix(&line[suffix_start..suffix_end]) {
+        end = suffix_end;
+    } else if line.get(suffix_start) == Some(&b'_') {
+        let mut underscored_end = suffix_start + 1;
+        while line
+            .get(underscored_end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        {
+            underscored_end += 1;
+        }
+        if underscored_end > suffix_start + 1
+            && is_number_suffix(&line[suffix_start + 1..underscored_end])
+        {
+            end = underscored_end;
+        }
+    }
+    end
+}
+
+/// Match the longest operator, regardless of static table order.
+fn try_operator(line: &[u8], pos: usize, ops: &[&str], hl: &mut [Kind]) -> Option<usize> {
+    let mut best_len = 0;
+    for &op in ops {
+        let ob = op.as_bytes();
+        if ob.len() > best_len && starts_with_at(line, ob, pos) {
+            best_len = ob.len();
+        }
+    }
+    if best_len == 0 {
+        return None;
+    }
+    for b in &mut hl[pos..pos + best_len] {
+        *b = Kind::Operator;
+    }
+    Some(best_len)
 }
 
 /// Binary search a **sorted** keyword list for an exact match.
@@ -410,12 +753,38 @@ fn keyword_search(id: &[u8], words: &[&str]) -> bool {
 // -- Semver highlighting ----------------------------------------------------
 
 /// Post-pass: highlight semver patterns like v1.2.3 or 0.3.5-beta.1
-fn highlight_semver(line: &[u8], hl: &mut [HighlightKind]) {
+fn highlight_semver(line: &[u8], hl: &mut [Kind], lexer_kind: LexerKind, state: StateKind) {
     let len = line.len();
     let mut i = 0;
+    let mut raw_hash_count = match state {
+        StateKind::RustRawString(hash_count) => Some(hash_count),
+        _ => None,
+    };
     while i < len {
+        if lexer_kind == LexerKind::Rust {
+            if let Some(hash_count) = raw_hash_count {
+                if let Some(end) = rust_raw_string_close(line, i, hash_count) {
+                    i = end;
+                    raw_hash_count = None;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            // A raw-string prefix starts a fresh String run. Requiring that
+            // boundary keeps this post-pass from interpreting `r"..."`-like
+            // text embedded in an ordinary string as a second Rust token.
+            if hl[i] == Kind::String
+                && (i == 0 || hl[i - 1] != Kind::String)
+                && let Some((content_start, hash_count)) = rust_raw_string_open(line, i)
+            {
+                raw_hash_count = Some(hash_count);
+                i = content_start;
+                continue;
+            }
+        }
         // Don't start inside a comment
-        if hl[i] == HighlightKind::Comment {
+        if hl[i] == Kind::Comment {
             i += 1;
             continue;
         }
@@ -485,18 +854,14 @@ fn highlight_semver(line: &[u8], hl: &mut [HighlightKind]) {
         }
         // Apply highlight
         for b in &mut hl[start..i] {
-            *b = HighlightKind::Type;
+            *b = Kind::Type;
         }
     }
 }
 
 // -- JSON highlighting ------------------------------------------------------
 
-fn highlight_line_json(
-    line: &[u8],
-    _state: HighlightState,
-    hl: &mut [HighlightKind],
-) -> HighlightState {
+fn highlight_line_json(line: &[u8], _state: StateKind, hl: &mut [Kind]) -> StateKind {
     let len = line.len();
     let mut i = 0;
 
@@ -529,9 +894,9 @@ fn highlight_line_json(
                 peek += 1;
             }
             let hl_type = if peek < len && line[peek] == b':' {
-                HighlightKind::Keyword // key → yellow
+                Kind::Keyword // key → yellow
             } else {
-                HighlightKind::String // value → green
+                Kind::String // value → green
             };
             for b in &mut hl[start..str_end] {
                 *b = hl_type;
@@ -557,7 +922,7 @@ fn highlight_line_json(
             }
             if i > start + (if line[start] == b'-' { 1 } else { 0 }) {
                 for b in &mut hl[start..i] {
-                    *b = HighlightKind::Number;
+                    *b = Kind::Number;
                 }
                 continue;
             }
@@ -565,9 +930,9 @@ fn highlight_line_json(
 
         // true, false, null
         for &(word, hl_type) in &[
-            (&b"true"[..], HighlightKind::Type),
-            (&b"false"[..], HighlightKind::Type),
-            (&b"null"[..], HighlightKind::Type),
+            (&b"true"[..], Kind::Type),
+            (&b"false"[..], Kind::Type),
+            (&b"null"[..], Kind::Type),
         ] {
             if starts_with_at(line, word, i) {
                 let end = i + word.len();
@@ -583,42 +948,38 @@ fn highlight_line_json(
 
         // Brackets
         if i < len && matches!(line[i], b'{' | b'}' | b'[' | b']') {
-            hl[i] = HighlightKind::Bracket;
+            hl[i] = Kind::Bracket;
         }
 
         i += 1;
     }
 
-    HighlightState::Normal
+    StateKind::Normal
 }
 
 // -- YAML highlighting ------------------------------------------------------
 
-fn highlight_line_yaml(
-    line: &[u8],
-    _state: HighlightState,
-    hl: &mut [HighlightKind],
-) -> HighlightState {
+fn highlight_line_yaml(line: &[u8], _state: StateKind, hl: &mut [Kind]) -> StateKind {
     let len = line.len();
 
     if len == 0 {
-        return HighlightState::Normal;
+        return StateKind::Normal;
     }
 
     // Comment: # (at start or after whitespace)
     if let Some(comment_start) = find_yaml_comment(line) {
         for b in &mut hl[comment_start..len] {
-            *b = HighlightKind::Comment;
+            *b = Kind::Comment;
         }
         // Highlight the part before the comment
         if comment_start > 0 {
             highlight_yaml_content(&line[..comment_start], &mut hl[..comment_start]);
         }
-        return HighlightState::Normal;
+        return StateKind::Normal;
     }
 
     highlight_yaml_content(line, hl);
-    HighlightState::Normal
+    StateKind::Normal
 }
 
 fn find_yaml_comment(line: &[u8]) -> Option<usize> {
@@ -644,7 +1005,7 @@ fn find_yaml_comment(line: &[u8]) -> Option<usize> {
     None
 }
 
-fn highlight_yaml_content(line: &[u8], hl: &mut [HighlightKind]) {
+fn highlight_yaml_content(line: &[u8], hl: &mut [Kind]) {
     let len = line.len();
     if len == 0 {
         return;
@@ -665,7 +1026,7 @@ fn highlight_yaml_content(line: &[u8], hl: &mut [HighlightKind]) {
                 .take_while(|&&b| !b.is_ascii_whitespace() && b != b':')
                 .count();
         for b in &mut hl[indent..end] {
-            *b = HighlightKind::Type;
+            *b = Kind::Type;
         }
         return;
     }
@@ -675,7 +1036,7 @@ fn highlight_yaml_content(line: &[u8], hl: &mut [HighlightKind]) {
         let abs_colon = indent + colon_pos;
         // Key portion (before colon)
         for b in &mut hl[indent..abs_colon] {
-            *b = HighlightKind::Keyword;
+            *b = Kind::Keyword;
         }
         // Value portion (after colon + space)
         let val_start = abs_colon + 1;
@@ -687,7 +1048,7 @@ fn highlight_yaml_content(line: &[u8], hl: &mut [HighlightKind]) {
 
     // List item: - value
     if rest.starts_with(b"- ") {
-        hl[indent] = HighlightKind::Normal;
+        hl[indent] = Kind::Normal;
         let val_start = indent + 2;
         if val_start < len {
             // Check if the list item contains a key
@@ -695,7 +1056,7 @@ fn highlight_yaml_content(line: &[u8], hl: &mut [HighlightKind]) {
             if let Some(colon_pos) = find_yaml_colon(item_rest) {
                 let abs_colon = val_start + colon_pos;
                 for b in &mut hl[val_start..abs_colon] {
-                    *b = HighlightKind::Keyword;
+                    *b = Kind::Keyword;
                 }
                 let after = abs_colon + 1;
                 if after < len {
@@ -730,7 +1091,7 @@ fn find_yaml_colon(line: &[u8]) -> Option<usize> {
     None
 }
 
-fn highlight_yaml_value(val: &[u8], hl: &mut [HighlightKind]) {
+fn highlight_yaml_value(val: &[u8], hl: &mut [Kind]) {
     let trimmed_start = val.iter().take_while(|&&b| b == b' ').count();
     let trimmed = &val[trimmed_start..];
 
@@ -755,18 +1116,18 @@ fn highlight_yaml_value(val: &[u8], hl: &mut [HighlightKind]) {
             i += 1;
         }
         for b in &mut hl[start..start + i] {
-            *b = HighlightKind::String;
+            *b = Kind::String;
         }
         return;
     }
 
     // true/false/null/yes/no
     for &(word, hl_type) in &[
-        (&b"true"[..], HighlightKind::Type),
-        (&b"false"[..], HighlightKind::Type),
-        (&b"null"[..], HighlightKind::Type),
-        (&b"yes"[..], HighlightKind::Type),
-        (&b"no"[..], HighlightKind::Type),
+        (&b"true"[..], Kind::Type),
+        (&b"false"[..], Kind::Type),
+        (&b"null"[..], Kind::Type),
+        (&b"yes"[..], Kind::Type),
+        (&b"no"[..], Kind::Type),
     ] {
         if trimmed.len() >= word.len()
             && trimmed[..word.len()].eq_ignore_ascii_case(word)
@@ -796,7 +1157,7 @@ fn highlight_yaml_value(val: &[u8], hl: &mut [HighlightKind]) {
         }
         if i > num_start && (i >= trimmed.len() || trimmed[i].is_ascii_whitespace()) {
             for b in &mut hl[trimmed_start..trimmed_start + i] {
-                *b = HighlightKind::Number;
+                *b = Kind::Number;
             }
             return;
         }
@@ -809,22 +1170,18 @@ fn highlight_yaml_value(val: &[u8], hl: &mut [HighlightKind]) {
             .take_while(|&&b| !b.is_ascii_whitespace())
             .count();
         for b in &mut hl[trimmed_start..trimmed_start + end] {
-            *b = HighlightKind::Type;
+            *b = Kind::Type;
         }
     }
 }
 
 // -- INI/Config highlighting ------------------------------------------------
 
-fn highlight_line_ini(
-    line: &[u8],
-    _state: HighlightState,
-    hl: &mut [HighlightKind],
-) -> HighlightState {
+fn highlight_line_ini(line: &[u8], _state: StateKind, hl: &mut [Kind]) -> StateKind {
     let len = line.len();
 
     if len == 0 {
-        return HighlightState::Normal;
+        return StateKind::Normal;
     }
 
     // Skip leading whitespace
@@ -835,22 +1192,22 @@ fn highlight_line_ini(
     let rest = &line[indent..];
 
     if rest.is_empty() {
-        return HighlightState::Normal;
+        return StateKind::Normal;
     }
 
     // Comment lines: ; or # at start (after optional whitespace)
     if rest[0] == b';' || rest[0] == b'#' {
         for b in &mut hl[indent..] {
-            *b = HighlightKind::Comment;
+            *b = Kind::Comment;
         }
-        return HighlightState::Normal;
+        return StateKind::Normal;
     }
 
     // Section headers: [section]
     if rest[0] == b'[' {
         if let Some(close) = rest.iter().position(|&b| b == b']') {
             for b in &mut hl[indent..indent + close + 1] {
-                *b = HighlightKind::Keyword;
+                *b = Kind::Keyword;
             }
             // Anything after ] could be an inline comment
             let after = indent + close + 1;
@@ -858,7 +1215,7 @@ fn highlight_line_ini(
                 highlight_ini_inline_comment(line, hl, after);
             }
         }
-        return HighlightState::Normal;
+        return StateKind::Normal;
     }
 
     // Key = value pairs
@@ -866,7 +1223,7 @@ fn highlight_line_ini(
         let abs_eq = indent + eq_pos;
         // Key (before =)
         for b in &mut hl[indent..abs_eq] {
-            *b = HighlightKind::Keyword;
+            *b = Kind::Keyword;
         }
         // Value (after =)
         let val_start = abs_eq + 1;
@@ -875,10 +1232,10 @@ fn highlight_line_ini(
         }
     }
 
-    HighlightState::Normal
+    StateKind::Normal
 }
 
-fn highlight_ini_value(val: &[u8], hl: &mut [HighlightKind]) {
+fn highlight_ini_value(val: &[u8], hl: &mut [Kind]) {
     let trimmed_start = val.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
     let trimmed = &val[trimmed_start..];
 
@@ -892,7 +1249,7 @@ fn highlight_ini_value(val: &[u8], hl: &mut [HighlightKind]) {
     let value_end = if let Some(cs) = comment_start {
         // Highlight the comment
         for b in &mut hl[cs..] {
-            *b = HighlightKind::Comment;
+            *b = Kind::Comment;
         }
         cs
     } else {
@@ -932,7 +1289,7 @@ fn highlight_ini_value(val: &[u8], hl: &mut [HighlightKind]) {
             i += 1;
         }
         for b in &mut hl[trimmed_start..trimmed_start + i] {
-            *b = HighlightKind::String;
+            *b = Kind::String;
         }
         return;
     }
@@ -948,7 +1305,7 @@ fn highlight_ini_value(val: &[u8], hl: &mut [HighlightKind]) {
     ] {
         if value_trimmed.len() == keyword.len() && value_trimmed.eq_ignore_ascii_case(keyword) {
             for b in &mut hl[trimmed_start..trimmed_start + keyword.len()] {
-                *b = HighlightKind::Type;
+                *b = Kind::Type;
             }
             return;
         }
@@ -968,7 +1325,7 @@ fn highlight_ini_value(val: &[u8], hl: &mut [HighlightKind]) {
         }
         if i > num_start && i == value_trimmed.len() {
             for b in &mut hl[trimmed_start..trimmed_start + i] {
-                *b = HighlightKind::Number;
+                *b = Kind::Number;
             }
         }
     }
@@ -1000,7 +1357,7 @@ fn find_ini_inline_comment(val: &[u8]) -> Option<usize> {
 }
 
 /// Highlight inline comment after a section header closing bracket.
-fn highlight_ini_inline_comment(line: &[u8], hl: &mut [HighlightKind], start: usize) {
+fn highlight_ini_inline_comment(line: &[u8], hl: &mut [Kind], start: usize) {
     let rest = &line[start..];
     let ws = rest
         .iter()
@@ -1009,7 +1366,7 @@ fn highlight_ini_inline_comment(line: &[u8], hl: &mut [HighlightKind], start: us
     let after_ws = start + ws;
     if after_ws < line.len() && (line[after_ws] == b';' || line[after_ws] == b'#') {
         for b in &mut hl[after_ws..] {
-            *b = HighlightKind::Comment;
+            *b = Kind::Comment;
         }
     }
 }
@@ -1018,52 +1375,52 @@ fn highlight_ini_inline_comment(line: &[u8], hl: &mut [HighlightKind], start: us
 
 fn highlight_line_markdown(
     line: &[u8],
-    state: HighlightState,
-    rules: &SyntaxRules,
-    hl: &mut [HighlightKind],
-) -> HighlightState {
+    state: StateKind,
+    rules: &RuleSet,
+    hl: &mut [Kind],
+) -> StateKind {
     let len = line.len();
 
     let block_close = rules.block_comment.1.as_bytes();
 
     // Fenced code block: entering or continuing
-    if state == HighlightState::FencedCodeBlock {
+    if state == StateKind::FencedCodeBlock {
         if len >= 3 && line[0] == b'`' && line[1] == b'`' && line[2] == b'`' {
             for b in &mut hl[..len] {
-                *b = HighlightKind::String;
+                *b = Kind::String;
             }
-            return HighlightState::Normal;
+            return StateKind::Normal;
         }
         for b in &mut hl[..len] {
-            *b = HighlightKind::String;
+            *b = Kind::String;
         }
-        return HighlightState::FencedCodeBlock;
+        return StateKind::FencedCodeBlock;
     }
 
     // Block comment continuation
-    if state == HighlightState::BlockComment {
+    if state == StateKind::BlockComment {
         let mut i = 0;
         while i < len {
             if starts_with_at(line, block_close, i) {
                 let end = i + block_close.len();
                 for b in &mut hl[i..end] {
-                    *b = HighlightKind::Comment;
+                    *b = Kind::Comment;
                 }
                 // hl[0..end] is all Comment; process remainder as inline markdown
                 return highlight_line_markdown_inner(&line[end..], rules, &mut hl[end..]);
             }
-            hl[i] = HighlightKind::Comment;
+            hl[i] = Kind::Comment;
             i += 1;
         }
-        return HighlightState::BlockComment;
+        return StateKind::BlockComment;
     }
 
     // Fenced code block start
     if len >= 3 && line[0] == b'`' && line[1] == b'`' && line[2] == b'`' {
         for b in &mut hl[..len] {
-            *b = HighlightKind::String;
+            *b = Kind::String;
         }
-        return HighlightState::FencedCodeBlock;
+        return StateKind::FencedCodeBlock;
     }
 
     // Horizontal rules: ---, ***, ___ (optionally with spaces)
@@ -1075,9 +1432,9 @@ fn highlight_line_markdown(
             });
             if is_hr {
                 for b in &mut hl[..len] {
-                    *b = HighlightKind::Comment;
+                    *b = Kind::Comment;
                 }
-                return HighlightState::Normal;
+                return StateKind::Normal;
             }
         }
     }
@@ -1085,16 +1442,16 @@ fn highlight_line_markdown(
     // Headers: # at line start
     if len > 0 && line[0] == b'#' {
         for b in &mut hl[..len] {
-            *b = HighlightKind::Keyword;
+            *b = Kind::Keyword;
         }
-        return HighlightState::Normal;
+        return StateKind::Normal;
     }
 
     // Blockquote: > at line start
     if len > 0 && line[0] == b'>' {
-        hl[0] = HighlightKind::Comment;
+        hl[0] = Kind::Comment;
         if len > 1 && line[1] == b' ' {
-            hl[1] = HighlightKind::Comment;
+            hl[1] = Kind::Comment;
         }
         let start = if len > 1 && line[1] == b' ' { 2 } else { 1 };
         return highlight_line_markdown_inner(&line[start..], rules, &mut hl[start..]);
@@ -1130,7 +1487,7 @@ fn highlight_line_markdown(
         };
         if marker_len > 0 {
             for b in &mut hl[indent..indent + marker_len] {
-                *b = HighlightKind::Number;
+                *b = Kind::Number;
             }
             let after = indent + marker_len;
             return highlight_line_markdown_inner(&line[after..], rules, &mut hl[after..]);
@@ -1142,11 +1499,7 @@ fn highlight_line_markdown(
 }
 
 /// Process inline markdown elements: inline code, bold, italic, HTML comments.
-fn highlight_line_markdown_inner(
-    line: &[u8],
-    rules: &SyntaxRules,
-    hl: &mut [HighlightKind],
-) -> HighlightState {
+fn highlight_line_markdown_inner(line: &[u8], rules: &RuleSet, hl: &mut [Kind]) -> StateKind {
     let len = line.len();
     let mut i = 0;
 
@@ -1163,7 +1516,7 @@ fn highlight_line_markdown_inner(
                 if starts_with_at(line, block_close, i) {
                     let end = i + block_close.len();
                     for b in &mut hl[start..end] {
-                        *b = HighlightKind::Comment;
+                        *b = Kind::Comment;
                     }
                     i = end;
                     found = true;
@@ -1173,9 +1526,9 @@ fn highlight_line_markdown_inner(
             }
             if !found {
                 for b in &mut hl[start..len] {
-                    *b = HighlightKind::Comment;
+                    *b = Kind::Comment;
                 }
-                return HighlightState::BlockComment;
+                return StateKind::BlockComment;
             }
             continue;
         }
@@ -1190,7 +1543,7 @@ fn highlight_line_markdown_inner(
             if i < len {
                 i += 1; // consume closing `
                 for b in &mut hl[start..i] {
-                    *b = HighlightKind::String;
+                    *b = Kind::String;
                 }
             }
             continue;
@@ -1206,7 +1559,7 @@ fn highlight_line_markdown_inner(
             if i + 1 < len {
                 i += 2; // consume closing **
                 for b in &mut hl[start..i] {
-                    *b = HighlightKind::Keyword;
+                    *b = Kind::Keyword;
                 }
             }
             continue;
@@ -1222,7 +1575,7 @@ fn highlight_line_markdown_inner(
             if i < len {
                 i += 1; // consume closing *
                 for b in &mut hl[start..i] {
-                    *b = HighlightKind::Type;
+                    *b = Kind::Type;
                 }
             }
             continue;
@@ -1231,12 +1584,10 @@ fn highlight_line_markdown_inner(
         i += 1;
     }
 
-    HighlightState::Normal
+    StateKind::Normal
 }
 
 // -- Bracket matching -------------------------------------------------------
-
-use crate::selection::TextPosition;
 
 fn bracket_pair(ch: u8) -> Option<(u8, bool)> {
     match ch {
@@ -1393,7 +1744,7 @@ fn character_column_to_byte(line: &[u8], character_column: usize) -> Option<usiz
     let mut bi = 0;
     let mut ci = 0;
     while ci < character_column && bi < line.len() {
-        bi += buffer::utf8_char_len(line[bi]);
+        bi += utf8_char_len(line[bi]);
         ci += 1;
     }
     Some(bi)
@@ -1406,7 +1757,7 @@ fn byte_to_character_column(line: &[u8], byte_idx: usize) -> usize {
     let mut bi = 0;
     let mut ci = 0;
     while bi < byte_idx && bi < line.len() {
-        bi += buffer::utf8_char_len(line[bi]);
+        bi += utf8_char_len(line[bi]);
         ci += 1;
     }
     ci
@@ -1417,70 +1768,186 @@ fn byte_to_character_column(line: &[u8], byte_idx: usize) -> usize {
 /// Map byte-indexed highlights to char-indexed highlights, writing into `out`.
 /// Tabs expand to 2 display entries, multi-byte UTF-8 collapses to 1 entry.
 /// Clears `out` first; reuses its allocation across calls.
-pub fn byte_hl_to_char_hl_into(
-    raw: &[u8],
-    byte_hl: &[HighlightKind],
-    out: &mut Vec<HighlightKind>,
-) {
+pub fn byte_kinds_to_char_kinds_into(raw: &[u8], byte_kinds: &[Kind], out: &mut Vec<Kind>) {
+    assert_eq!(
+        raw.len(),
+        byte_kinds.len(),
+        "byte kinds must have one entry per input byte"
+    );
     out.clear();
     if raw.is_ascii() {
         // ASCII fast path: 1 byte = 1 char, tabs expand to 2 display positions
         out.reserve(raw.len());
         for (i, &b) in raw.iter().enumerate() {
-            out.push(byte_hl[i]);
+            out.push(byte_kinds[i]);
             if b == b'\t' {
-                out.push(byte_hl[i]);
+                out.push(byte_kinds[i]);
             }
         }
     } else {
         let mut bi = 0;
         while bi < raw.len() {
-            let ht = byte_hl[bi];
+            let ht = byte_kinds[bi];
             if raw[bi] == b'\t' {
                 out.push(ht);
                 out.push(ht);
                 bi += 1;
             } else {
                 out.push(ht);
-                bi += buffer::utf8_char_len(raw[bi]);
+                bi += utf8_char_len(raw[bi]);
             }
         }
     }
 }
 
-/// Allocating wrapper around `byte_hl_to_char_hl_into`. Used in tests.
+/// Allocating wrapper around `byte_kinds_to_char_kinds_into`. Used in tests.
 #[allow(dead_code)]
-pub fn byte_hl_to_char_hl(raw: &[u8], byte_hl: &[HighlightKind]) -> Vec<HighlightKind> {
+pub fn byte_kinds_to_char_kinds(raw: &[u8], byte_kinds: &[Kind]) -> Vec<Kind> {
     let mut out = Vec::with_capacity(raw.len());
-    byte_hl_to_char_hl_into(raw, byte_hl, &mut out);
+    byte_kinds_to_char_kinds_into(raw, byte_kinds, &mut out);
     out
 }
 
-/// Like `highlight_line` but writes the per-byte highlights into `out`
-/// (clearing it first), reusing its allocation across calls.
-/// Returns only the next-line `HighlightState`.
-pub fn highlight_line_into(
+/// Scan one line with an internal static rule table and caller-owned output.
+fn highlight_line_into_rules(
     line: &[u8],
-    state: HighlightState,
-    rules: &SyntaxRules,
+    state: StateKind,
+    rules: &RuleSet,
     user_types: &[Vec<u8>],
-    out: &mut Vec<HighlightKind>,
-) -> HighlightState {
-    out.clear();
-    out.resize(line.len(), HighlightKind::Normal);
-    let next_state = if rules.is_markdown {
-        highlight_line_markdown(line, state, rules, out)
-    } else if rules.is_json {
-        highlight_line_json(line, state, out)
-    } else if rules.is_yaml {
-        highlight_line_yaml(line, state, out)
-    } else if rules.is_ini {
-        highlight_line_ini(line, state, out)
-    } else {
-        highlight_line_code(line, state, rules, user_types, out)
+    out: &mut [Kind],
+) -> StateKind {
+    assert_eq!(
+        line.len(),
+        out.len(),
+        "highlight output must have one slot per input byte"
+    );
+    let next_state = match rules.lexer_kind {
+        LexerKind::Markdown => highlight_line_markdown(line, state, rules, out),
+        LexerKind::Json => highlight_line_json(line, state, out),
+        LexerKind::Yaml => highlight_line_yaml(line, state, out),
+        LexerKind::Ini => highlight_line_ini(line, state, out),
+        LexerKind::Code | LexerKind::Rust => {
+            highlight_line_code(line, state, rules, user_types, out)
+        }
     };
-    highlight_semver(line, out);
+    highlight_semver(line, out, rules.lexer_kind, state);
     next_state
+}
+
+/// Highlight one line into a caller-sized byte-kind buffer.
+///
+/// `out` must have exactly `line.len()` elements. The returned opaque state is
+/// the input state for the next logical line.
+pub fn highlight_line_into(
+    language: crate::Language,
+    state: State,
+    line: &[u8],
+    out: &mut [Kind],
+) -> State {
+    State(highlight_line_into_rules(
+        line,
+        state.0,
+        language.rules(),
+        &[],
+        out,
+    ))
+}
+
+/// Stateful line highlighter for streaming callers.
+pub struct Highlighter {
+    language: crate::Language,
+    state: State,
+    user_types: Vec<Vec<u8>>,
+}
+
+impl Highlighter {
+    /// Start highlighting with `language` and a normal lexical state.
+    pub fn new(language: crate::Language) -> Self {
+        Self {
+            language,
+            state: State::normal(),
+            user_types: Vec::new(),
+        }
+    }
+
+    /// Return the selected language.
+    pub const fn language(&self) -> crate::Language {
+        self.language
+    }
+
+    /// Replace the selected language and reset multiline state.
+    pub fn set_language(&mut self, language: crate::Language) {
+        self.language = language;
+        self.reset();
+    }
+
+    /// Reset the stream to the beginning of a document.
+    pub fn reset(&mut self) {
+        self.state = State::normal();
+    }
+
+    /// Return the current opaque lexical state.
+    pub const fn state(&self) -> State {
+        self.state
+    }
+
+    /// Set the state used for the next line.
+    ///
+    /// This is useful for editors that resume from a cached line checkpoint.
+    pub fn set_state(&mut self, state: State) {
+        self.state = state;
+    }
+
+    /// Supply optional application-defined type names for identifier coloring.
+    /// The scanner copies the names only when they change.
+    pub fn set_user_types(&mut self, user_types: &[Vec<u8>]) {
+        if self.user_types != user_types {
+            self.user_types.clear();
+            self.user_types.extend_from_slice(user_types);
+        }
+    }
+
+    /// Highlight one line, reusing the caller's scratch allocation.
+    pub fn highlight_into<'a>(&mut self, line: &[u8], scratch: &'a mut Vec<Kind>) -> &'a [Kind] {
+        scratch.resize(line.len(), Kind::Normal);
+        self.state = State(highlight_line_into_rules(
+            line,
+            self.state.0,
+            self.language.rules(),
+            &self.user_types,
+            scratch,
+        ));
+        scratch
+    }
+}
+
+/// A contiguous byte range with one semantic kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub start: usize,
+    pub end: usize,
+    pub kind: Kind,
+}
+
+/// Iterate over sorted, non-overlapping runs of equal byte kinds.
+pub fn runs(kinds: &[Kind]) -> impl Iterator<Item = Run> + '_ {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        if start >= kinds.len() {
+            return None;
+        }
+        let kind = kinds[start];
+        let run_start = start;
+        start += 1;
+        while start < kinds.len() && kinds[start] == kind {
+            start += 1;
+        }
+        Some(Run {
+            start: run_start,
+            end: start,
+            kind,
+        })
+    })
 }
 
 // -- Tests ------------------------------------------------------------------
@@ -1488,10 +1955,11 @@ pub fn highlight_line_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Language;
     use crate::languages::*;
 
-    fn hl_types(line: &[u8], rules: &SyntaxRules) -> Vec<HighlightKind> {
-        highlight_line(line, HighlightState::Normal, rules).0
+    fn hl_types(line: &[u8], rules: &RuleSet) -> Vec<Kind> {
+        highlight_line(line, StateKind::Normal, rules).0
     }
 
     // -- Basic highlighting -------------------------------------------------
@@ -1500,45 +1968,45 @@ mod tests {
     fn test_line_comment() {
         let hl = hl_types(b"let x = 1; // comment", &RUST_RULES);
         // The "// comment" part should all be Comment
-        assert_eq!(hl[11], HighlightKind::Comment);
-        assert_eq!(hl[20], HighlightKind::Comment);
+        assert_eq!(hl[11], Kind::Comment);
+        assert_eq!(hl[20], Kind::Comment);
     }
 
     #[test]
     fn test_keyword() {
         let hl = hl_types(b"fn main() {}", &RUST_RULES);
-        assert_eq!(hl[0], HighlightKind::Keyword); // 'f'
-        assert_eq!(hl[1], HighlightKind::Keyword); // 'n'
-        assert_eq!(hl[2], HighlightKind::Normal); // ' '
+        assert_eq!(hl[0], Kind::Keyword); // 'f'
+        assert_eq!(hl[1], Kind::Keyword); // 'n'
+        assert_eq!(hl[2], Kind::Normal); // ' '
     }
 
     #[test]
     fn test_type() {
         let hl = hl_types(b"let x: usize = 0;", &RUST_RULES);
         // "usize" starts at index 7
-        assert_eq!(hl[7], HighlightKind::Type);
-        assert_eq!(hl[11], HighlightKind::Type);
+        assert_eq!(hl[7], Kind::Type);
+        assert_eq!(hl[11], Kind::Type);
     }
 
     #[test]
     fn test_string() {
         let hl = hl_types(b"let s = \"hello\";", &RUST_RULES);
         // "hello" starts at index 8, ends at 14
-        assert_eq!(hl[8], HighlightKind::String); // opening "
-        assert_eq!(hl[13], HighlightKind::String); // closing "
+        assert_eq!(hl[8], Kind::String); // opening "
+        assert_eq!(hl[13], Kind::String); // closing "
     }
 
     #[test]
     fn test_number() {
         let hl = hl_types(b"let x = 42;", &RUST_RULES);
-        assert_eq!(hl[8], HighlightKind::Number); // '4'
-        assert_eq!(hl[9], HighlightKind::Number); // '2'
+        assert_eq!(hl[8], Kind::Number); // '4'
+        assert_eq!(hl[9], Kind::Number); // '2'
     }
 
     #[test]
     fn test_normal_text() {
         let hl = hl_types(b"hello", &RUST_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::Normal));
+        assert!(hl.iter().all(|&h| h == Kind::Normal));
     }
 
     // -- Block comments -----------------------------------------------------
@@ -1546,46 +2014,87 @@ mod tests {
     #[test]
     fn test_block_comment_single_line() {
         let hl = hl_types(b"x /* comment */ y", &RUST_RULES);
-        assert_eq!(hl[0], HighlightKind::Normal); // 'x'
-        assert_eq!(hl[2], HighlightKind::Comment); // '/'
-        assert_eq!(hl[13], HighlightKind::Comment); // '/'
-        assert_eq!(hl[16], HighlightKind::Normal); // 'y'
+        assert_eq!(hl[0], Kind::Normal); // 'x'
+        assert_eq!(hl[2], Kind::Comment); // '/'
+        assert_eq!(hl[13], Kind::Comment); // '/'
+        assert_eq!(hl[16], Kind::Normal); // 'y'
     }
 
     #[test]
     fn test_block_comment_multiline() {
-        let (hl1, state) = highlight_line(b"/* start", HighlightState::Normal, &RUST_RULES);
-        assert!(hl1.iter().all(|&h| h == HighlightKind::Comment));
-        assert_eq!(state, HighlightState::BlockComment);
+        let (hl1, state) = highlight_line(b"/* start", StateKind::Normal, &RUST_RULES);
+        assert!(hl1.iter().all(|&h| h == Kind::Comment));
+        assert_eq!(state, StateKind::BlockComment);
 
-        let (hl2, state2) = highlight_line(b"end */", HighlightState::BlockComment, &RUST_RULES);
-        assert!(hl2.iter().all(|&h| h == HighlightKind::Comment));
-        assert_eq!(state2, HighlightState::Normal);
+        let (hl2, state2) = highlight_line(b"end */", StateKind::BlockComment, &RUST_RULES);
+        assert!(hl2.iter().all(|&h| h == Kind::Comment));
+        assert_eq!(state2, StateKind::Normal);
+    }
+
+    #[test]
+    fn test_rust_nested_block_comments() {
+        let (hl1, state1) = highlight_line(b"/* outer /* inner", StateKind::Normal, &RUST_RULES);
+        assert!(hl1.iter().all(|&h| h == Kind::Comment));
+        assert_eq!(state1, StateKind::RustBlockComment(2));
+
+        let (hl2, state2) = highlight_line(b"still */", state1, &RUST_RULES);
+        assert!(hl2.iter().all(|&h| h == Kind::Comment));
+        assert_eq!(state2, StateKind::BlockComment);
+
+        let (hl3, state3) = highlight_line(b"end */ let", state2, &RUST_RULES);
+        assert_eq!(state3, StateKind::Normal);
+        assert_eq!(hl3[7], Kind::Keyword);
+    }
+
+    #[test]
+    fn test_rust_lifetimes_are_not_character_literals() {
+        let hl = hl_types(b"'a 'static 'x'", &RUST_RULES);
+        assert_eq!(hl[0], Kind::Type);
+        assert_eq!(hl[1], Kind::Type);
+        assert_eq!(hl[3], Kind::Type);
+        assert_eq!(hl[9], Kind::Type);
+        assert_eq!(hl[11], Kind::String);
+        assert_eq!(hl[12], Kind::String);
+        assert_eq!(hl[13], Kind::String);
+    }
+
+    #[test]
+    fn test_rust_raw_strings_and_hashes() {
+        let line = b"r#\"1.2.3 \\\" quote\"#";
+        let (hl, state) = highlight_line(line, StateKind::Normal, &RUST_RULES);
+        assert!(hl.iter().all(|&h| h == Kind::String));
+        assert_eq!(state, StateKind::Normal);
+
+        let (first, state1) = highlight_line(b"br###\"start", StateKind::Normal, &RUST_RULES);
+        assert!(first.iter().all(|&h| h == Kind::String));
+        assert_eq!(state1, StateKind::RustRawString(3));
+        let (second, state2) = highlight_line(b"1.2.3\"###", state1, &RUST_RULES);
+        assert!(second.iter().all(|&h| h == Kind::String));
+        assert_eq!(state2, StateKind::Normal);
     }
 
     // -- Multiline strings --------------------------------------------------
 
     #[test]
     fn test_python_triple_quote() {
-        let (hl1, state) =
-            highlight_line(b"s = \"\"\"hello", HighlightState::Normal, &PYTHON_RULES);
-        assert_eq!(hl1[4], HighlightKind::String);
-        assert!(matches!(state, HighlightState::MultiLineString(_)));
+        let (hl1, state) = highlight_line(b"s = \"\"\"hello", StateKind::Normal, &PYTHON_RULES);
+        assert_eq!(hl1[4], Kind::String);
+        assert!(matches!(state, StateKind::MultiLineString(_)));
 
         let (hl2, state2) = highlight_line(b"world\"\"\"", state, &PYTHON_RULES);
-        assert!(hl2.iter().all(|&h| h == HighlightKind::String));
-        assert_eq!(state2, HighlightState::Normal);
+        assert!(hl2.iter().all(|&h| h == Kind::String));
+        assert_eq!(state2, StateKind::Normal);
     }
 
     #[test]
     fn test_go_backtick_string() {
-        let (hl1, state) = highlight_line(b"s := `hello", HighlightState::Normal, &GO_RULES);
-        assert_eq!(hl1[5], HighlightKind::String);
-        assert!(matches!(state, HighlightState::MultiLineString(_)));
+        let (hl1, state) = highlight_line(b"s := `hello", StateKind::Normal, &GO_RULES);
+        assert_eq!(hl1[5], Kind::String);
+        assert!(matches!(state, StateKind::MultiLineString(_)));
 
         let (hl2, state2) = highlight_line(b"world`", state, &GO_RULES);
-        assert!(hl2.iter().all(|&h| h == HighlightKind::String));
-        assert_eq!(state2, HighlightState::Normal);
+        assert!(hl2.iter().all(|&h| h == Kind::String));
+        assert_eq!(state2, StateKind::Normal);
     }
 
     // -- Escape handling in strings -----------------------------------------
@@ -1594,7 +2103,7 @@ mod tests {
     fn test_string_escape() {
         let hl = hl_types(b"\"he\\\"llo\"", &RUST_RULES);
         // All should be String since \" is escaped
-        assert!(hl.iter().all(|&h| h == HighlightKind::String));
+        assert!(hl.iter().all(|&h| h == Kind::String));
     }
 
     // -- Keyword boundary ---------------------------------------------------
@@ -1603,7 +2112,7 @@ mod tests {
     fn test_keyword_not_in_identifier() {
         let hl = hl_types(b"format", &RUST_RULES);
         // "for" should not match inside "format"
-        assert!(hl.iter().all(|&h| h == HighlightKind::Normal));
+        assert!(hl.iter().all(|&h| h == Kind::Normal));
     }
 
     // -- Function call highlighting -----------------------------------------
@@ -1611,27 +2120,27 @@ mod tests {
     #[test]
     fn test_function_call() {
         let hl = hl_types(b"foo(x)", &RUST_RULES);
-        assert_eq!(hl[0], HighlightKind::Function); // f
-        assert_eq!(hl[1], HighlightKind::Function); // o
-        assert_eq!(hl[2], HighlightKind::Function); // o
-        assert_eq!(hl[3], HighlightKind::Bracket); // (
+        assert_eq!(hl[0], Kind::Function); // f
+        assert_eq!(hl[1], Kind::Function); // o
+        assert_eq!(hl[2], Kind::Function); // o
+        assert_eq!(hl[3], Kind::Bracket); // (
     }
 
     #[test]
     fn test_method_call() {
         let hl = hl_types(b"x.method(y)", &RUST_RULES);
-        assert_eq!(hl[0], HighlightKind::Normal); // x
-        assert_eq!(hl[2], HighlightKind::Function); // m
-        assert_eq!(hl[7], HighlightKind::Function); // d
-        assert_eq!(hl[8], HighlightKind::Bracket); // (
+        assert_eq!(hl[0], Kind::Normal); // x
+        assert_eq!(hl[2], Kind::Function); // m
+        assert_eq!(hl[7], Kind::Function); // d
+        assert_eq!(hl[8], Kind::Bracket); // (
     }
 
     #[test]
     fn test_keyword_not_function() {
         // "if(" should still be keyword, not function
         let hl = hl_types(b"if(x)", &RUST_RULES);
-        assert_eq!(hl[0], HighlightKind::Keyword); // i
-        assert_eq!(hl[1], HighlightKind::Keyword); // f
+        assert_eq!(hl[0], Kind::Keyword); // i
+        assert_eq!(hl[1], Kind::Keyword); // f
     }
 
     // -- Constant highlighting ----------------------------------------------
@@ -1639,21 +2148,21 @@ mod tests {
     #[test]
     fn test_upper_snake_constant() {
         let hl = hl_types(b"let x = MAX_SIZE;", &RUST_RULES);
-        assert_eq!(hl[8], HighlightKind::Constant); // M
-        assert_eq!(hl[15], HighlightKind::Constant); // E
+        assert_eq!(hl[8], Kind::Constant); // M
+        assert_eq!(hl[15], Kind::Constant); // E
     }
 
     #[test]
     fn test_single_upper_char_not_constant() {
         // Single uppercase letter shouldn't be constant (need >=2 chars)
         let hl = hl_types(b"let X = 1;", &RUST_RULES);
-        assert_eq!(hl[4], HighlightKind::Normal); // X
+        assert_eq!(hl[4], Kind::Normal); // X
     }
 
     #[test]
     fn test_mixed_case_not_constant() {
         let hl = hl_types(b"let MyVar = 1;", &RUST_RULES);
-        assert_eq!(hl[4], HighlightKind::Normal); // M
+        assert_eq!(hl[4], Kind::Normal); // M
     }
 
     // -- Macro highlighting -------------------------------------------------
@@ -1661,44 +2170,44 @@ mod tests {
     #[test]
     fn test_rust_bang_macro() {
         let hl = hl_types(b"println!(\"hi\")", &RUST_RULES);
-        assert_eq!(hl[0], HighlightKind::Macro); // p
-        assert_eq!(hl[6], HighlightKind::Macro); // n
-        assert_eq!(hl[7], HighlightKind::Macro); // !
-        assert_eq!(hl[8], HighlightKind::Bracket); // (
+        assert_eq!(hl[0], Kind::Macro); // p
+        assert_eq!(hl[6], Kind::Macro); // n
+        assert_eq!(hl[7], Kind::Macro); // !
+        assert_eq!(hl[8], Kind::Bracket); // (
     }
 
     #[test]
     fn test_bang_not_macro_in_python() {
         // Python doesn't have bang macros, so foo! is not a macro
         let hl = hl_types(b"foo!(x)", &PYTHON_RULES);
-        assert_eq!(hl[0], HighlightKind::Normal); // f
-        assert_eq!(hl[2], HighlightKind::Normal); // o
+        assert_eq!(hl[0], Kind::Normal); // f
+        assert_eq!(hl[2], Kind::Normal); // o
     }
 
     #[test]
     fn test_not_equal_not_macro() {
         // foo != bar — the != should not be treated as a macro invocation
         let hl = hl_types(b"foo != bar", &RUST_RULES);
-        assert_eq!(hl[0], HighlightKind::Normal); // f
-        assert_eq!(hl[4], HighlightKind::Operator); // !
+        assert_eq!(hl[0], Kind::Normal); // f
+        assert_eq!(hl[4], Kind::Operator); // !
     }
 
-    // -- byte_hl_to_char_hl -------------------------------------------------
+    // -- byte_kinds_to_char_kinds -------------------------------------------------
 
     #[test]
     fn test_byte_to_char_ascii() {
         let raw = b"hello";
-        let byte_hl = vec![HighlightKind::Keyword; 5];
-        let char_hl = byte_hl_to_char_hl(raw, &byte_hl);
+        let byte_kinds = vec![Kind::Keyword; 5];
+        let char_hl = byte_kinds_to_char_kinds(raw, &byte_kinds);
         assert_eq!(char_hl.len(), 5);
-        assert!(char_hl.iter().all(|&h| h == HighlightKind::Keyword));
+        assert!(char_hl.iter().all(|&h| h == Kind::Keyword));
     }
 
     #[test]
     fn test_byte_to_char_tab() {
         let raw = b"\thello";
-        let byte_hl = vec![HighlightKind::Normal; 6];
-        let char_hl = byte_hl_to_char_hl(raw, &byte_hl);
+        let byte_kinds = vec![Kind::Normal; 6];
+        let char_hl = byte_kinds_to_char_kinds(raw, &byte_kinds);
         // Tab expands to 2 entries
         assert_eq!(char_hl.len(), 7);
     }
@@ -1706,41 +2215,44 @@ mod tests {
     #[test]
     fn test_byte_to_char_utf8() {
         let raw = "héllo".as_bytes(); // é is 2 bytes
-        let byte_hl = vec![HighlightKind::Normal; raw.len()];
-        let char_hl = byte_hl_to_char_hl(raw, &byte_hl);
+        let byte_kinds = vec![Kind::Normal; raw.len()];
+        let char_hl = byte_kinds_to_char_kinds(raw, &byte_kinds);
         // 5 chars: h, é, l, l, o
         assert_eq!(char_hl.len(), 5);
     }
 
-    // -- rules_for_language -------------------------------------------------
+    // -- Language lookup -----------------------------------------------------
 
     #[test]
-    fn test_rules_for_known_languages() {
-        assert!(rules_for_language("Rust").is_some());
-        assert!(rules_for_language("Python").is_some());
-        assert!(rules_for_language("Go").is_some());
-        assert!(rules_for_language("TypeScript").is_some());
-        assert!(rules_for_language("JavaScript").is_some());
-        assert!(rules_for_language("Shell").is_some());
-        assert!(rules_for_language("C").is_some());
-        assert!(rules_for_language("TOML").is_some());
-        assert!(rules_for_language("JSON").is_some());
-        assert!(rules_for_language("YAML").is_some());
-        assert!(rules_for_language("Makefile").is_some());
-        assert!(rules_for_language("HTML").is_some());
-        assert!(rules_for_language("CSS").is_some());
-        assert!(rules_for_language("Dockerfile").is_some());
-        assert!(rules_for_language("Config").is_some());
+    fn test_language_rules_cover_builtins() {
+        let languages = [
+            Language::Rust,
+            Language::Python,
+            Language::Go,
+            Language::TypeScript,
+            Language::JavaScript,
+            Language::Bash,
+            Language::C,
+            Language::Toml,
+            Language::Json,
+            Language::Yaml,
+            Language::Makefile,
+            Language::Html,
+            Language::Css,
+            Language::Dockerfile,
+            Language::Ini,
+            Language::Markdown,
+            Language::Xsh,
+        ];
+        for language in languages {
+            assert_eq!(Language::from_name(language.name()), Some(language));
+            let _ = language.rules();
+        }
     }
 
     #[test]
-    fn test_rules_for_unknown() {
-        assert!(rules_for_language("Unknown").is_none());
-    }
-
-    #[test]
-    fn test_rules_for_markdown() {
-        assert!(rules_for_language("Markdown").is_some());
+    fn test_language_unknown() {
+        assert!(Language::from_name("Unknown").is_none());
     }
 
     // -- INI/Config ---------------------------------------------------------
@@ -1749,77 +2261,77 @@ mod tests {
     fn test_ini_config() {
         // Section header
         let hl = hl_types(b"[section]", &INI_RULES);
-        assert_eq!(hl[0], HighlightKind::Keyword); // [
-        assert_eq!(hl[4], HighlightKind::Keyword); // i
-        assert_eq!(hl[8], HighlightKind::Keyword); // ]
+        assert_eq!(hl[0], Kind::Keyword); // [
+        assert_eq!(hl[4], Kind::Keyword); // i
+        assert_eq!(hl[8], Kind::Keyword); // ]
 
         // Key = value
         let hl = hl_types(b"key = value", &INI_RULES);
-        assert_eq!(hl[0], HighlightKind::Keyword); // k
-        assert_eq!(hl[2], HighlightKind::Keyword); // y
-        assert_eq!(hl[4], HighlightKind::Normal); // =
-        assert_eq!(hl[6], HighlightKind::Normal); // v (unquoted string)
+        assert_eq!(hl[0], Kind::Keyword); // k
+        assert_eq!(hl[2], Kind::Keyword); // y
+        assert_eq!(hl[4], Kind::Normal); // =
+        assert_eq!(hl[6], Kind::Normal); // v (unquoted string)
 
         // Quoted string value
         let hl = hl_types(b"name = \"hello\"", &INI_RULES);
-        assert_eq!(hl[0], HighlightKind::Keyword); // n
-        assert_eq!(hl[7], HighlightKind::String); // "
-        assert_eq!(hl[12], HighlightKind::String); // o
-        assert_eq!(hl[13], HighlightKind::String); // "
+        assert_eq!(hl[0], Kind::Keyword); // n
+        assert_eq!(hl[7], Kind::String); // "
+        assert_eq!(hl[12], Kind::String); // o
+        assert_eq!(hl[13], Kind::String); // "
 
         // Single-quoted string value
         let hl = hl_types(b"name = 'hello'", &INI_RULES);
-        assert_eq!(hl[7], HighlightKind::String);
-        assert_eq!(hl[13], HighlightKind::String);
+        assert_eq!(hl[7], Kind::String);
+        assert_eq!(hl[13], Kind::String);
 
         // Semicolon comment
         let hl = hl_types(b"; this is a comment", &INI_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::Comment));
+        assert!(hl.iter().all(|&h| h == Kind::Comment));
 
         // Hash comment
         let hl = hl_types(b"# this is a comment", &INI_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::Comment));
+        assert!(hl.iter().all(|&h| h == Kind::Comment));
 
         // Indented comment
         let hl = hl_types(b"  ; indented comment", &INI_RULES);
-        assert_eq!(hl[0], HighlightKind::Normal);
-        assert_eq!(hl[2], HighlightKind::Comment);
-        assert_eq!(hl[19], HighlightKind::Comment);
+        assert_eq!(hl[0], Kind::Normal);
+        assert_eq!(hl[2], Kind::Comment);
+        assert_eq!(hl[19], Kind::Comment);
 
         // Number value
         let hl = hl_types(b"port = 8080", &INI_RULES);
-        assert_eq!(hl[0], HighlightKind::Keyword); // p
-        assert_eq!(hl[7], HighlightKind::Number); // 8
-        assert_eq!(hl[10], HighlightKind::Number); // 0
+        assert_eq!(hl[0], Kind::Keyword); // p
+        assert_eq!(hl[7], Kind::Number); // 8
+        assert_eq!(hl[10], Kind::Number); // 0
 
         // Boolean type
         let hl = hl_types(b"enabled = true", &INI_RULES);
-        assert_eq!(hl[0], HighlightKind::Keyword);
-        assert_eq!(hl[10], HighlightKind::Type); // t
-        assert_eq!(hl[13], HighlightKind::Type); // e
+        assert_eq!(hl[0], Kind::Keyword);
+        assert_eq!(hl[10], Kind::Type); // t
+        assert_eq!(hl[13], Kind::Type); // e
 
         // Case-insensitive boolean
         let hl = hl_types(b"flag = TRUE", &INI_RULES);
-        assert_eq!(hl[7], HighlightKind::Type);
+        assert_eq!(hl[7], Kind::Type);
 
         let hl = hl_types(b"flag = Yes", &INI_RULES);
-        assert_eq!(hl[7], HighlightKind::Type);
+        assert_eq!(hl[7], Kind::Type);
 
         let hl = hl_types(b"debug = off", &INI_RULES);
-        assert_eq!(hl[8], HighlightKind::Type);
+        assert_eq!(hl[8], Kind::Type);
 
         // Inline comment after value
         let hl = hl_types(b"key = value ; comment", &INI_RULES);
-        assert_eq!(hl[0], HighlightKind::Keyword);
-        assert_eq!(hl[6], HighlightKind::Normal); // v
-        assert_eq!(hl[12], HighlightKind::Comment); // ;
-        assert_eq!(hl[20], HighlightKind::Comment);
+        assert_eq!(hl[0], Kind::Keyword);
+        assert_eq!(hl[6], Kind::Normal); // v
+        assert_eq!(hl[12], Kind::Comment); // ;
+        assert_eq!(hl[20], Kind::Comment);
 
         // Section header with inline comment
         let hl = hl_types(b"[section] ; comment", &INI_RULES);
-        assert_eq!(hl[0], HighlightKind::Keyword);
-        assert_eq!(hl[8], HighlightKind::Keyword);
-        assert_eq!(hl[10], HighlightKind::Comment);
+        assert_eq!(hl[0], Kind::Keyword);
+        assert_eq!(hl[8], Kind::Keyword);
+        assert_eq!(hl[10], Kind::Comment);
     }
 
     // -- Python specifics ---------------------------------------------------
@@ -1827,43 +2339,43 @@ mod tests {
     #[test]
     fn test_python_hash_comment() {
         let hl = hl_types(b"x = 1 # comment", &PYTHON_RULES);
-        assert_eq!(hl[6], HighlightKind::Comment);
+        assert_eq!(hl[6], Kind::Comment);
     }
 
     // -- Empty line ---------------------------------------------------------
 
     #[test]
     fn test_empty_line() {
-        let (hl, state) = highlight_line(b"", HighlightState::Normal, &RUST_RULES);
+        let (hl, state) = highlight_line(b"", StateKind::Normal, &RUST_RULES);
         assert!(hl.is_empty());
-        assert_eq!(state, HighlightState::Normal);
+        assert_eq!(state, StateKind::Normal);
     }
 
     #[test]
     fn test_empty_line_in_block_comment() {
-        let (hl, state) = highlight_line(b"", HighlightState::BlockComment, &RUST_RULES);
+        let (hl, state) = highlight_line(b"", StateKind::BlockComment, &RUST_RULES);
         assert!(hl.is_empty());
-        assert_eq!(state, HighlightState::BlockComment);
+        assert_eq!(state, StateKind::BlockComment);
     }
 
     // -- HTML block comments ------------------------------------------------
 
     #[test]
     fn test_html_comment() {
-        let (hl, state) = highlight_line(b"<!-- comment -->", HighlightState::Normal, &HTML_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::Comment));
-        assert_eq!(state, HighlightState::Normal);
+        let (hl, state) = highlight_line(b"<!-- comment -->", StateKind::Normal, &HTML_RULES);
+        assert!(hl.iter().all(|&h| h == Kind::Comment));
+        assert_eq!(state, StateKind::Normal);
     }
 
     #[test]
     fn test_html_multiline_comment() {
-        let (hl1, state1) = highlight_line(b"<!-- start", HighlightState::Normal, &HTML_RULES);
-        assert!(hl1.iter().all(|&h| h == HighlightKind::Comment));
-        assert_eq!(state1, HighlightState::BlockComment);
+        let (hl1, state1) = highlight_line(b"<!-- start", StateKind::Normal, &HTML_RULES);
+        assert!(hl1.iter().all(|&h| h == Kind::Comment));
+        assert_eq!(state1, StateKind::BlockComment);
 
-        let (hl2, state2) = highlight_line(b"end -->", HighlightState::BlockComment, &HTML_RULES);
-        assert!(hl2.iter().all(|&h| h == HighlightKind::Comment));
-        assert_eq!(state2, HighlightState::Normal);
+        let (hl2, state2) = highlight_line(b"end -->", StateKind::BlockComment, &HTML_RULES);
+        assert!(hl2.iter().all(|&h| h == Kind::Comment));
+        assert_eq!(state2, StateKind::Normal);
     }
 
     // -- Dockerfile keywords ------------------------------------------------
@@ -1871,8 +2383,8 @@ mod tests {
     #[test]
     fn test_dockerfile_keywords() {
         let hl = hl_types(b"FROM ubuntu:latest", &DOCKERFILE_RULES);
-        assert_eq!(hl[0], HighlightKind::Keyword); // F
-        assert_eq!(hl[3], HighlightKind::Keyword); // M
+        assert_eq!(hl[0], Kind::Keyword); // F
+        assert_eq!(hl[3], Kind::Keyword); // M
     }
 
     // -- JSON ---------------------------------------------------------------
@@ -1880,8 +2392,8 @@ mod tests {
     #[test]
     fn test_json_no_comments() {
         let hl = hl_types(b"{\"key\": true}", &JSON_RULES);
-        assert_eq!(hl[1], HighlightKind::Keyword); // key is yellow
-        assert_eq!(hl[8], HighlightKind::Type); // 't' of true
+        assert_eq!(hl[1], Kind::Keyword); // key is yellow
+        assert_eq!(hl[8], Kind::Type); // 't' of true
     }
 
     // -- Number edge cases --------------------------------------------------
@@ -1889,24 +2401,56 @@ mod tests {
     #[test]
     fn test_hex_number() {
         let hl = hl_types(b"let x = 0xff;", &RUST_RULES);
-        assert_eq!(hl[8], HighlightKind::Number); // '0'
-        assert_eq!(hl[9], HighlightKind::Number); // 'x'
-        assert_eq!(hl[11], HighlightKind::Number); // 'f'
+        assert_eq!(hl[8], Kind::Number); // '0'
+        assert_eq!(hl[9], Kind::Number); // 'x'
+        assert_eq!(hl[11], Kind::Number); // 'f'
     }
 
     #[test]
     fn test_float_number() {
         let hl = hl_types(b"let x = 3.14;", &RUST_RULES);
-        assert_eq!(hl[8], HighlightKind::Number); // '3'
-        assert_eq!(hl[9], HighlightKind::Number); // '.'
-        assert_eq!(hl[10], HighlightKind::Number); // '1'
+        assert_eq!(hl[8], Kind::Number); // '3'
+        assert_eq!(hl[9], Kind::Number); // '.'
+        assert_eq!(hl[10], Kind::Number); // '1'
+    }
+
+    #[test]
+    fn test_number_does_not_swallow_identifier() {
+        let hl = hl_types(b"123foobar", &RUST_RULES);
+        assert!(hl[..3].iter().all(|&h| h == Kind::Number));
+        assert!(hl[3..].iter().all(|&h| h == Kind::Normal));
+
+        let hl = hl_types(b"1..2", &RUST_RULES);
+        assert_eq!(hl[0], Kind::Number);
+        assert_eq!(hl[1], Kind::Normal);
+        assert_eq!(hl[2], Kind::Normal);
+        assert_eq!(hl[3], Kind::Number);
+    }
+
+    #[test]
+    fn test_number_radices_exponents_separators_and_suffixes() {
+        for line in [
+            b"0xFF_u32".as_slice(),
+            b"0b1010u8".as_slice(),
+            b"0o755usize".as_slice(),
+            b"1_000_000".as_slice(),
+            b"1.5e-2f64".as_slice(),
+            b"100ms".as_slice(),
+        ] {
+            let hl = hl_types(line, &RUST_RULES);
+            assert!(hl.iter().all(|&h| h == Kind::Number), "{line:?}");
+        }
+
+        let malformed = hl_types(b"0xZZ", &RUST_RULES);
+        assert_eq!(malformed[0], Kind::Number);
+        assert!(malformed[1..].iter().all(|&h| h == Kind::Normal));
     }
 
     // -- Semver highlighting ------------------------------------------------
 
     /// Helper: highlight multiple lines and return all per-byte highlights.
-    fn hl_multiline(lines: &[&[u8]], rules: &SyntaxRules) -> Vec<Vec<HighlightKind>> {
-        let mut state = HighlightState::Normal;
+    fn hl_multiline(lines: &[&[u8]], rules: &RuleSet) -> Vec<Vec<Kind>> {
+        let mut state = StateKind::Normal;
         let mut result = Vec::new();
         for line in lines {
             let (hl, next) = highlight_line(line, state, rules);
@@ -1916,13 +2460,8 @@ mod tests {
         result
     }
 
-    /// Helper: assert a byte range is a specific HighlightKind.
-    fn assert_range(
-        hl: &[HighlightKind],
-        range: std::ops::Range<usize>,
-        expected: HighlightKind,
-        label: &str,
-    ) {
+    /// Helper: assert a byte range is a specific Kind.
+    fn assert_range(hl: &[Kind], range: std::ops::Range<usize>, expected: Kind, label: &str) {
         for i in range {
             assert_eq!(
                 hl[i], expected,
@@ -1948,21 +2487,16 @@ mod tests {
         ];
         let hls = hl_multiline(lines, &TOML_RULES);
         // line 2: version = "0.3.5" — 0.3.5 at bytes 11..16
-        assert_range(&hls[2], 11..16, HighlightKind::Type, "version value");
+        assert_range(&hls[2], 11..16, Kind::Type, "version value");
         // line 6: serde = "1.0.197" — 1.0.197 at bytes 9..16
-        assert_range(&hls[6], 9..16, HighlightKind::Type, "serde version");
+        assert_range(&hls[6], 9..16, Kind::Type, "serde version");
         // line 7: "1.36.0" — 1.36.0 inside the string
         let l7 = &hls[7];
         let s = b"tokio = { version = \"1.36.0\", features = [\"full\"] }";
         let ver_start = s.windows(5).position(|w| w == b"1.36.").unwrap();
-        assert_range(
-            l7,
-            ver_start..ver_start + 6,
-            HighlightKind::Type,
-            "tokio version",
-        );
+        assert_range(l7, ver_start..ver_start + 6, Kind::Type, "tokio version");
         // line 3: "2021" is NOT semver (only one component)
-        assert_ne!(hls[3][11], HighlightKind::Type);
+        assert_ne!(hls[3][11], Kind::Type);
     }
 
     #[test]
@@ -1976,7 +2510,7 @@ mod tests {
         ];
         let hls = hl_multiline(lines, &RUST_RULES);
         // line 0: comment — semver should NOT override comment
-        assert_range(&hls[0], 0..25, HighlightKind::Comment, "comment line");
+        assert_range(&hls[0], 0..25, Kind::Comment, "comment line");
         // line 1: "1.0.0+build.42" inside string — semver SHOULD override
         let l1 = &hls[1];
         // const VERSION: &str = "1.0.0+build.42"; — version at byte 23
@@ -1984,26 +2518,53 @@ mod tests {
         assert_range(
             l1,
             ver_start..ver_start + 14,
-            HighlightKind::Type,
+            Kind::Type,
             "version in string",
         );
         // line 2: "v = 1" — bare v is not semver
-        assert_ne!(hls[2][4], HighlightKind::Type);
+        assert_ne!(hls[2][4], Kind::Type);
         // line 3: "abc1.2.3" — preceded by alpha, not semver
-        assert_ne!(hls[3][12], HighlightKind::Type);
+        assert_ne!(hls[3][12], Kind::Type);
         // line 4: "v0.9.0" in string should be semver, "1.2.3x" should not
         let l4 = &hls[4];
         let s4 = b"println!(\"upgrade to v0.9.0 or 1.2.3x\");";
         let v_start = s4.windows(6).position(|w| w == b"v0.9.0").unwrap();
-        assert_range(
-            l4,
-            v_start..v_start + 6,
-            HighlightKind::Type,
-            "v0.9.0 in string",
-        );
+        assert_range(l4, v_start..v_start + 6, Kind::Type, "v0.9.0 in string");
         // 1.2.3x should not be Type (trailing x)
         let bad_start = s4.windows(5).position(|w| w == b"1.2.3").unwrap();
-        assert_ne!(l4[bad_start], HighlightKind::Type);
+        assert_ne!(l4[bad_start], Kind::Type);
+    }
+
+    #[test]
+    fn test_semver_raw_string_detection_respects_string_boundaries() {
+        let line = b"\"r\\\"x\\\"\"; r\"1.2.3\"; 4.5.6";
+        let hl = hl_types(line, &RUST_RULES);
+
+        let ordinary = line
+            .windows(4)
+            .position(|window| window == b"r\\\"x")
+            .unwrap();
+        assert!(
+            hl[ordinary..ordinary + 4]
+                .iter()
+                .all(|&kind| kind == Kind::String)
+        );
+
+        let raw = line
+            .windows(5)
+            .position(|window| window == b"1.2.3")
+            .unwrap();
+        assert!(hl[raw..raw + 5].iter().all(|&kind| kind == Kind::String));
+
+        let trailing = line
+            .windows(5)
+            .position(|window| window == b"4.5.6")
+            .unwrap();
+        assert!(
+            hl[trailing..trailing + 5]
+                .iter()
+                .all(|&kind| kind == Kind::Type)
+        );
     }
 
     // -- Bracket highlighting -----------------------------------------------
@@ -2022,9 +2583,9 @@ mod tests {
         ];
         let hls = hl_multiline(lines, &RUST_RULES);
         // line 0: ( at 10, ) at 26, { at 28
-        assert_eq!(hls[0][10], HighlightKind::Bracket); // (
-        assert_eq!(hls[0][26], HighlightKind::Bracket); // )
-        assert_eq!(hls[0][28], HighlightKind::Bracket); // { at end
+        assert_eq!(hls[0][10], Kind::Bracket); // (
+        assert_eq!(hls[0][26], Kind::Bracket); // )
+        assert_eq!(hls[0][28], Kind::Bracket); // { at end
         // line 1: ( and ) inside string should be String, not Bracket
         let l1 = &hls[1];
         // The string starts at the " and everything inside is String
@@ -2032,13 +2593,13 @@ mod tests {
             .iter()
             .position(|&b| b == b'(')
             .unwrap();
-        assert_eq!(l1[paren_pos], HighlightKind::String);
+        assert_eq!(l1[paren_pos], Kind::String);
         // line 2: { inside comment should be Comment (after leading whitespace)
         let comment_start = b"    ".len();
         assert_range(
             &hls[2],
             comment_start..hls[2].len(),
-            HighlightKind::Comment,
+            Kind::Comment,
             "comment with brackets",
         );
         // line 3: [ at some position, { at end
@@ -2047,9 +2608,9 @@ mod tests {
             .iter()
             .position(|&b| b == b'[')
             .unwrap();
-        assert_eq!(l3[bracket_pos], HighlightKind::Bracket);
+        assert_eq!(l3[bracket_pos], Kind::Bracket);
         // line 6: } is bracket
-        assert_eq!(hls[6][0], HighlightKind::Bracket);
+        assert_eq!(hls[6][0], Kind::Bracket);
     }
 
     // -- Markdown highlighting ----------------------------------------------
@@ -2079,74 +2640,52 @@ mod tests {
 
         // line 0: header — all Keyword
         assert!(
-            hls[0].iter().all(|&h| h == HighlightKind::Keyword),
+            hls[0].iter().all(|&h| h == Kind::Keyword),
             "header should be all Keyword"
         );
 
         // line 2: **bold** → Keyword, *italic* → Type, rest Normal
         let l2 = &hls[2];
         let bold_start = b"Some text with ".len();
-        assert_range(
-            l2,
-            bold_start..bold_start + 8,
-            HighlightKind::Keyword,
-            "bold",
-        );
+        assert_range(l2, bold_start..bold_start + 8, Kind::Keyword, "bold");
         let italic_start = bold_start + 8 + " and ".len();
-        assert_range(
-            l2,
-            italic_start..italic_start + 8,
-            HighlightKind::Type,
-            "italic",
-        );
+        assert_range(l2, italic_start..italic_start + 8, Kind::Type, "italic");
 
         // line 4: > marker is Comment, `inline code` is String
-        assert_eq!(hls[4][0], HighlightKind::Comment); // >
+        assert_eq!(hls[4][0], Kind::Comment); // >
         let backtick = b"> A blockquote with ".len();
         assert_range(
             &hls[4],
             backtick..backtick + 13,
-            HighlightKind::String,
+            Kind::String,
             "inline code",
         );
 
         // line 6-7: list markers — "- " is Number
-        assert_eq!(hls[6][0], HighlightKind::Number); // -
-        assert_eq!(hls[6][1], HighlightKind::Number); // space
-        assert_eq!(hls[6][2], HighlightKind::Normal); // f
-        assert_eq!(hls[7][0], HighlightKind::Number); // -
+        assert_eq!(hls[6][0], Kind::Number); // -
+        assert_eq!(hls[6][1], Kind::Number); // space
+        assert_eq!(hls[6][2], Kind::Normal); // f
+        assert_eq!(hls[7][0], Kind::Number); // -
 
         // line 8: ordered list — "1. " is Number
-        assert_range(&hls[8], 0..3, HighlightKind::Number, "ordered marker");
-        assert_eq!(hls[8][3], HighlightKind::Normal);
+        assert_range(&hls[8], 0..3, Kind::Number, "ordered marker");
+        assert_eq!(hls[8][3], Kind::Normal);
 
         // line 10: horizontal rule — all Comment
         assert!(
-            hls[10].iter().all(|&h| h == HighlightKind::Comment),
+            hls[10].iter().all(|&h| h == Kind::Comment),
             "hr should be Comment"
         );
 
         // line 12: fenced code open — all String, state enters FencedCodeBlock
-        assert!(
-            hls[12].iter().all(|&h| h == HighlightKind::String),
-            "fence open"
-        );
+        assert!(hls[12].iter().all(|&h| h == Kind::String), "fence open");
         // line 13: inside fenced block — all String
-        assert!(
-            hls[13].iter().all(|&h| h == HighlightKind::String),
-            "fenced content"
-        );
+        assert!(hls[13].iter().all(|&h| h == Kind::String), "fenced content");
         // line 14: fence close — all String
-        assert!(
-            hls[14].iter().all(|&h| h == HighlightKind::String),
-            "fence close"
-        );
+        assert!(hls[14].iter().all(|&h| h == Kind::String), "fence close");
 
         // line 16: HTML comment — all Comment
-        assert!(
-            hls[16].iter().all(|&h| h == HighlightKind::Comment),
-            "html comment"
-        );
+        assert!(hls[16].iter().all(|&h| h == Kind::Comment), "html comment");
     }
 
     #[test]
@@ -2158,18 +2697,12 @@ mod tests {
             b"end --> after",
         ];
         let hls = hl_multiline(lines, &MARKDOWN_RULES);
-        assert!(hls[0].iter().all(|&h| h == HighlightKind::Normal), "before");
-        assert!(
-            hls[1].iter().all(|&h| h == HighlightKind::Comment),
-            "comment start"
-        );
-        assert!(
-            hls[2].iter().all(|&h| h == HighlightKind::Comment),
-            "comment middle"
-        );
+        assert!(hls[0].iter().all(|&h| h == Kind::Normal), "before");
+        assert!(hls[1].iter().all(|&h| h == Kind::Comment), "comment start");
+        assert!(hls[2].iter().all(|&h| h == Kind::Comment), "comment middle");
         // line 3: "end -->" is comment, " after" is normal
         let close_end = b"end -->".len();
-        assert_range(&hls[3], 0..close_end, HighlightKind::Comment, "comment end");
+        assert_range(&hls[3], 0..close_end, Kind::Comment, "comment end");
     }
 
     // -- JSON document ------------------------------------------------------
@@ -2193,60 +2726,45 @@ mod tests {
         let hls = hl_multiline(lines, &JSON_RULES);
 
         // line 0: { is Bracket
-        assert_eq!(hls[0][0], HighlightKind::Bracket);
+        assert_eq!(hls[0][0], Kind::Bracket);
         // line 1: "name" is Keyword (key), "my-app" is String (value)
-        assert_range(&hls[1], 2..8, HighlightKind::Keyword, "name key");
-        assert_range(&hls[1], 10..18, HighlightKind::String, "my-app value");
+        assert_range(&hls[1], 2..8, Kind::Keyword, "name key");
+        assert_range(&hls[1], 10..18, Kind::String, "my-app value");
         // line 2: "version" is Keyword, "2.1.0" gets semver override
-        assert_range(&hls[2], 2..11, HighlightKind::Keyword, "version key");
+        assert_range(&hls[2], 2..11, Kind::Keyword, "version key");
         let ver_start = b"  \"version\": \"".len();
         assert_range(
             &hls[2],
             ver_start..ver_start + 5,
-            HighlightKind::Type,
+            Kind::Type,
             "semver 2.1.0",
         );
         // line 3: true is Type
         let true_start = b"  \"private\": ".len();
-        assert_range(
-            &hls[3],
-            true_start..true_start + 4,
-            HighlightKind::Type,
-            "true",
-        );
+        assert_range(&hls[3], true_start..true_start + 4, Kind::Type, "true");
         // line 4: "dependencies" key, { bracket
-        assert_eq!(hls[4][2], HighlightKind::Keyword); // "
+        assert_eq!(hls[4][2], Kind::Keyword); // "
         let brace = hls[4].len() - 1;
-        assert_eq!(hls[4][brace], HighlightKind::Bracket);
+        assert_eq!(hls[4][brace], Kind::Bracket);
         // line 5: nested key "react", semver value "18.2.0"
-        assert_eq!(hls[5][4], HighlightKind::Keyword);
+        assert_eq!(hls[5][4], Kind::Keyword);
         let react_ver = b"    \"react\": \"".len();
         assert_range(
             &hls[5],
             react_ver..react_ver + 6,
-            HighlightKind::Type,
+            Kind::Type,
             "react semver",
         );
         // line 8: 42 is Number
         let num_start = b"  \"count\": ".len();
-        assert_range(
-            &hls[8],
-            num_start..num_start + 2,
-            HighlightKind::Number,
-            "42",
-        );
+        assert_range(&hls[8], num_start..num_start + 2, Kind::Number, "42");
         // line 9: [ and ] are brackets, string values
-        assert_eq!(hls[9][b"  \"tags\": ".len()], HighlightKind::Bracket); // [
+        assert_eq!(hls[9][b"  \"tags\": ".len()], Kind::Bracket); // [
         // line 10: null is Type
         let null_start = b"  \"nullable\": ".len();
-        assert_range(
-            &hls[10],
-            null_start..null_start + 4,
-            HighlightKind::Type,
-            "null",
-        );
+        assert_range(&hls[10], null_start..null_start + 4, Kind::Type, "null");
         // line 11: } is Bracket
-        assert_eq!(hls[11][0], HighlightKind::Bracket);
+        assert_eq!(hls[11][0], Kind::Bracket);
     }
 
     // -- YAML document ------------------------------------------------------
@@ -2274,38 +2792,38 @@ mod tests {
         let hls = hl_multiline(lines, &YAML_RULES);
 
         // line 0: "name" is Keyword, "my-service" is Normal (unquoted)
-        assert_range(&hls[0], 0..4, HighlightKind::Keyword, "name key");
-        assert_eq!(hls[0][6], HighlightKind::Normal);
+        assert_range(&hls[0], 0..4, Kind::Keyword, "name key");
+        assert_eq!(hls[0][6], Kind::Normal);
         // line 1: "version" Keyword, "1.5.0" semver
-        assert_range(&hls[1], 0..7, HighlightKind::Keyword, "version key");
-        assert_range(&hls[1], 9..14, HighlightKind::Type, "semver 1.5.0");
+        assert_range(&hls[1], 0..7, Kind::Keyword, "version key");
+        assert_range(&hls[1], 9..14, Kind::Type, "semver 1.5.0");
         // line 2: "false" is Type
-        assert_range(&hls[2], 7..12, HighlightKind::Type, "false");
+        assert_range(&hls[2], 7..12, Kind::Type, "false");
         // line 3: 8080 is Number
-        assert_range(&hls[3], 6..10, HighlightKind::Number, "8080");
+        assert_range(&hls[3], 6..10, Kind::Number, "8080");
         // line 4: "localhost" is String (quoted)
-        assert_range(&hls[4], 6..17, HighlightKind::String, "quoted value");
+        assert_range(&hls[4], 6..17, Kind::String, "quoted value");
         // line 5: "database" is Keyword, no value
-        assert_range(&hls[5], 0..8, HighlightKind::Keyword, "database key");
+        assert_range(&hls[5], 0..8, Kind::Keyword, "database key");
         // line 6: nested key "url", quoted string value
-        assert_range(&hls[6], 2..5, HighlightKind::Keyword, "url key");
-        assert_eq!(hls[6][7], HighlightKind::String);
+        assert_range(&hls[6], 2..5, Kind::Keyword, "url key");
+        assert_eq!(hls[6][7], Kind::String);
         // line 7: "pool_size" key, 10 number
-        assert_range(&hls[7], 2..11, HighlightKind::Keyword, "pool_size key");
-        assert_range(&hls[7], 13..15, HighlightKind::Number, "10");
+        assert_range(&hls[7], 2..11, Kind::Keyword, "pool_size key");
+        assert_range(&hls[7], 13..15, Kind::Number, "10");
         // line 8: "defaults" key, &defaults anchor
-        assert_range(&hls[8], 0..8, HighlightKind::Keyword, "defaults key");
+        assert_range(&hls[8], 0..8, Kind::Keyword, "defaults key");
         // line 11: *defaults alias
         let l11 = &hls[11];
         let alias_start = b"  <<: ".len();
-        assert_eq!(l11[alias_start], HighlightKind::Type); // *
+        assert_eq!(l11[alias_start], Kind::Type); // *
         // line 13: key then # comment
-        assert_range(&hls[13], 0..4, HighlightKind::Keyword, "tags key");
+        assert_range(&hls[13], 0..4, Kind::Keyword, "tags key");
         let comment_start = b"tags: ".len();
         assert_range(
             &hls[13],
             comment_start..hls[13].len(),
-            HighlightKind::Comment,
+            Kind::Comment,
             "inline comment",
         );
     }
@@ -2554,14 +3072,14 @@ mod tests {
     #[test]
     fn test_ini_empty_value() {
         let hl = hl_types(b"key =", &INI_RULES);
-        assert_range(&hl, 0..3, HighlightKind::Keyword, "ini key");
+        assert_range(&hl, 0..3, Kind::Keyword, "ini key");
     }
 
     #[test]
     fn test_ini_no_equals() {
         let hl = hl_types(b"just text", &INI_RULES);
         // Without = sign, this isn't a key=value pair
-        assert!(hl.iter().all(|&h| h != HighlightKind::Keyword));
+        assert!(hl.iter().all(|&h| h != Kind::Keyword));
     }
 
     // -- YAML edge cases ------------------------------------------------------
@@ -2570,13 +3088,13 @@ mod tests {
     fn test_yaml_multiline_string() {
         let lines: &[&[u8]] = &[b"description: |", b"  multi line", b"  text here"];
         let hls = hl_multiline(lines, &YAML_RULES);
-        assert_range(&hls[0], 0..11, HighlightKind::Keyword, "description key");
+        assert_range(&hls[0], 0..11, Kind::Keyword, "description key");
     }
 
     #[test]
     fn test_yaml_empty_value() {
         let hl = hl_types(b"key:", &YAML_RULES);
-        assert_range(&hl, 0..3, HighlightKind::Keyword, "yaml key");
+        assert_range(&hl, 0..3, Kind::Keyword, "yaml key");
     }
 
     // -- Markdown edge cases --------------------------------------------------
@@ -2586,122 +3104,181 @@ mod tests {
         let lines: &[&[u8]] = &[b"```rust", b"fn main() {}", b"```"];
         let hls = hl_multiline(lines, &MARKDOWN_RULES);
         assert!(
-            hls[0].iter().all(|&h| h == HighlightKind::String),
+            hls[0].iter().all(|&h| h == Kind::String),
             "fence open with lang"
         );
-        assert!(
-            hls[1].iter().all(|&h| h == HighlightKind::String),
-            "fenced content"
-        );
-        assert!(
-            hls[2].iter().all(|&h| h == HighlightKind::String),
-            "fence close"
-        );
+        assert!(hls[1].iter().all(|&h| h == Kind::String), "fenced content");
+        assert!(hls[2].iter().all(|&h| h == Kind::String), "fence close");
     }
 
     #[test]
     fn test_markdown_blockquote() {
         let hl = hl_types(b"> quoted text", &MARKDOWN_RULES);
         // Blockquote marker should be highlighted as Comment
-        assert_eq!(hl[0], HighlightKind::Comment);
+        assert_eq!(hl[0], Kind::Comment);
     }
 
-    // -- rules_for_language ---------------------------------------------------
+    // -- Language lookup ------------------------------------------------------
 
     #[test]
-    fn test_rules_for_language_known() {
-        assert!(rules_for_language("Rust").is_some());
-        assert!(rules_for_language("Python").is_some());
-        assert!(rules_for_language("Config").is_some());
+    fn test_language_aliases_and_extensions() {
+        assert_eq!(Language::from_name("Rust"), Some(Language::Rust));
+        assert_eq!(Language::from_name("shell"), Some(Language::Bash));
+        assert_eq!(Language::from_extension(".json"), Some(Language::Json));
+        assert_eq!(Language::from_extension("md"), Some(Language::Markdown));
+        assert_eq!(Language::from_name("Brainfuck"), None);
     }
 
     #[test]
-    fn test_rules_for_language_unknown() {
-        assert!(rules_for_language("Brainfuck").is_none());
+    fn test_operator_matching_is_longest_first() {
+        static RULES: RuleSet = RuleSet {
+            lexer_kind: LexerKind::Code,
+            line_comment: "",
+            block_comment: ("", ""),
+            string_delims: &[],
+            keywords: &[],
+            types: &[],
+            constants: &[],
+            macros: &[],
+            operators: &["=", "==", "==="],
+            highlight_numbers: false,
+            highlight_upper_constants: false,
+            highlight_fn_calls: false,
+            highlight_bang_macros: false,
+        };
+        let hl = hl_types(b"===", &RULES);
+        assert!(hl.iter().all(|&h| h == Kind::Operator));
     }
 
-    // -- byte_hl_to_char_hl with multi-byte chars -----------------------------
+    #[test]
+    fn test_public_streaming_api_keeps_state_opaque() {
+        let mut highlighter = Highlighter::new(Language::Rust);
+        let mut scratch = Vec::new();
+        let first = highlighter.highlight_into(b"/* comment", &mut scratch);
+        assert!(first.iter().all(|&kind| kind == Kind::Comment));
+        assert!(!highlighter.state().is_normal());
+
+        let second = highlighter.highlight_into(b"done */ let", &mut scratch);
+        assert_eq!(second[0], Kind::Comment);
+        assert_eq!(second[8], Kind::Keyword);
+        assert!(highlighter.state().is_normal());
+
+        highlighter.reset();
+        assert_eq!(highlighter.state(), State::default());
+    }
 
     #[test]
-    fn test_byte_hl_to_char_hl_multibyte() {
+    fn test_stateless_api_and_runs() {
+        let line = b"let x = 1";
+        let mut kinds = vec![Kind::Normal; line.len()];
+        let state = highlight_line_into(Language::Rust, State::default(), line, &mut kinds);
+        assert!(state.is_normal());
+        assert_eq!(kinds[0], Kind::Keyword);
+
+        let grouped: Vec<_> = runs(&[
+            Kind::Keyword,
+            Kind::Keyword,
+            Kind::Normal,
+            Kind::Number,
+            Kind::Number,
+        ])
+        .collect();
+        assert_eq!(
+            grouped,
+            vec![
+                Run {
+                    start: 0,
+                    end: 2,
+                    kind: Kind::Keyword,
+                },
+                Run {
+                    start: 2,
+                    end: 3,
+                    kind: Kind::Normal,
+                },
+                Run {
+                    start: 3,
+                    end: 5,
+                    kind: Kind::Number,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_language_aliases() {
+        assert_eq!(Language::from_name("rs"), Some(Language::Rust));
+        assert_eq!(Language::from_name("shell"), Some(Language::Bash));
+        assert_eq!(Language::from_name("yml"), Some(Language::Yaml));
+        assert_eq!(Language::from_extension(".md"), Some(Language::Markdown));
+        assert_eq!(Language::from_name("unknown"), None);
+    }
+
+    // -- byte_kinds_to_char_kinds with multi-byte chars -----------------------------
+
+    #[test]
+    fn test_byte_kinds_to_char_kinds_multibyte() {
         // "é" is 2 bytes → 1 char highlight
         let text = "é".as_bytes();
-        let byte_hl = vec![HighlightKind::String; text.len()];
-        let char_hl = byte_hl_to_char_hl(text, &byte_hl);
+        let byte_kinds = vec![Kind::String; text.len()];
+        let char_hl = byte_kinds_to_char_kinds(text, &byte_kinds);
         assert_eq!(char_hl.len(), 1);
-        assert_eq!(char_hl[0], HighlightKind::String);
-    }
-
-    // -- Coverage gap: ansi_code for all HighlightKind variants (lines 61-65) --------
-
-    #[test]
-    fn test_ansi_code_all_variants() {
-        assert_eq!(HighlightKind::Normal.ansi_code(), "");
-        assert!(!HighlightKind::Comment.ansi_code().is_empty());
-        assert!(!HighlightKind::Keyword.ansi_code().is_empty());
-        assert!(!HighlightKind::Type.ansi_code().is_empty());
-        assert!(!HighlightKind::String.ansi_code().is_empty());
-        assert!(!HighlightKind::Number.ansi_code().is_empty());
-        assert!(!HighlightKind::Bracket.ansi_code().is_empty());
-        assert!(!HighlightKind::Operator.ansi_code().is_empty());
-        assert!(!HighlightKind::Function.ansi_code().is_empty());
-        assert!(!HighlightKind::Constant.ansi_code().is_empty());
-        assert!(!HighlightKind::Macro.ansi_code().is_empty());
+        assert_eq!(char_hl[0], Kind::String);
     }
 
     // -- Coverage gap: multiline string continuation (lines 166-169, 184-185) --
 
     #[test]
     fn test_multiline_string_continuation() {
-        let rules = rules_for_language("Python").unwrap();
+        let rules = Language::from_name("Python").unwrap().rules();
         // Start a triple-quoted string that doesn't close
         let line1 = b"x = \"\"\"hello";
-        let (_hl1, state1) = highlight_line(line1, HighlightState::Normal, rules);
-        assert!(matches!(state1, HighlightState::MultiLineString(_)));
+        let (_hl1, state1) = highlight_line(line1, StateKind::Normal, rules);
+        assert!(matches!(state1, StateKind::MultiLineString(_)));
         // Continuation line with escape
         let line2 = b"world \\n more";
         let (hl2, state2) = highlight_line(line2, state1, rules);
         // All characters should be string
-        assert_eq!(hl2[0], HighlightKind::String);
-        assert!(matches!(state2, HighlightState::MultiLineString(_)));
+        assert_eq!(hl2[0], Kind::String);
+        assert!(matches!(state2, StateKind::MultiLineString(_)));
         // Closing line
         let line3 = b"end\"\"\"";
         let (_hl3, state3) = highlight_line(line3, state2, rules);
-        assert_eq!(state3, HighlightState::Normal);
+        assert_eq!(state3, StateKind::Normal);
     }
 
     // -- Coverage gap: unclosed non-multiline string (line 266) ---------------
 
     #[test]
     fn test_unclosed_string_single_line() {
-        let rules = rules_for_language("Rust").unwrap();
+        let rules = Language::from_name("Rust").unwrap().rules();
         let line = b"let s = \"unterminated";
-        let (hl, state) = highlight_line(line, HighlightState::Normal, rules);
+        let (hl, state) = highlight_line(line, StateKind::Normal, rules);
         // The string characters should be highlighted as String
-        assert_eq!(hl[8], HighlightKind::String); // opening quote
-        assert_eq!(state, HighlightState::Normal);
+        assert_eq!(hl[8], Kind::String); // opening quote
+        assert_eq!(state, StateKind::Normal);
     }
 
     // -- Coverage gap: float starting with dot (line 330) ---------------------
 
     #[test]
     fn test_number_starting_with_dot() {
-        let rules = rules_for_language("Rust").unwrap();
+        let rules = Language::from_name("Rust").unwrap().rules();
         let line = b"let x = .5;";
-        let (hl, _) = highlight_line(line, HighlightState::Normal, rules);
-        assert_eq!(hl[8], HighlightKind::Number); // .
-        assert_eq!(hl[9], HighlightKind::Number); // 5
+        let (hl, _) = highlight_line(line, StateKind::Normal, rules);
+        assert_eq!(hl[8], Kind::Number); // .
+        assert_eq!(hl[9], Kind::Number); // 5
     }
 
     // -- Coverage gap: semver pre-release (lines 433-436) ---------------------
 
     #[test]
     fn test_semver_pre_release() {
-        let rules = rules_for_language("TOML").unwrap();
+        let rules = Language::from_name("TOML").unwrap().rules();
         let line = b"version = \"1.2.3-beta.1\"";
-        let (hl, _) = highlight_line(line, HighlightState::Normal, rules);
+        let (hl, _) = highlight_line(line, StateKind::Normal, rules);
         // The version inside quotes should be Type (cyan/semver)
-        assert_eq!(hl[11], HighlightKind::Type); // '1' of version
+        assert_eq!(hl[11], Kind::Type); // '1' of version
     }
 
     // -- Coverage gap: YAML anchor/alias (lines 621-629) ----------------------
@@ -2709,18 +3286,18 @@ mod tests {
     #[test]
     fn test_yaml_anchor() {
         let line = b"&my_anchor";
-        let mut hl = vec![HighlightKind::Normal; line.len()];
+        let mut hl = vec![Kind::Normal; line.len()];
         highlight_yaml_content(line, &mut hl);
-        assert_eq!(hl[0], HighlightKind::Type); // '&'
-        assert_eq!(hl[1], HighlightKind::Type); // 'm'
+        assert_eq!(hl[0], Kind::Type); // '&'
+        assert_eq!(hl[1], Kind::Type); // 'm'
     }
 
     #[test]
     fn test_yaml_alias() {
         let line = b"*my_alias";
-        let mut hl = vec![HighlightKind::Normal; line.len()];
+        let mut hl = vec![Kind::Normal; line.len()];
         highlight_yaml_content(line, &mut hl);
-        assert_eq!(hl[0], HighlightKind::Type);
+        assert_eq!(hl[0], Kind::Type);
     }
 
     // -- Coverage gap: YAML list item with key:value (lines 655-661) ----------
@@ -2728,10 +3305,10 @@ mod tests {
     #[test]
     fn test_yaml_list_item_with_key() {
         let line = b"- name: value";
-        let mut hl = vec![HighlightKind::Normal; line.len()];
+        let mut hl = vec![Kind::Normal; line.len()];
         highlight_yaml_content(line, &mut hl);
-        assert_eq!(hl[2], HighlightKind::Keyword); // 'n' of name
-        assert_eq!(hl[5], HighlightKind::Keyword); // 'e' of name
+        assert_eq!(hl[2], Kind::Keyword); // 'n' of name
+        assert_eq!(hl[5], Kind::Keyword); // 'e' of name
     }
 
     // -- Keyword lists must be sorted for binary search -----------------------
@@ -2755,7 +3332,7 @@ mod tests {
             "XSH",
         ];
         for lang in languages {
-            let rules = rules_for_language(lang).unwrap();
+            let rules = Language::from_name(lang).unwrap().rules();
             for (name, list) in [
                 ("keywords", rules.keywords),
                 ("types", rules.types),
@@ -2779,10 +3356,10 @@ mod tests {
     #[test]
     fn test_yaml_negative_number() {
         let line = b"  -42";
-        let mut hl = vec![HighlightKind::Normal; line.len()];
+        let mut hl = vec![Kind::Normal; line.len()];
         highlight_yaml_value(line, &mut hl);
-        assert_eq!(hl[2], HighlightKind::Number); // '-'
-        assert_eq!(hl[3], HighlightKind::Number); // '4'
+        assert_eq!(hl[2], Kind::Number); // '-'
+        assert_eq!(hl[3], Kind::Number); // '4'
     }
 
     // -- Coverage gap: find_yaml_colon with quoted colon (lines 675-680) ------
@@ -2790,11 +3367,11 @@ mod tests {
     #[test]
     fn test_yaml_colon_in_quotes() {
         let line = b"\"key:with:colons\": value";
-        let mut hl = vec![HighlightKind::Normal; line.len()];
+        let mut hl = vec![Kind::Normal; line.len()];
         highlight_yaml_content(line, &mut hl);
         // The colon inside quotes should not split key/value
         // The actual key ends at the colon after the closing quote
-        assert_eq!(hl[0], HighlightKind::Keyword);
+        assert_eq!(hl[0], Kind::Keyword);
     }
 
     // -- XSH -----------------------------------------------------------------
@@ -2802,104 +3379,104 @@ mod tests {
     #[test]
     fn test_xsh_keyword() {
         let hl = hl_types(b"let x = 1", &XSH_RULES);
-        assert_eq!(hl[0], HighlightKind::Keyword);
-        assert_eq!(hl[1], HighlightKind::Keyword);
-        assert_eq!(hl[2], HighlightKind::Keyword);
+        assert_eq!(hl[0], Kind::Keyword);
+        assert_eq!(hl[1], Kind::Keyword);
+        assert_eq!(hl[2], Kind::Keyword);
     }
 
     #[test]
     fn test_xsh_comment() {
         let hl = hl_types(b"# a comment", &XSH_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::Comment));
+        assert!(hl.iter().all(|&h| h == Kind::Comment));
     }
 
     #[test]
     fn test_xsh_string() {
         let hl = hl_types(b"let s = \"hello\";", &XSH_RULES);
-        assert_eq!(hl[8], HighlightKind::String); // "
-        assert_eq!(hl[9], HighlightKind::String); // h
-        assert_eq!(hl[14], HighlightKind::String); // closing "
+        assert_eq!(hl[8], Kind::String); // "
+        assert_eq!(hl[9], Kind::String); // h
+        assert_eq!(hl[14], Kind::String); // closing "
     }
 
     #[test]
     fn test_xsh_prefixed_strings() {
         // bytes literal
         let hl = hl_types(b"b\"data\"", &XSH_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::String));
+        assert!(hl.iter().all(|&h| h == Kind::String));
 
         // path literal
         let hl = hl_types(b"p\"/usr/bin\"", &XSH_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::String));
+        assert!(hl.iter().all(|&h| h == Kind::String));
 
         // format string
         let hl = hl_types(b"f\"hello ${name}\"", &XSH_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::String));
+        assert!(hl.iter().all(|&h| h == Kind::String));
 
         // raw string
         let hl = hl_types(b"r\"raw\\n\"", &XSH_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::String));
+        assert!(hl.iter().all(|&h| h == Kind::String));
 
         // glob literal
         let hl = hl_types(b"g\"*.rs\"", &XSH_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::String));
+        assert!(hl.iter().all(|&h| h == Kind::String));
 
         // formatted path
         let hl = hl_types(b"fp\"${root}/child\"", &XSH_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::String));
+        assert!(hl.iter().all(|&h| h == Kind::String));
     }
 
     #[test]
     fn test_xsh_triple_quoted() {
         let hl = hl_types(b"\"\"\"multi\nline\"\"\"", &XSH_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::String));
+        assert!(hl.iter().all(|&h| h == Kind::String));
     }
 
     #[test]
     fn test_xsh_type() {
         let hl = hl_types(b"Result[Int]", &XSH_RULES);
-        assert_eq!(hl[0], HighlightKind::Type); // R
-        assert_eq!(hl[5], HighlightKind::Type); // t
+        assert_eq!(hl[0], Kind::Type); // R
+        assert_eq!(hl[5], Kind::Type); // t
     }
 
     #[test]
     fn test_xsh_operator() {
         let hl = hl_types(b"x ?? y", &XSH_RULES);
-        assert_eq!(hl[2], HighlightKind::Operator);
-        assert_eq!(hl[3], HighlightKind::Operator);
+        assert_eq!(hl[2], Kind::Operator);
+        assert_eq!(hl[3], Kind::Operator);
 
         let hl = hl_types(b"a |> b", &XSH_RULES);
-        assert_eq!(hl[2], HighlightKind::Operator);
-        assert_eq!(hl[3], HighlightKind::Operator);
+        assert_eq!(hl[2], Kind::Operator);
+        assert_eq!(hl[3], Kind::Operator);
 
         let hl = hl_types(b"=>", &XSH_RULES);
-        assert_eq!(hl[0], HighlightKind::Operator);
-        assert_eq!(hl[1], HighlightKind::Operator);
+        assert_eq!(hl[0], Kind::Operator);
+        assert_eq!(hl[1], Kind::Operator);
 
         let hl = hl_types(b"x != y", &XSH_RULES);
-        assert_eq!(hl[2], HighlightKind::Operator);
-        assert_eq!(hl[3], HighlightKind::Operator);
+        assert_eq!(hl[2], Kind::Operator);
+        assert_eq!(hl[3], Kind::Operator);
     }
 
     #[test]
     fn test_xsh_stdlib_macro() {
         // module names, stream stages, and builtins are Macro (bold magenta)
         let hl = hl_types(b"print total", &XSH_RULES);
-        assert_eq!(hl[0], HighlightKind::Macro); // p
-        assert_eq!(hl[5], HighlightKind::Normal); // total is ordinary
+        assert_eq!(hl[0], Kind::Macro); // p
+        assert_eq!(hl[5], Kind::Normal); // total is ordinary
 
         let hl = hl_types(b"|> where .kind", &XSH_RULES);
-        assert_eq!(hl[3], HighlightKind::Macro); // where
-        assert_eq!(hl[4], HighlightKind::Macro); // all of 'where'
+        assert_eq!(hl[3], Kind::Macro); // where
+        assert_eq!(hl[4], Kind::Macro); // all of 'where'
         let hl = hl_types(b"|> sort-by .name", &XSH_RULES);
-        assert_eq!(hl[3], HighlightKind::Macro); // 'sort' of sort-by
+        assert_eq!(hl[3], Kind::Macro); // 'sort' of sort-by
         let hl = hl_types(b"|> count {key}", &XSH_RULES);
-        assert_eq!(hl[3], HighlightKind::Macro); // count
+        assert_eq!(hl[3], Kind::Macro); // count
 
         let hl = hl_types(b"fs.files(root)?", &XSH_RULES);
-        assert_eq!(hl[0], HighlightKind::Macro); // fs module
-        assert_eq!(hl[2], HighlightKind::Normal); // .files is a call, not a static word
+        assert_eq!(hl[0], Kind::Macro); // fs module
+        assert_eq!(hl[2], Kind::Normal); // .files is a call, not a static word
         let hl = hl_types(b"net.download(url)?", &XSH_RULES);
-        assert_eq!(hl[0], HighlightKind::Macro); // net module
+        assert_eq!(hl[0], Kind::Macro); // net module
     }
 
     #[test]
@@ -2910,7 +3487,7 @@ mod tests {
         ] {
             let line = format!("{} x", kw);
             let hl = hl_types(line.as_bytes(), &XSH_RULES);
-            assert_eq!(hl[0], HighlightKind::Keyword, "{kw} should be a keyword");
+            assert_eq!(hl[0], Kind::Keyword, "{kw} should be a keyword");
         }
     }
 
@@ -2926,7 +3503,7 @@ mod tests {
         ] {
             let line = format!("{} value", ty);
             let hl = hl_types(line.as_bytes(), &XSH_RULES);
-            assert_eq!(hl[0], HighlightKind::Type, "{ty} should be a type");
+            assert_eq!(hl[0], Kind::Type, "{ty} should be a type");
             assert_eq!(hl[0], hl[ty.len() - 1], "whole {ty} identifier");
         }
     }
@@ -2951,129 +3528,118 @@ mod tests {
         let hls = hl_multiline(lines, &XSH_RULES);
 
         // line 0: `let` keyword, `fs` module, `tempdir` is a function call
-        assert_eq!(hls[0][0], HighlightKind::Keyword); // let
-        assert_eq!(hls[0][18], HighlightKind::Macro); // fs
-        assert_eq!(hls[0][21], HighlightKind::Function); // tempdir
-        assert_eq!(hls[0][28], HighlightKind::Bracket); // (
+        assert_eq!(hls[0][0], Kind::Keyword); // let
+        assert_eq!(hls[0][18], Kind::Macro); // fs
+        assert_eq!(hls[0][21], Kind::Function); // tempdir
+        assert_eq!(hls[0][28], Kind::Bracket); // (
         // line 1: `defer` keyword
-        assert_eq!(hls[1][0], HighlightKind::Keyword); // defer
-        assert_eq!(hls[1][6], HighlightKind::Macro); // fs
+        assert_eq!(hls[1][0], Kind::Keyword); // defer
+        assert_eq!(hls[1][6], Kind::Macro); // fs
         // line 3: fp"..." string
-        assert!(hls[3][10..].iter().all(|&h| h == HighlightKind::String));
+        assert!(hls[3][10..].iter().all(|&h| h == Kind::String));
         // line 5: `let`, `fs`, `files` function
-        assert_eq!(hls[5][0], HighlightKind::Keyword); // let
-        assert_eq!(hls[5][14], HighlightKind::Macro); // fs
-        assert_eq!(hls[5][17], HighlightKind::Function); // files
+        assert_eq!(hls[5][0], Kind::Keyword); // let
+        assert_eq!(hls[5][14], Kind::Macro); // fs
+        assert_eq!(hls[5][17], Kind::Function); // files
         // line 6: `|>` operator, `where` stage
-        assert_eq!(hls[6][2], HighlightKind::Operator); // |
-        assert_eq!(hls[6][3], HighlightKind::Operator); // >
-        assert_eq!(hls[6][5], HighlightKind::Macro); // where
+        assert_eq!(hls[6][2], Kind::Operator); // |
+        assert_eq!(hls[6][3], Kind::Operator); // >
+        assert_eq!(hls[6][5], Kind::Macro); // where
         // line 7: `map` stage, `|entry|` is plain
-        assert_eq!(hls[7][5], HighlightKind::Macro); // map
-        assert_eq!(hls[7][10], HighlightKind::Normal); // entry
+        assert_eq!(hls[7][5], Kind::Macro); // map
+        assert_eq!(hls[7][10], Kind::Normal); // entry
         // line 10: `sort` of `sort-by` is a stage
-        assert_eq!(hls[10][5], HighlightKind::Macro); // sort
+        assert_eq!(hls[10][5], Kind::Macro); // sort
         // line 11: `pure` keyword, `Str` type, `->` operator
-        assert_eq!(hls[11][0], HighlightKind::Keyword); // pure
-        assert_eq!(hls[11][17], HighlightKind::Type); // Str
-        assert_eq!(hls[11][20], HighlightKind::Operator); // ->
+        assert_eq!(hls[11][0], Kind::Keyword); // pure
+        assert_eq!(hls[11][17], Kind::Type); // Str
+        assert_eq!(hls[11][20], Kind::Operator); // ->
     }
 
     #[test]
     fn test_xsh_type_schema_declaration() {
         let hl = hl_types(b"type Config = { name: Str, retries: Int }", &XSH_RULES);
-        assert_eq!(hl[0], HighlightKind::Keyword); // type
-        assert_eq!(hl[24], HighlightKind::Type); // Str
-        assert_eq!(hl[37], HighlightKind::Type); // Int
-        assert_eq!(hl[16], HighlightKind::Normal); // name (field)
+        assert_eq!(hl[0], Kind::Keyword); // type
+        assert_eq!(hl[24], Kind::Type); // Str
+        assert_eq!(hl[37], Kind::Type); // Int
+        assert_eq!(hl[16], Kind::Normal); // name (field)
     }
 
     #[test]
     fn test_xsh_number() {
         let hl = hl_types(b"let x = 42;", &XSH_RULES);
-        assert_eq!(hl[8], HighlightKind::Number);
-        assert_eq!(hl[9], HighlightKind::Number);
+        assert_eq!(hl[8], Kind::Number);
+        assert_eq!(hl[9], Kind::Number);
 
         // octal
         let hl = hl_types(b"0o755", &XSH_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::Number));
+        assert!(hl.iter().all(|&h| h == Kind::Number));
 
         // float
         let hl = hl_types(b"3.14", &XSH_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::Number));
+        assert!(hl.iter().all(|&h| h == Kind::Number));
 
         // duration
         let hl = hl_types(b"100ms", &XSH_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::Number));
+        assert!(hl.iter().all(|&h| h == Kind::Number));
     }
 
     #[test]
     fn test_xsh_function_call() {
         let hl = hl_types(b"my_func(\"hi\")", &XSH_RULES);
-        assert_eq!(hl[0], HighlightKind::Function); // m
-        assert_eq!(hl[6], HighlightKind::Function); // c
-        assert_eq!(hl[7], HighlightKind::Bracket); // (
+        assert_eq!(hl[0], Kind::Function); // m
+        assert_eq!(hl[6], Kind::Function); // c
+        assert_eq!(hl[7], Kind::Bracket); // (
     }
 
     #[test]
     fn test_xsh_stdlib_purple() {
         // stdlib names are Macro (bold magenta / purple)
         let hl = hl_types(b"print(\"hi\")", &XSH_RULES);
-        assert_eq!(hl[0], HighlightKind::Macro); // p
-        assert_eq!(hl[4], HighlightKind::Macro); // t
+        assert_eq!(hl[0], Kind::Macro); // p
+        assert_eq!(hl[4], Kind::Macro); // t
 
         let hl = hl_types(b"fs.mkdir(\"dir\")", &XSH_RULES);
-        assert_eq!(hl[0], HighlightKind::Macro); // f
-        assert_eq!(hl[1], HighlightKind::Macro); // s
+        assert_eq!(hl[0], Kind::Macro); // f
+        assert_eq!(hl[1], Kind::Macro); // s
 
         let hl = hl_types(b"abort(1)", &XSH_RULES);
-        assert_eq!(hl[0], HighlightKind::Macro);
+        assert_eq!(hl[0], Kind::Macro);
     }
 
     #[test]
     fn test_xsh_multiline_string_state() {
-        let (hl, state) = highlight_line(b"\"\"\"hello", HighlightState::Normal, &XSH_RULES);
-        assert!(hl.iter().all(|&h| h == HighlightKind::String));
-        assert!(matches!(state, HighlightState::MultiLineString(_)));
+        let (hl, state) = highlight_line(b"\"\"\"hello", StateKind::Normal, &XSH_RULES);
+        assert!(hl.iter().all(|&h| h == Kind::String));
+        assert!(matches!(state, StateKind::MultiLineString(_)));
     }
 
     #[test]
     fn test_xsh_proc_definition() {
         let hl = hl_types(b"proc build() [fs] -> Result[Unit] {", &XSH_RULES);
-        assert_eq!(hl[0], HighlightKind::Keyword); // proc
-        assert_eq!(hl[5], HighlightKind::Function); // build
+        assert_eq!(hl[0], Kind::Keyword); // proc
+        assert_eq!(hl[5], Kind::Function); // build
     }
 
     #[test]
     fn test_xsh_user_type_highlight() {
         let user = vec![b"MyType".to_vec(), b"MyVariant".to_vec()];
-        let rules = &XSH_RULES;
 
         // Simple alias
-        let hl = highlight_line(b"let x: MyType = 1", HighlightState::Normal, rules).0;
-        assert_eq!(hl[8], HighlightKind::Normal); // MyType not highlighted without user_types
+        let hl = highlight_line(b"let x: MyType = 1", StateKind::Normal, &XSH_RULES).0;
+        assert_eq!(hl[8], Kind::Normal); // MyType not highlighted without user_types
 
+        let mut highlighter = crate::Highlighter::new(Language::Xsh);
+        highlighter.set_user_types(&user);
         let mut out = Vec::new();
-        highlight_line_into(
-            b"let x: MyType = 1",
-            HighlightState::Normal,
-            rules,
-            &user,
-            &mut out,
-        );
-        assert_eq!(out[8], HighlightKind::Type); // M
-        assert_eq!(out[12], HighlightKind::Type); // e
+        highlighter.highlight_into(b"let x: MyType = 1", &mut out);
+        assert_eq!(out[8], Kind::Type); // M
+        assert_eq!(out[12], Kind::Type); // e
 
         // Tag variant
-        let mut out = Vec::new();
-        highlight_line_into(
-            b"match x { MyVariant => 1 }",
-            HighlightState::Normal,
-            rules,
-            &user,
-            &mut out,
-        );
-        assert_eq!(out[10], HighlightKind::Type); // M
-        assert_eq!(out[18], HighlightKind::Type); // t
+        highlighter.reset();
+        highlighter.highlight_into(b"match x { MyVariant => 1 }", &mut out);
+        assert_eq!(out[10], Kind::Type); // M
+        assert_eq!(out[18], Kind::Type); // t
     }
 }

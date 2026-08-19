@@ -1,10 +1,9 @@
 use std::io::{self, Write};
 
 use crate::buffer::{self, GapBuffer};
-use crate::highlight::{self, HighlightKind, HighlightState};
-use crate::languages::SyntaxRules;
 use crate::selection::{Selection, TextPosition};
 use crate::viewport::Viewport;
+use hi_lite::{Highlighter, Kind, Language, State, byte_kinds_to_char_kinds_into};
 
 // -- ANSI styling sequences -------------------------------------------------
 
@@ -24,6 +23,22 @@ const FIND_MATCH: &str = "\x1b[43;30m";
 const BRACKET_MATCH: &str = "\x1b[45;30m";
 const STATUS_BG: &str = "\x1b[0;100m";
 const CMD_LINE_BG: &str = "\x1b[30;43m";
+
+fn highlight_ansi_code(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Normal => "",
+        Kind::Comment => "\x1b[90m",
+        Kind::Keyword => "\x1b[33m",
+        Kind::Type => "\x1b[36m",
+        Kind::String => "\x1b[32m",
+        Kind::Number => "\x1b[31m",
+        Kind::Bracket => "\x1b[35m",
+        Kind::Operator => "\x1b[33m",
+        Kind::Function => "\x1b[34m",
+        Kind::Constant => "\x1b[31;1m",
+        Kind::Macro => "\x1b[35;1m",
+    }
+}
 
 /// Wraps a `char` for safe terminal output.
 /// Control characters (U+0000–U+001F except tab/newline, and U+007F) are
@@ -107,9 +122,10 @@ fn expand_tabs_into(text: &[u8], out: &mut Vec<u8>, tab_pipes: &mut Vec<bool>) -
 
 pub struct Renderer {
     pub needs_full_redraw: bool,
-    syntax: Option<&'static SyntaxRules>,
+    language: Option<Language>,
+    highlighter: Option<Highlighter>,
     /// Cached highlight state at the start of each line.
-    hl_cache: Vec<HighlightState>,
+    hl_cache: Vec<State>,
     /// Buffer version the cache was computed for.
     hl_cache_version: u64,
     /// First line whose cached state may be stale (set by caller via dirty tracking).
@@ -121,9 +137,9 @@ pub struct Renderer {
     /// Scratch buffer reused each line for tab-pipe column markers.
     tab_pipes_scratch: Vec<bool>,
     /// Scratch buffer reused each line for byte-indexed highlight output.
-    hl_scratch: Vec<HighlightKind>,
+    hl_scratch: Vec<Kind>,
     /// Scratch buffer reused each line for char-indexed highlight output.
-    char_hl_scratch: Vec<HighlightKind>,
+    char_hl_scratch: Vec<Kind>,
     /// Scratch buffer reused each line for find-range display columns.
     find_scratch: Vec<(usize, usize, bool)>,
     /// Frame buffer reused each draw to avoid per-frame allocation.
@@ -160,7 +176,8 @@ impl Renderer {
     pub fn new() -> Self {
         Self {
             needs_full_redraw: true,
-            syntax: None,
+            language: None,
+            highlighter: None,
             hl_cache: Vec::new(),
             hl_cache_version: u64::MAX,
             hl_dirty_from: 0,
@@ -187,18 +204,25 @@ impl Renderer {
         }
     }
 
-    pub fn set_syntax(&mut self, rules: Option<&'static SyntaxRules>) {
-        let same = match (self.syntax, rules) {
-            (Some(a), Some(b)) => std::ptr::eq(a, b),
-            (None, None) => true,
-            _ => false,
-        };
-        if !same {
-            self.syntax = rules;
+    pub fn set_language(&mut self, language: Option<Language>) {
+        if self.language != language {
+            self.language = language;
+            self.highlighter = language.map(Highlighter::new);
             self.hl_cache.clear();
             self.hl_cache_version = u64::MAX;
             self.hl_dirty_from = 0;
         }
+    }
+
+    fn highlight_line_with(
+        highlighter: &mut Highlighter,
+        line: &[u8],
+        state: State,
+        scratch: &mut Vec<Kind>,
+    ) -> State {
+        highlighter.set_state(state);
+        highlighter.highlight_into(line, scratch);
+        highlighter.state()
     }
 
     pub fn force_full_redraw(&mut self) {
@@ -213,8 +237,7 @@ impl Renderer {
         let mut in_continuation = false;
         for line_idx in 0..line_count {
             buffer.line_text_into(line_idx, &mut self.line_buf);
-            let (names, continues) =
-                crate::languages::xsh::scan_type_line(&self.line_buf, in_continuation);
+            let (names, continues) = hi_lite::scan_xsh_type_line(&self.line_buf, in_continuation);
             for name in names {
                 if seen.insert(name.clone()) {
                     self.user_types.push(name);
@@ -320,7 +343,7 @@ impl Renderer {
         let buf_version = buffer.version();
         // One line past the last visible line — that's all we need to cover.
         let visible_end = (viewport.scroll_line + text_rows + 1).min(line_count);
-        if let Some(rules) = self.syntax {
+        if self.language.is_some() {
             if buf_version != self.hl_cache_version {
                 let dirty = buffer.take_dirty_line();
                 self.hl_dirty_from = self.hl_dirty_from.min(dirty);
@@ -336,13 +359,14 @@ impl Renderer {
                     self.update_user_types(buffer, line_count);
                 }
             }
-            self.refresh_hl_cache(visible_end, viewport.scroll_line, line_count, buffer, rules);
+            if let Some(highlighter) = self.highlighter.as_mut() {
+                highlighter.set_user_types(&self.user_types);
+            }
+            self.refresh_hl_cache(visible_end, viewport.scroll_line, line_count, buffer);
             self.hl_dirty_from = usize::MAX;
         } else {
             self.hl_cache.clear();
         }
-        let hl_states = &self.hl_cache;
-
         // Wrap-aware render loop
         let mut screen_row: usize = 0;
         let mut line_idx = viewport.scroll_line;
@@ -411,24 +435,23 @@ impl Renderer {
 
             // Compute per-char syntax highlights for this line (once per logical line).
             // Results go into self.char_hl_scratch; has_char_hl tracks whether it's valid.
-            let has_char_hl =
-                if let (Some(rules), Some(&state)) = (self.syntax, hl_states.get(line_idx)) {
-                    highlight::highlight_line_into(
-                        raw_text,
-                        state,
-                        rules,
-                        &self.user_types,
-                        &mut self.hl_scratch,
-                    );
-                    highlight::byte_hl_to_char_hl_into(
-                        raw_text,
-                        &self.hl_scratch,
-                        &mut self.char_hl_scratch,
-                    );
-                    true
-                } else {
-                    false
-                };
+            let has_char_hl = if self.language.is_some()
+                && let Some(state) = self.hl_cache.get(line_idx).copied()
+            {
+                let highlighter = self
+                    .highlighter
+                    .as_mut()
+                    .expect("syntax highlighter must be configured");
+                Self::highlight_line_with(highlighter, raw_text, state, &mut self.hl_scratch);
+                byte_kinds_to_char_kinds_into(
+                    raw_text,
+                    &self.hl_scratch,
+                    &mut self.char_hl_scratch,
+                );
+                true
+            } else {
+                false
+            };
 
             // Bracket match: highlight only the *matching* character, not the cursor's
             // character (the terminal cursor already shows where the cursor is).
@@ -593,14 +616,11 @@ impl Renderer {
                         let is_bracket_match = bracket_match_col == Some(i);
                         if is_cursor {
                             let ht = if has_char_hl {
-                                self.char_hl_scratch
-                                    .get(i)
-                                    .copied()
-                                    .unwrap_or(HighlightKind::Normal)
+                                self.char_hl_scratch.get(i).copied().unwrap_or(Kind::Normal)
                             } else {
-                                HighlightKind::Normal
+                                Kind::Normal
                             };
-                            let code = ht.ansi_code();
+                            let code = highlight_ansi_code(ht);
                             write!(rb, "{}{CURSOR_STYLE}{}{RESET}", code, CtrlSafe(ch))?;
                         } else if in_sel {
                             if is_tab_pipe {
@@ -620,14 +640,11 @@ impl Renderer {
                             write!(rb, "{DIM}{}{RESET}", ch)?;
                         } else {
                             let ht = if has_char_hl {
-                                self.char_hl_scratch
-                                    .get(i)
-                                    .copied()
-                                    .unwrap_or(HighlightKind::Normal)
+                                self.char_hl_scratch.get(i).copied().unwrap_or(Kind::Normal)
                             } else {
-                                HighlightKind::Normal
+                                Kind::Normal
                             };
-                            let code = ht.ansi_code();
+                            let code = highlight_ansi_code(ht);
                             if code.is_empty() {
                                 write!(rb, "{}", CtrlSafe(ch))?;
                             } else {
@@ -637,7 +654,7 @@ impl Renderer {
                     }
                 } else {
                     // Fast path: syntax highlighting only (no cursor on this line)
-                    let mut current_hl = HighlightKind::Normal;
+                    let mut current_hl = Kind::Normal;
                     for (i, ch) in line_str
                         .chars()
                         .enumerate()
@@ -648,32 +665,29 @@ impl Renderer {
                             && i < self.tab_pipes_scratch.len()
                             && self.tab_pipes_scratch[i];
                         if is_tab_pipe {
-                            if current_hl != HighlightKind::Normal {
+                            if current_hl != Kind::Normal {
                                 write!(rb, "{RESET}")?;
-                                current_hl = HighlightKind::Normal;
+                                current_hl = Kind::Normal;
                             }
                             write!(rb, "{DIM}{}{RESET}", ch)?;
                         } else {
                             let ht = if has_char_hl {
-                                self.char_hl_scratch
-                                    .get(i)
-                                    .copied()
-                                    .unwrap_or(HighlightKind::Normal)
+                                self.char_hl_scratch.get(i).copied().unwrap_or(Kind::Normal)
                             } else {
-                                HighlightKind::Normal
+                                Kind::Normal
                             };
                             if ht != current_hl {
-                                if ht == HighlightKind::Normal {
+                                if ht == Kind::Normal {
                                     write!(rb, "{RESET}")?;
                                 } else {
-                                    write!(rb, "{}", ht.ansi_code())?;
+                                    write!(rb, "{}", highlight_ansi_code(ht))?;
                                 }
                                 current_hl = ht;
                             }
                             write!(rb, "{}", CtrlSafe(ch))?;
                         }
                     }
-                    if current_hl != HighlightKind::Normal {
+                    if current_hl != Kind::Normal {
                         write!(rb, "{RESET}")?;
                     }
                 }
@@ -952,7 +966,7 @@ impl Renderer {
     ///   that line, stopping early once the cached output state matches.
     /// - **Large-jump fast path**: when the viewport jumped far past the computed
     ///   range (e.g. select-all on a 1M-line file), the intermediate entries are
-    ///   filled with `HighlightState::Normal` and only the `scroll_line-200..end` range
+    ///   filled with `State::default()` and only the `scroll_line-200..end` range
     ///   is actually computed.  Multi-line constructs starting in the skipped gap
     ///   will be cosmetically wrong until the user scrolls back through them.
     fn refresh_hl_cache(
@@ -961,7 +975,6 @@ impl Renderer {
         scroll_line: usize,
         line_count: usize,
         buffer: &mut GapBuffer,
-        rules: &'static SyntaxRules,
     ) {
         let end = end.min(line_count);
 
@@ -976,7 +989,7 @@ impl Renderer {
         // Grow to cover the viewport.  Entries beyond the old `computed` point
         // are initialised to Normal (fast memset).
         if computed < end {
-            self.hl_cache.resize(end, HighlightState::Normal);
+            self.hl_cache.resize(end, State::default());
         }
 
         // Where to start recomputing:
@@ -1008,7 +1021,7 @@ impl Renderer {
         }
 
         let mut state = if start == 0 {
-            HighlightState::Normal
+            State::default()
         } else {
             self.hl_cache[start]
         };
@@ -1016,13 +1029,12 @@ impl Renderer {
         let mut line = start;
         while line < end {
             buffer.line_text_into(line, &mut self.line_buf);
-            let next_state = highlight::highlight_line_into(
-                &self.line_buf,
-                state,
-                rules,
-                &self.user_types,
-                &mut self.hl_scratch,
-            );
+            let highlighter = self
+                .highlighter
+                .as_mut()
+                .expect("syntax highlighter must be configured");
+            let next_state =
+                Self::highlight_line_with(highlighter, &self.line_buf, state, &mut self.hl_scratch);
             state = next_state;
 
             if line + 1 < end {
@@ -1604,8 +1616,7 @@ mod tests {
     #[test]
     fn test_render_syntax_cache_invalidation() {
         let mut r = Renderer::new();
-        let rules = crate::languages::rules_for_language("Rust");
-        r.set_syntax(rules);
+        r.set_language(Some(Language::Rust));
 
         let mut buffer = GapBuffer::from_text(b"fn main() {}");
         let viewport = Viewport::new(80, 24);
@@ -1662,14 +1673,70 @@ mod tests {
     }
 
     #[test]
-    fn test_set_syntax_changes_rules() {
+    fn test_opaque_state_cache_propagates_and_converges() {
         let mut r = Renderer::new();
-        assert!(r.syntax.is_none());
-        let rules = crate::languages::rules_for_language("Rust");
-        r.set_syntax(rules);
-        assert!(r.syntax.is_some());
-        r.set_syntax(None);
-        assert!(r.syntax.is_none());
+        r.set_language(Some(Language::Rust));
+        let mut buffer = GapBuffer::from_text(b"/*\nlet\n*/ let");
+        let viewport = Viewport::new(80, 24);
+        let mut output = Vec::new();
+
+        render_test(
+            &mut r,
+            &mut output,
+            &mut buffer,
+            &viewport,
+            0,
+            0,
+            true,
+            "",
+            "",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(!r.hl_cache[1].is_normal());
+        assert!(!r.hl_cache[2].is_normal());
+
+        buffer.insert(0, b"// ");
+        output.clear();
+        render_test(
+            &mut r,
+            &mut output,
+            &mut buffer,
+            &viewport,
+            0,
+            0,
+            true,
+            "",
+            "",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(r.hl_cache[1].is_normal());
+        assert!(r.hl_cache[2].is_normal());
+    }
+
+    #[test]
+    fn test_set_language_changes_highlighter() {
+        let mut r = Renderer::new();
+        assert!(r.language.is_none());
+        r.set_language(Some(Language::Rust));
+        assert!(r.language.is_some());
+        r.set_language(None);
+        assert!(r.language.is_none());
     }
 
     #[test]

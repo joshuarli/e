@@ -27,8 +27,9 @@ main.rs → Editor → Document → GapBuffer
 - `src/viewport.rs` — `Viewport`, soft-wrap scrolling, screen mapping, and resize anchors.
 - `src/render.rs` — ANSI rendering, syntax-state caching, dirty rows, and reusable scratch buffers.
 - `src/find.rs` — `FindState`, regex compilation, viewport match caching, and navigation.
-- `src/highlight.rs` — `HighlightKind`, `HighlightState`, the highlighting engine, and bracket matching.
-- `src/languages/` — per-language `SyntaxRules` tables (one file per language); the XSH vocabulary is a generated region inside `xsh.rs`.
+- `src/language.rs` — application filename/shebang detection and comment-insertion syntax; lexer selection lives in `hi-lite`.
+- `crates/hi-lite/` — reusable `Kind`, opaque `State`, language selection, line highlighter, byte/character mapping, and storage-agnostic bracket matching.
+- `crates/hi-lite/src/languages/` — private static per-language rule tables; the XSH vocabulary is a generated region inside `xsh.rs`.
 - `src/operation.rs` — `UndoOperation`, `UndoGroup`, and `UndoStack`.
 - `src/file_io.rs` — file reads/writes, modification times, persistent undo, and cursor state.
 - `benches/bench.rs` — executable performance and allocation benchmarks.
@@ -122,4 +123,3 @@ Use `make bench` for host-keyed timing/allocation baselines.
 - `~/.config/e/locks/<encoded_path>.elock` — single-editor file locks.
 
 Keep public behavior and these paths stable unless the task explicitly changes the contract.
-

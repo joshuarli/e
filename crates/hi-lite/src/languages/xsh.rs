@@ -6,7 +6,7 @@
 //! string delimiters, rule table, and the `type`/tag-union scanner are
 //! hand-maintained and sit outside the markers.
 
-use super::{StringDelim, SyntaxRules, string_delim};
+use super::{LexerKind, RuleSet, StringDelim, string_delim};
 
 // BEGIN GENERATED XSH VOCABULARY
 // Generated from /Users/josh/d/laputa-systems/xsh
@@ -236,7 +236,7 @@ static STRINGS: &[StringDelim] = &[
     string_delim!("\"", "\"", false),
 ];
 
-pub static RULES: SyntaxRules = SyntaxRules {
+pub(crate) static RULES: RuleSet = RuleSet {
     line_comment: "#",
     block_comment: ("", ""),
     string_delims: STRINGS,
@@ -249,10 +249,7 @@ pub static RULES: SyntaxRules = SyntaxRules {
     highlight_upper_constants: true,
     highlight_fn_calls: true,
     highlight_bang_macros: false,
-    is_markdown: false,
-    is_json: false,
-    is_yaml: false,
-    is_ini: false,
+    lexer_kind: LexerKind::Code,
 };
 
 /// Scan a single line for `type` declaration names and tag-union variants.
@@ -384,7 +381,7 @@ fn line_continues(line: &[u8], len: usize) -> bool {
 #[cfg(test)]
 pub fn collect_user_types(buf: &crate::buffer::GapBuffer) -> Vec<Vec<u8>> {
     let mut all = Vec::new();
-    let mut seen = fxhash::FxHashSet::default();
+    let mut seen = std::collections::HashSet::<Vec<u8>>::new();
     let mut line_buf = Vec::new();
     let mut in_continuation = false;
     for line_idx in 0..buf.line_count() {

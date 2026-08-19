@@ -1,4 +1,4 @@
-//! Guard the generated vocabulary region of `src/languages/xsh.rs` against
+//! Guard the generated vocabulary region of `crates/hi-lite/src/languages/xsh.rs` against
 //! drift from the XSH registry.
 //!
 //! Re-runs the same `syn`-based vocabulary extraction as `examples/gen_xsh.rs`
@@ -39,17 +39,19 @@ fn xsh_lang_matches_registry() {
     let vocab = gen_xsh::regenerate(&repo).expect("parsing the XSH registry source");
     let committed = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("crates")
+            .join("hi-lite")
             .join("src")
             .join("languages")
             .join("xsh.rs"),
     )
-    .expect("reading src/languages/xsh.rs");
+    .expect("reading crates/hi-lite/src/languages/xsh.rs");
     let spliced = gen_xsh::splice_into(&committed, &vocab.content)
         .expect("committed xsh.rs has the generation markers");
     assert_eq!(
         strip_generated_from(&committed),
         strip_generated_from(&spliced),
-        "src/languages/xsh.rs is out of date with the registry at {}; run `make gen-xsh`",
+        "crates/hi-lite/src/languages/xsh.rs is out of date with the registry at {}; run `make gen-xsh`",
         repo.display()
     );
 }
