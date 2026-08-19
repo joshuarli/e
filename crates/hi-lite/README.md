@@ -32,6 +32,10 @@ specialized lexer. Rule tables and lexer modes are private implementation
 details; the crate intentionally does not expose a grammar DSL, themes, ANSI
 colors, or editor abstractions.
 
+`Language::from_filename`, `Language::from_shebang`, and `Language::detect` own
+filename, shebang, and comment-delimiter policy for clients. Callers do not
+need a second supported-language registry.
+
 ## Benchmarks
 
 The checked-in golden corpus has warm (reused highlighter and scratch) and cold

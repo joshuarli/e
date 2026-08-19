@@ -27,7 +27,7 @@ main.rs → Editor → Document → GapBuffer
 - `src/viewport.rs` — `Viewport`, soft-wrap scrolling, screen mapping, and resize anchors.
 - `src/render.rs` — ANSI rendering, syntax-state caching, dirty rows, and reusable scratch buffers.
 - `src/find.rs` — `FindState`, regex compilation, viewport match caching, and navigation.
-- `src/language.rs` — application filename/shebang detection and comment-insertion syntax; lexer selection lives in `hi-lite`.
+- `crates/hi-lite/src/language.rs` — canonical language registry, filename/shebang detection, and comment syntax; the application delegates to it.
 - `crates/hi-lite/` — reusable `Kind`, opaque `State`, language selection, line highlighter, byte/character mapping, and storage-agnostic bracket matching.
 - `crates/hi-lite/src/languages/` — private static per-language rule tables; the XSH vocabulary is a generated region inside `xsh.rs`.
 - `src/operation.rs` — `UndoOperation`, `UndoGroup`, and `UndoStack`.

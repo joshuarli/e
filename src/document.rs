@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::buffer::GapBuffer;
-use crate::language::{self, DetectedLanguage};
 use crate::operation::{UndoOperation, UndoStack};
 use crate::selection::{CaretSnapshot, Selection, TextPosition};
 
@@ -327,12 +326,17 @@ impl Document {
         carets_after
     }
 
-    /// Detect language from filename, falling back to shebang on the first line.
-    pub fn detect_language(&self) -> Option<DetectedLanguage> {
-        self.file_path
+    /// Ask hi-lite to detect the language from the filename and first-line shebang.
+    pub fn detect_language(&self) -> Option<hi_lite::Language> {
+        // Keep the filename branch lazy: extracting the first line allocates.
+        if let Some(language) = self
+            .file_path
             .as_deref()
-            .and_then(language::detect)
-            .or_else(|| language::detect_from_shebang(&self.buffer.line_text(0)))
+            .and_then(hi_lite::Language::from_filename)
+        {
+            return Some(language);
+        }
+        hi_lite::Language::from_shebang(&self.buffer.line_text(0))
     }
 
     /// Get text in a range (for clipboard, etc.).

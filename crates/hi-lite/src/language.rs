@@ -224,6 +224,85 @@ impl Language {
         }
     }
 
+    /// Resolve a language from a path or conventional filename.
+    ///
+    /// Compound suffixes are tried before their shorter suffixes, so names
+    /// such as `page.css.erb` and `query.sql.erb` select their host lexer.
+    /// Plain-text extensions intentionally return `None`: callers can use
+    /// `from_extension` directly when they need to distinguish plain text.
+    pub fn from_filename(filename: &str) -> Option<Self> {
+        let basename = filename
+            .rsplit(|byte| matches!(byte, '/' | '\\'))
+            .next()
+            .unwrap_or(filename);
+
+        if basename == "Dockerfile"
+            || (basename.starts_with("Dockerfile.") && basename.len() > "Dockerfile.".len())
+        {
+            return Some(Self::Dockerfile);
+        }
+        if basename.eq_ignore_ascii_case("makefile")
+            || basename.eq_ignore_ascii_case("GNUmakefile")
+            || basename.eq_ignore_ascii_case("ocamlmakefile")
+            || (basename.len() > "makefile.".len()
+                && basename
+                    .as_bytes()
+                    .get(.."makefile".len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"makefile"))
+                && basename.as_bytes().get("makefile".len()) == Some(&b'.'))
+        {
+            return Some(Self::Makefile);
+        }
+
+        let mut suffix = basename;
+        while let Some((_, remainder)) = suffix.split_once('.') {
+            suffix = remainder;
+            if let Some(language) = Self::from_extension(suffix) {
+                return (language != Self::PlainText).then_some(language);
+            }
+        }
+        None
+    }
+
+    /// Resolve a language from a shebang line such as `#!/usr/bin/env python3`.
+    pub fn from_shebang(first_line: &[u8]) -> Option<Self> {
+        let line = first_line.strip_prefix(b"#!")?.trim_ascii();
+        let mut parts = line
+            .split(|&byte| byte == b' ' || byte == b'\t')
+            .filter(|part| !part.is_empty());
+        let command = parts.next()?;
+        let interpreter = if command.ends_with(b"/env") {
+            parts.find(|part| !part.starts_with(b"-"))?
+        } else {
+            command
+        };
+        let basename = interpreter
+            .rsplit(|&byte| byte == b'/')
+            .next()
+            .unwrap_or(interpreter);
+        let name = match basename.iter().position(|&byte| byte == b'.') {
+            Some(index) => &basename[..index],
+            None => basename,
+        };
+
+        match name {
+            b"sh" | b"bash" | b"zsh" | b"fish" | b"dash" | b"ash" | b"ksh" => {
+                Some(Self::Bash)
+            }
+            b"python" | b"python2" | b"python3" => Some(Self::Python),
+            b"node" | b"nodejs" | b"deno" | b"bun" => Some(Self::JavaScript),
+            b"xsh" | b"xshi" | b"xsht" => Some(Self::Xsh),
+            _ => None,
+        }
+    }
+
+    /// Resolve a language from a filename, falling back to its first-line shebang.
+    pub fn detect(filename: Option<&str>, first_line: &[u8]) -> Option<Self> {
+        filename
+            .and_then(Self::from_filename)
+            .or_else(|| Self::from_shebang(first_line))
+    }
+
     /// Return the canonical display name.
     pub const fn name(self) -> &'static str {
         match self {
@@ -246,6 +325,33 @@ impl Language {
             Self::Sql => "SQL", Self::Swift => "Swift", Self::Tcl => "Tcl",
             Self::Kotlin => "Kotlin", Self::Elm => "Elm", Self::Regex => "Regular Expression",
             Self::PlainText => "Plain Text", Self::Xsh => "XSH",
+        }
+    }
+
+    /// Return the line-comment delimiter used by editor integrations.
+    pub const fn comment(self) -> &'static str {
+        match self {
+            Self::Html | Self::Xml => "<!--",
+            Self::Css => "/*",
+            Self::Scss | Self::Less => "//",
+            Self::Bash
+            | Self::Python
+            | Self::Ini
+            | Self::Yaml
+            | Self::Makefile
+            | Self::Dockerfile
+            | Self::Perl
+            | Self::R
+            | Self::Ruby
+            | Self::Tcl
+            | Self::Batch
+            | Self::Xsh => "#",
+            Self::Markdown => "<!--",
+            Self::Erlang | Self::LaTeX | Self::Matlab => "%",
+            Self::Haskell | Self::Lua | Self::Sql => "--",
+            Self::Lisp | Self::Clojure => ";",
+            Self::Json | Self::PlainText | Self::Regex => "",
+            _ => "//",
         }
     }
 

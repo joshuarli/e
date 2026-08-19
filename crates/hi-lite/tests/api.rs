@@ -70,6 +70,58 @@ fn language_aliases_are_small_and_explicit() {
 }
 
 #[test]
+fn language_detection_owns_filename_and_shebang_mapping() {
+    assert_eq!(Language::from_filename("src/main.rs"), Some(Language::Rust));
+    assert_eq!(
+        Language::from_filename("templates/page.css.erb"),
+        Some(Language::Css)
+    );
+    assert_eq!(
+        Language::from_filename("Dockerfile.release"),
+        Some(Language::Dockerfile)
+    );
+    assert_eq!(Language::from_filename("GNUmakefile"), Some(Language::Makefile));
+    assert_eq!(Language::from_filename("build.xsh"), Some(Language::Xsh));
+    assert_eq!(Language::from_filename("README.txt"), None);
+
+    assert_eq!(
+        Language::from_shebang(b"#!/usr/bin/python3.11"),
+        Some(Language::Python)
+    );
+    assert_eq!(
+        Language::from_shebang(b"#!/usr/bin/env -S python3 -O"),
+        Some(Language::Python)
+    );
+    assert_eq!(
+        Language::from_shebang(b"#!/usr/bin/node"),
+        Some(Language::JavaScript)
+    );
+    assert_eq!(
+        Language::from_shebang(b"#!/usr/bin/env xshi"),
+        Some(Language::Xsh)
+    );
+    assert_eq!(Language::from_shebang(b"not a shebang"), None);
+    assert_eq!(
+        Language::detect(Some("unknown.file"), b"#!/bin/bash"),
+        Some(Language::Bash)
+    );
+    assert_eq!(
+        Language::detect(Some("main.rs"), b"#!/bin/bash"),
+        Some(Language::Rust)
+    );
+}
+
+#[test]
+fn language_comment_delimiters_are_canonical() {
+    assert_eq!(Language::Rust.comment(), "//");
+    assert_eq!(Language::Python.comment(), "#");
+    assert_eq!(Language::Html.comment(), "<!--");
+    assert_eq!(Language::Markdown.comment(), "<!--");
+    assert_eq!(Language::Css.comment(), "/*");
+    assert_eq!(Language::PlainText.comment(), "");
+}
+
+#[test]
 fn syntect_programming_syntax_names_have_dependency_free_lexers() {
     // Keep this list aligned with the programming grammars in syntect's
     // default SyntaxSet. Embedded/template syntaxes intentionally resolve to

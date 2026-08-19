@@ -11,7 +11,6 @@ use crate::document::{Document, TextEdit};
 use crate::find::FindState;
 use crate::input::{self, EditorEvent, InputParser, Key, MouseButton, MouseEvent, MouseMods};
 use crate::keybind::{EditorAction, KeybindingTable};
-use crate::language::DetectedLanguage;
 use crate::mouse::MouseState;
 use crate::render::{Renderer, gutter_width};
 use crate::selection::{
@@ -586,7 +585,7 @@ impl Editor {
             .ensure_cursor_visible(cursor_line, display_col, gw, &mut line_display_width);
 
         let lang = self.document.detect_language();
-        let lang_name = lang.map(|l| l.name).unwrap_or("Text");
+        let lang_name = lang.map(|l| l.name()).unwrap_or("Text");
         let selection = if self.selection().is_empty() {
             None
         } else {
@@ -627,7 +626,7 @@ impl Editor {
                 .refresh_viewport_matches(&self.document.buffer, &self.viewport);
         }
 
-        let language = lang.and_then(DetectedLanguage::syntax);
+        let language = lang;
         self.renderer.set_language(language);
         if self.carets.is_multicursor() {
             self.renderer.force_full_redraw();
@@ -2027,7 +2026,7 @@ impl Editor {
     // -- editing ------------------------------------------------------------
 
     fn insert_char(&mut self, c: char) {
-        let lang_name = self.document.detect_language().map(|l| l.name);
+        let lang_name = self.document.detect_language().map(|l| l.name());
         if self.carets.is_multicursor() {
             let mut planned = Vec::with_capacity(self.carets.len());
             let mut char_buf = [0u8; 4];
@@ -2507,7 +2506,7 @@ impl Editor {
                     let prev = self.document.buffer.byte_at(ls + c.column - 1);
                     if ls + c.column < le {
                         let next = self.document.buffer.byte_at(ls + c.column);
-                        let lang_name = self.document.detect_language().map(|l| l.name);
+                        let lang_name = self.document.detect_language().map(|l| l.name());
                         if auto_close_char(prev as char, lang_name) == Some(next as char) {
                             let start = TextPosition::new(c.line, c.column - 1);
                             let end = TextPosition::new(c.line, c.column + 1);
@@ -2601,7 +2600,7 @@ impl Editor {
             let prev = self.document.buffer.byte_at(ls + c.column - 1);
             if ls + c.column < le {
                 let next = self.document.buffer.byte_at(ls + c.column);
-                let lang_name = self.document.detect_language().map(|l| l.name);
+                let lang_name = self.document.detect_language().map(|l| l.name());
                 if auto_close_char(prev as char, lang_name) == Some(next as char) {
                     let start = TextPosition::new(c.line, c.column - 1);
                     let end = TextPosition::new(c.line, c.column + 1);
@@ -2836,7 +2835,7 @@ impl Editor {
     /// `force`: None = toggle, Some(true) = comment, Some(false) = uncomment.
     fn comment_impl(&mut self, force: Option<bool>) {
         let comment = match self.document.detect_language() {
-            Some(lang) => lang.comment,
+            Some(lang) => lang.comment(),
             None => {
                 self.set_status("No language detected for commenting".to_string());
                 return;
@@ -5393,7 +5392,7 @@ mod tests {
         let lang_name = e
             .document
             .detect_language()
-            .map(|l| l.name)
+            .map(|l| l.name())
             .unwrap_or("Text");
         let left = e.status_left(lang_name);
         assert!(left.contains("test.rs"));
@@ -5408,7 +5407,7 @@ mod tests {
         let lang_name = e
             .document
             .detect_language()
-            .map(|l| l.name)
+            .map(|l| l.name())
             .unwrap_or("Text");
         let left = e.status_left(lang_name);
         assert!(left.contains("test.rs*"));
