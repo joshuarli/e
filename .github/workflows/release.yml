@@ -3,9 +3,7 @@ name: release
 on:
   workflow_dispatch:
 
-permissions:
-  actions: write
-  contents: write
+permissions: {}
 
 concurrency:
   group: release-${{ github.sha }}
@@ -17,9 +15,12 @@ env:
 
 jobs:
   build:
-    name: Build (${{ matrix.runner }})
+    name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
+    timeout-minutes: 30
+    permissions:
+      actions: write
+      contents: read
     defaults:
       run:
         shell: bash -euo pipefail {0}
@@ -29,63 +30,57 @@ jobs:
         include:
           - runner: macos-26
             target: aarch64-apple-darwin
+            docker_platform: ''
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            docker_platform: linux/amd64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
+            docker_platform: linux/arm64
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        if: endsWith(matrix.target, '-linux-musl')
-        uses: docker/setup-buildx-action@v3
-
+      - uses: docker/setup-buildx-action@v3
+        if: matrix.docker_platform != ''
       - name: Build Linux release image
-        if: endsWith(matrix.target, '-linux-musl')
+        if: matrix.docker_platform != ''
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
+          platforms: ${{ matrix.docker_platform }}
           load: true
           tags: e-builder:${{ matrix.target }}
           cache-from: type=gha,scope=e-${{ matrix.target }}
           cache-to: type=gha,mode=max,scope=e-${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        if: endsWith(matrix.target, '-apple-darwin')
-        with:
-          key: ${{ matrix.runner }}-${{ matrix.target }}
-
+      - uses: laputa-systems/setup-rust@a7d09bfe692e431e6a98cd107ac2df77d47b5bba
+        if: matrix.docker_platform == ''
       - name: Build macOS release
-        if: endsWith(matrix.target, '-apple-darwin')
-        run: make release-pgo TARGET=${{ matrix.target }}
-
+        if: matrix.docker_platform == ''
+        run: make release-pgo TARGET="${{ matrix.target }}"
       - name: Run macOS tests
-        if: endsWith(matrix.target, '-apple-darwin')
-        run: make test-ci TARGET=${{ matrix.target }}
-
+        if: matrix.docker_platform == ''
+        run: make test-ci TARGET="${{ matrix.target }}"
+      - name: Save macOS release
+        if: matrix.docker_platform == ''
+        run: cp "target/${{ matrix.target }}/release/e" "e-${{ matrix.target }}"
       - name: Build and verify Linux releases
-        if: endsWith(matrix.target, '-linux-musl')
+        if: matrix.docker_platform != ''
         run: |
           docker run --rm --init \
-            --volume "$GITHUB_WORKSPACE:/e" \
-            --workdir /e \
-            "e-builder:${{ matrix.target }}" \
+            --platform "${{ matrix.docker_platform }}" \
+            -v "$GITHUB_WORKSPACE:/e" \
+            -w /e \
+            e-builder:${{ matrix.target }} \
             sh -ec '
               make release-pgo-linux TARGET=${{ matrix.target }}
               make verify-release-dynamic TARGET=${{ matrix.target }}
               make test-ci TARGET=${{ matrix.target }}
-              cp "target/${{ matrix.target }}/release/e" "e-${{ matrix.target }}"
+              cp target/${{ matrix.target }}/release/e e-${{ matrix.target }}
               make release-pgo-linux-static TARGET=${{ matrix.target }}
               make verify-release TARGET=${{ matrix.target }}
-              cp "target/${{ matrix.target }}/release/e" "e-${{ matrix.target }}-static"
+              cp target/${{ matrix.target }}/release/e e-${{ matrix.target }}-static
             '
-
-      - name: Save macOS release
-        if: endsWith(matrix.target, '-apple-darwin')
-        run: cp "target/${{ matrix.target }}/release/e" "e-${{ matrix.target }}"
-
       - uses: actions/upload-artifact@v4
         with:
           name: e-${{ matrix.target }}
@@ -96,20 +91,19 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: e-*
           path: dist
           merge-multiple: true
-
+      - name: Zip artifacts
+        run: for f in dist/*; do zip -9 --junk-paths "$f.zip" "$f"; done
       - name: Create pre-release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: release-${{ github.sha }}
-        run: |
-          gh release create "$RELEASE_TAG" dist/e-* \
-            --repo "$GITHUB_REPOSITORY" \
-            --prerelease \
-            --target "$GITHUB_SHA" \
-            --title "$RELEASE_TAG"
+        run: gh release create "$RELEASE_TAG" dist/*.zip --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" --title "$RELEASE_TAG"
