@@ -18,6 +18,9 @@ done)
 # Host proc-macro crates are linked with the same musl toolchain. Keep the
 # target CRT objects visible to those links as well as to the final binary.
 MUSL_NATIVE_RUSTFLAGS = $(if $(findstring -linux-musl,$(TARGET)),-L native=/usr/lib -Clink-arg=-B$(MUSL_CRT_DIR))
+# LLVM's profile runtime calls compiler-rt builtins that the musl target's
+# compiler-builtins archive does not provide on every architecture.
+MUSL_PROFILE_RUSTFLAGS = $(if $(findstring -linux-musl,$(TARGET)),$(MUSL_NATIVE_RUSTFLAGS) -Clink-arg=/usr/lib/libcompiler-rt-builtins.a)
 # LLVM helper binaries run on the build host; they are not installed in the
 # target triple's rustlib directory when cross-compiling to musl.
 LLVM_BIN   := $(shell rustc --print sysroot)/lib/rustlib/$(HOST)/bin
@@ -29,7 +32,7 @@ PGO_DIR    := $(CURDIR)/target/pgo-profiles/$(TARGET)
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 PGO_BINARY := $(PGO_BUILD_DIR)/$(TARGET)/release/$(NAME)
 RELEASE_RUSTFLAGS := $(MUSL_NATIVE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort
-LINUX_DYNAMIC_RUSTFLAGS := $(RELEASE_RUSTFLAGS) -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER)
+LINUX_DYNAMIC_RUSTFLAGS := $(RELEASE_RUSTFLAGS) -Ctarget-feature=-crt-static -Clink-arg=-B$(MUSL_CRT_DIR) -Clink-arg=-dynamic-linker=$(MUSL_LOADER) -Clink-arg=/usr/lib/libcompiler-rt-builtins.a
 PGO_USE_FLAGS := -Cprofile-use=$(PGO_MERGED) -Cllvm-args=-pgo-warn-missing-function
 
 .PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-hi-lite bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-instrument pgo-instrument-linux pgo-profile pgo-profile-linux pgo-merge bench-pgo install record gifs ensure-musl-target gen-xsh
@@ -115,14 +118,14 @@ pgo-instrument: ensure-musl-target
 	rm -rf "$(PGO_BUILD_DIR)/$(TARGET)" "$(PGO_DIR)"
 	mkdir -p "$(PGO_DIR)"
 	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
-	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(RELEASE_RUSTFLAGS)" \
+	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(MUSL_PROFILE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
 	CARGO_TARGET_DIR="$(PGO_BUILD_DIR)" \
 	cargo rustc --release --target $(TARGET) --lib \
 	  -Z build-std=std \
 	  -Z build-std-features= \
 	  -- -Cprofile-generate="$(PGO_DIR)"
 	CARGO_TARGET_$(TARGET_ENV)_LINKER="$(MUSL_LINKER)" \
-	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(RELEASE_RUSTFLAGS)" \
+	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS="$(MUSL_PROFILE_RUSTFLAGS) -Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
 	CARGO_TARGET_DIR="$(PGO_BUILD_DIR)" \
 	cargo rustc --release --target $(TARGET) --bin $(NAME) \
 	  -Z build-std=std \
