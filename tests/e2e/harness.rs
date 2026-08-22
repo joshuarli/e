@@ -236,8 +236,12 @@ impl TestEditor {
         if let Some(profile_dir) = profile_dir {
             command = command.env("LLVM_PROFILE_FILE", profile_dir.join("e-%p.profraw"));
         }
-        let environment = TestEnv::hermetic_utf8("C.UTF-8")
-            .expect("C.UTF-8 must be available on supported E2E platforms")
+        let environment = if cfg!(target_os = "linux") {
+            TestEnv::hermetic_ascii()
+        } else {
+            TestEnv::hermetic_utf8("C.UTF-8")
+        }
+        .expect("a supported hermetic locale must be available on E2E platforms")
             .env("HOME", home.path())
             .env("PATH", home.path());
         let scenario = Scenario::new("e editor E2E")
