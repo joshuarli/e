@@ -180,8 +180,7 @@ pgo-profile: pgo-instrument
 
 pgo-profile-linux: pgo-instrument-linux
 	rm -f "$(PGO_DIR)"/*.profraw
-	RUSTFLAGS= \
-	CARGO_ENCODED_RUSTFLAGS= \
+	RUSTFLAGS="$(MUSL_NATIVE_RUSTFLAGS)" \
 	CARGO_TARGET_$(TARGET_ENV)_RUSTFLAGS= \
 	CARGO_TARGET_DIR="$(PGO_DRIVER_DIR)" \
 	E_PGO_BINARY="$(PGO_BINARY)" \
