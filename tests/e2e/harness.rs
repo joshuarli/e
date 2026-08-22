@@ -207,25 +207,13 @@ impl TestEditor {
     }
 
     pub fn with_size(args: &[&str], rows: u16, cols: u16) -> Self {
-        Self::spawn(args, rows, cols, None)
+        Self::spawn(args, rows, cols)
     }
 
-    pub fn with_profile_size(args: &[&str], rows: u16, cols: u16) -> Self {
-        let profile_dir = std::env::var_os("E_PGO_PROFILE_DIR")
-            .map(PathBuf::from)
-            .expect("E_PGO_PROFILE_DIR must select the profile output directory");
-        assert!(
-            profile_dir.is_dir(),
-            "E_PGO_PROFILE_DIR is not a directory: {}",
-            profile_dir.display()
-        );
-        Self::spawn(args, rows, cols, Some(profile_dir))
-    }
-
-    fn spawn(args: &[&str], rows: u16, cols: u16, profile_dir: Option<PathBuf>) -> Self {
+    fn spawn(args: &[&str], rows: u16, cols: u16) -> Self {
         let home = TempDir::new();
         let binary = selected_binary();
-        let mut command = CommandSpec::new(binary)
+        let command = CommandSpec::new(binary)
             .args(args.iter().copied())
             .current_dir(home.path())
             // A HOME-only PATH forces the editor's internal clipboard, so
@@ -233,9 +221,6 @@ impl TestEditor {
             .env("PATH", home.path())
             .remove_env("WAYLAND_DISPLAY")
             .remove_env("DISPLAY");
-        if let Some(profile_dir) = profile_dir {
-            command = command.env("LLVM_PROFILE_FILE", profile_dir.join("e-%p.profraw"));
-        }
         let environment = if cfg!(target_os = "linux") {
             TestEnv::hermetic_ascii()
         } else {
@@ -547,9 +532,7 @@ impl Drop for TestEditor {
 }
 
 fn selected_binary() -> PathBuf {
-    if let Some(path) =
-        std::env::var_os("E_PGO_BINARY").or_else(|| std::env::var_os("E_TEST_BINARY"))
-    {
+    if let Some(path) = std::env::var_os("E_TEST_BINARY") {
         let path = PathBuf::from(path);
         assert!(
             path.is_file(),
