@@ -58,10 +58,10 @@ name = "e"
 version = "0.1.13"
 dependencies = [
  "fxhash",
- "hi-lite",
+ "laputa-hi-lite",
+ "laputa-ptytest",
  "proc-macro2",
  "proptest",
- "ptytest",
  "regex-lite",
  "rustix",
  "rustybench",
@@ -158,10 +158,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hi-lite"
-version = "0.1.0"
-
-[[package]]
 name = "id-arena"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -184,6 +180,22 @@ name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
+
+[[package]]
+name = "laputa-hi-lite"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfb0c7dc2a6271b5a4eddecbbef679ef3f0a19d32c57bdba6bba696d6fa3360e"
+
+[[package]]
+name = "laputa-ptytest"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8125ac34092fe1c8464b74641e39073d66ebc95e8174647d0ca9510e27bb40ba"
+dependencies = [
+ "libc",
+ "vt100",
+]
 
 [[package]]
 name = "leb128fmt"
@@ -303,14 +315,6 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
-]
-
-[[package]]
-name = "ptytest"
-version = "0.1.0"
-dependencies = [
- "libc",
- "vt100",
 ]
 
 [[package]]
