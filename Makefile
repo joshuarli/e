@@ -12,11 +12,12 @@ PGO_DIR    := $(CURDIR)/target/pgo-profiles/$(TARGET)
 PGO_MERGED := $(PGO_DIR)/merged.profdata
 PGO_BINARY := $(PGO_BUILD_DIR)/$(TARGET)/release/$(NAME)
 PGO_USE_FLAGS := -Cprofile-use=$(PGO_MERGED) -Cllvm-args=-pgo-warn-missing-function
+PROFILE_RUSTC_ARGS := $(if $(findstring -linux-musl,$(TARGET)),,-- -Cprofile-generate=$(PGO_DIR))
 
 # Docker's musl-cargo wrapper owns linker, CRT, loader, and profile-runtime
 # flags. The Makefile selects only the build mode and keeps Cargo invocations
 # readable on macOS as well as in the Linux release image.
-cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter static-profile dynamic-profile,$(1)),RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort -Cprofile-generate=$(PGO_DIR)",$(if $(filter release-static release-dynamic,$(1)),RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort"))) MUSL_TARGET="$(TARGET)" MUSL_BUILD_MODE="$(1)" MUSL_PROFILE_DIR="$(PGO_DIR)" $(CARGO_CMD)
+cargo = $(if $(findstring -linux-musl,$(TARGET)),,$(if $(filter release-static release-dynamic static-profile dynamic-profile,$(1)),RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort")) MUSL_TARGET="$(TARGET)" MUSL_BUILD_MODE="$(1)" MUSL_PROFILE_DIR="$(PGO_DIR)" $(CARGO_CMD)
 
 .PHONY: build test test-ci release verify-release verify-release-dynamic bench bench-hi-lite bench-syscalls release-pgo release-pgo-linux release-pgo-linux-static pgo-instrument pgo-instrument-linux pgo-profile pgo-profile-linux pgo-merge bench-pgo install record gifs gen-xsh
 
@@ -99,11 +100,13 @@ pgo-instrument:
 	CARGO_TARGET_DIR="$(PGO_BUILD_DIR)" \
 	$(call cargo,static-profile) rustc --release --target $(TARGET) --lib \
 	  -Z build-std=std \
-	  -Z build-std-features=
+	  -Z build-std-features= \
+	  $(PROFILE_RUSTC_ARGS)
 	CARGO_TARGET_DIR="$(PGO_BUILD_DIR)" \
 	$(call cargo,static-profile) rustc --release --target $(TARGET) --bin $(NAME) \
 	  -Z build-std=std \
-	  -Z build-std-features=
+	  -Z build-std-features= \
+	  $(PROFILE_RUSTC_ARGS)
 	@test -x "$(PGO_BINARY)" || { echo "instrumented binary was not built: $(PGO_BINARY)" >&2; exit 1; }
 	@if command -v otool >/dev/null 2>&1 && ! otool -l "$(PGO_BINARY)" 2>/dev/null | grep -q '__llvm_prf'; then \
 		echo 'instrumented binary has no LLVM profile sections' >&2; exit 1; \
@@ -120,11 +123,13 @@ pgo-instrument-linux:
 	CARGO_TARGET_DIR="$(PGO_BUILD_DIR)" \
 	$(call cargo,dynamic-profile) rustc --release --target $(TARGET) --lib \
 	  -Z build-std=std \
-	  -Z build-std-features=
+	  -Z build-std-features= \
+	  $(PROFILE_RUSTC_ARGS)
 	CARGO_TARGET_DIR="$(PGO_BUILD_DIR)" \
 	$(call cargo,dynamic-profile) rustc --release --target $(TARGET) --bin $(NAME) \
 	  -Z build-std=std \
-	  -Z build-std-features=
+	  -Z build-std-features= \
+	  $(PROFILE_RUSTC_ARGS)
 	@test -x "$(PGO_BINARY)" || { echo "instrumented binary was not built: $(PGO_BINARY)" >&2; exit 1; }
 	@if command -v otool >/dev/null 2>&1 && ! otool -l "$(PGO_BINARY)" 2>/dev/null | grep -q '__llvm_prf'; then \
 		echo 'instrumented binary has no LLVM profile sections' >&2; exit 1; \
