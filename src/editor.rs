@@ -2185,6 +2185,29 @@ impl Editor {
             let next_is_boundary =
                 next == b' ' || next == b'\t' || next == b'\n' || is_close_char(next as char);
             if next_is_boundary {
+                if c == close {
+                    // Symmetric-pair fence heuristic: a run of three quote-like
+                    // characters at a boundary almost always means a fenced
+                    // block or a triple-quoted string (``` ```, """ """,
+                    // ''' ''') rather than an inline pair. If the cursor is
+                    // already preceded by two of the same character, close with
+                    // three more so the caret lands inside. Asymmetric pairs
+                    // ((, [, {) are excluded because a run of identical open
+                    // chars is never a meaningful delimiter.
+                    let mut n = 0;
+                    while column > n
+                        && self.document.buffer.byte_at(ls + column - 1 - n) == c as u8
+                    {
+                        n += 1;
+                    }
+                    if n >= 2 {
+                        let fence = [c as u8; 4];
+                        let pos = self.document.insert(line, column, &fence);
+                        // Caret sits after the third opening character.
+                        self.set_cursor(TextPosition::new(pos.line, pos.column - 3));
+                        return;
+                    }
+                }
                 // Stack-allocate the pair: open char (1–4 bytes) + close char (1 byte).
                 let cb = s.as_bytes();
                 let mut pair = [0u8; 5];
@@ -7229,6 +7252,56 @@ mod tests {
         e.insert_char('`');
         assert_eq!(e.test_text(), "``");
         assert_eq!(e.cursor(), TextPosition::new(0, 2));
+    }
+
+    #[test]
+    fn test_autoclose_backtick_fence() {
+        // Three backticks should auto-close into a full ``` ``` code fence,
+        // not a 2-backtick inline pair, with the caret inside.
+        let mut e = ed("");
+        e.insert_char('`');
+        e.insert_char('`');
+        e.insert_char('`');
+        assert_eq!(e.test_text(), "``````");
+        assert_eq!(e.cursor(), TextPosition::new(0, 3));
+    }
+
+    #[test]
+    fn test_autoclose_triple_double_quote() {
+        // Three double quotes should auto-close into a """ """ triple-quoted
+        // string, not a 2-quote inline pair, with the caret inside.
+        let mut e = ed("");
+        e.insert_char('"');
+        e.insert_char('"');
+        e.insert_char('"');
+        assert_eq!(e.test_text(), "\"\"\"\"\"\"");
+        assert_eq!(e.cursor(), TextPosition::new(0, 3));
+    }
+
+    #[test]
+    fn test_autoclose_triple_single_quote() {
+        // Three single quotes should auto-close into a ''' ''' triple-quoted
+        // string, not a 2-quote inline pair, with the caret inside. Plain
+        // Text suppresses single-quote auto-close, so use a Python file where
+        // it is active (the canonical triple-quoted-string language).
+        let mut e = ed_named("", "/tmp/test.py");
+        e.insert_char('\'');
+        e.insert_char('\'');
+        e.insert_char('\'');
+        assert_eq!(e.test_text(), "''''''");
+        assert_eq!(e.cursor(), TextPosition::new(0, 3));
+    }
+
+    #[test]
+    fn test_autoclose_triple_paren_no_fence() {
+        // Asymmetric pairs must not fence: three '(' stay as nested pairs,
+        // never collapsing into a run of identical delimiters.
+        let mut e = ed("");
+        e.insert_char('(');
+        e.insert_char('(');
+        e.insert_char('(');
+        assert_eq!(e.test_text(), "((()))");
+        assert_eq!(e.cursor(), TextPosition::new(0, 3));
     }
 
     #[test]
